@@ -1,0 +1,19 @@
+{
+    "xweb": {
+        "domain": "localhost",
+        "http-port": 3000,
+        "enable-ssl": false,
+        "enable-wormhole": true,
+        "ssl-settings": {
+            "https-port": 3443,
+            "ssl-pk-file": "path/to/ssl-pk-file",
+            "ssl-cert-file": "path/to/ssl-cert-file",
+            "ssl-chain-file": "path/to/ssl-chain-file"
+        }
+    },
+    "logging": {
+        "level": "debug",
+        "log-to-file": false,
+        "log-file-path": "logs/server.log"
+    }
+}

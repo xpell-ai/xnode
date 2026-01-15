@@ -1,14 +1,13 @@
-# Xpell-Node - Real-Time Interpreter for Node.js and Web Applications
+# XNode - Real-Time Interpreter for Node.js and Web Applications
 
 
-Xpell-Node is a real-time interpreter for Node.js application development, such application requires control on several modules  and AI engine to run within high FPS.
+XNode is a real-time interpreter for Node.js application development, such application requires control on several modules  and AI engine to run within high FPS.
 
-Xpell enables real-time translation from any command (XCommand) to platform specific command.
+XNode enables real-time translation from any command (XCommand) to platform specific command.
 
 
 
-The way to communicate with Xpell engine is to send XCommand that will be analyzed and activate the appropriate module:
-
+The way to communicate with XNode engine is to send XCommand that will be analyzed and activate the appropriate module:
 ```
   [XCommand]
      - module (the name of the module to run the command)

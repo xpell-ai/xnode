@@ -1,7 +1,10 @@
 {
-  "name": "xpell-node",
-  "version": "0.0.551",
-  "description": "Xpell Real-Time Interpreter for Node.js",
+  "name": "@xpell/node",
+  "publishConfig": {
+    "access": "public"
+  },
+  "version": "0.0.57",
+  "description": "XNode  Server for Node.js (Xpell-Node)",
   "files": [
     "dist",
     "src",
@@ -9,25 +12,40 @@
     "docs"
   ],
   "type": "module",
-  "types": "./dist/Xpell.d.ts",
-  "main": "./dist/Xpell.js",
-  "module": "./dist/Xpell.js",
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
   "scripts": {
-    "build": "tsc -p .",
+    "build": "tsc -p .&& npm run copy-assets",
     "test": "npm run build && node ./dist/test.js",
-    "docs": "typedoc --options ./typedoc.json --tsconfig ./"
+    "docs": "typedoc --options ./typedoc.json --tsconfig ./",
+    "copy-assets": "cp -R ./public/assets ./dist/assets"
   },
   "author": "Tamir Fridman <tamir@aimeverse.com> (https://github.com/fridman-tamir)",
-  "license": "GPL-3",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AimeVerse/xpell-node"
   },
+  "peerDependencies": {
+    "@xpell/core": "^2.0.0-alpha"
+  },
   "devDependencies": {
-    "@types/node": "^14.18.36",
-    "typescript": "^4.9.5"
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/express-sslify": "^1.2.5",
+    "@types/node": "^14.18.63",
+    "typescript": "^4.9.5",
+    "@xpell/core": "workspace:*"
   },
   "engines": {
     "node": ">=14.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^12.6.0",
+    "express": "^5.2.1",
+    "express-sslify": "^1.2.0",
+    "mongoose": "^9.1.3"
   }
 }
