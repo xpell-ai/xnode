@@ -1,4 +1,4 @@
-import { XObject, _xlog, type XObjectData } from "xpell-core";
+import { XObject, _xlog, type XObjectData } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import { getXdbEngine } from "./xdbReady.js";
 

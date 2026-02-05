@@ -1,7 +1,7 @@
 // xnode/src/.../xutils.ts
 
 import fs from "node:fs";
-import { _xlog, _XUtils } from "xpell-core";
+import { _xlog,  _XUtils } from "@xpell/core";
 import { Buffer } from "node:buffer";
 
 export class _XNUtils extends _XUtils {

@@ -10,11 +10,12 @@ import fs from "fs";
 import http from "http";
 import https from "https";
 import express from "express";
+import type { Express } from "express";
 import cors from "cors";
 import enforce from "express-sslify";
 import WebSocket from "ws";
 
-import { _x, _xlog } from "xpell-core";
+import { _x, _xlog } from "@xpell/core";
 import { _xu } from "../XNUtils/XUtils.js";
 import { _xs } from "../XSettings/XSettings.js";
 import { fileURLToPath } from "url";
@@ -77,6 +78,7 @@ export class XWebServer {
   _web_server?: http.Server;
   _secured_web_server?: https.Server;
   _app!: express.Express;
+  _routes_handlers: Array<(app: Express, server: XWebServer) => void> = [];
 
   constructor() {}
 
@@ -122,10 +124,18 @@ export class XWebServer {
 
     this._app.use("/public", express.static(this._public_folder));
 
+    this.applyRoutes();
     this._app.get("/", this.loadHome);
 
     // 🔴 DO NOT ADD FALLBACK HERE (breaks REST wormholes)
     _xlog.log("Xpell Web Server loaded ✅", this._engine_id);
+  }
+
+  useRoutes(handler: (app: Express, server: XWebServer) => void) {
+    this._routes_handlers.push(handler);
+    if (this._app) {
+      handler(this._app, this);
+    }
   }
 
   /* ---------------------------------------------------------------- */
@@ -217,6 +227,12 @@ export class XWebServer {
       )
     );
   };
+
+  private applyRoutes() {
+    for (const handler of this._routes_handlers) {
+      handler(this._app, this);
+    }
+  }
 }
 
 export default XWebServer;

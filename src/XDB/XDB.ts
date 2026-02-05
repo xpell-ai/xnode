@@ -3,7 +3,7 @@
 // - XDB-owned XObjects are module-managed (XDB.create)
 // - cache remains optional
 
-import { XModule, type XCommand, _xlog } from "xpell-core";
+import { XModule, type XCommand, _xlog } from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 
 import { XDBEngine, type IXDBEmbeddingProvider, type IXDBVectorQueryProvider } from "./XDBEngine.js";

@@ -18,10 +18,10 @@
  * - Errors are always normalized to XError.toXData() inside XResponseData._result.
  */
 
-import { _x } from "xpell-core";
-import {XError} from "xpell-core";
+import { _x } from "@xpell/core";
+import {XError} from "@xpell/core";
 
-import type { XResponseData } from "xpell-core";
+import type { XResponseData } from "@xpell/core";
 
 import type {
   WHAny,

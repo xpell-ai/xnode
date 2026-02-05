@@ -17,9 +17,9 @@
  */
 
 import WebSocket from "ws";
-import { _xlog, _xu } from "xpell-core";
+import { _xlog, _xu } from "@xpell/core";
 
-import type { XResponseData } from "xpell-core";
+import type { XResponseData } from "@xpell/core";
 import type {
   WHAny,
   WHAuthPayload,

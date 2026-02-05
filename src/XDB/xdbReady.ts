@@ -1,4 +1,4 @@
-import { _xlog } from "xpell-core";
+import { _xlog } from "@xpell/core";
 import type { XDBEngine } from "./XDBEngine.js";
 import { XDB } from "./XDB.js";
 

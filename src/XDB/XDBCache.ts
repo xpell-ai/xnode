@@ -14,7 +14,7 @@
 import fs from "fs";
 import crypto from "crypto";
 
-import {  _xlog } from "xpell-core";
+import {  _xlog } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 const DEFAULT_CACHE_FOLDER = "./data/xdb/cache/";
 

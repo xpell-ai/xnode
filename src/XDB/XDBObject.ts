@@ -10,7 +10,7 @@ import mongoose from "mongoose";
 import type { IndexDefinition, IndexOptions } from "mongoose";
 import bcrypt from "bcryptjs";
 
-import { XObject, _xlog, type XObjectData, XResponse} from "xpell-core";
+import { XObject, _xlog, type XObjectData, XResponse} from "@xpell/core";
 
 
 const BCRYPT_SALT_OR_ROUNDS = 10;

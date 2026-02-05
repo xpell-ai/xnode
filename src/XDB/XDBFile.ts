@@ -1,4 +1,4 @@
-import { XUtils, XObject, _xlog, type XObjectData } from "xpell-core";
+import { XUtils, XObject, _xlog, type XObjectData } from "@xpell/core";
 import { getXdbEngine } from "./xdbReady.js";
 
 export type XDBNewFileIndex = {

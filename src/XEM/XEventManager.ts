@@ -19,12 +19,12 @@
  *   - fire(event, data, support_node_boolean) supported here (last arg boolean)
  */
 
-import { _xlog } from "xpell-core";
+import { _xlog } from "@xpell/core";
 
 import {
   _XEventManager as _XEventManagerBase,
   type XEventListenerOptions as XEventListenerOptionsBase,
-} from "xpell-core";
+} from "@xpell/core";
 
 import { EventEmitter } from "node:events";
 

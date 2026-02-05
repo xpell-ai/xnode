@@ -1,4 +1,4 @@
-import type { XResponse } from "xpell-core";
+import type { XResponse } from "@xpell/core";
 import type { IXDBEmbeddingProvider } from "../XDBEngine.js";
 
 type ExecFn = (cmd: any) => Promise<any>;

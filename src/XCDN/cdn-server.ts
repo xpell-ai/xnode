@@ -5,7 +5,7 @@
 
 
 
-import {XModule, _xlog } from "xpell-core"
+import {XModule, _xlog } from "@xpell/core"
 
 
 

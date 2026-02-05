@@ -13,7 +13,7 @@
  */
 
 import { _xu } from "../XNUtils/XUtils.js";
-import type { XResponseData } from "xpell-core";
+import type { XResponseData } from "@xpell/core";
 
 import {
   WH_VERSION,

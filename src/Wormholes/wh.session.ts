@@ -10,7 +10,7 @@
  * - Pending map is for REQ/RES correlation (client-side call()).
  */
 
-import type { XResponseData } from "xpell-core";
+import type { XResponseData } from "@xpell/core";
 import type { WHAuthState, WHConnMeta, WHRoute, WHRes } from "./wh.types.js";
 import { whTimeout } from "./wh.errors.js";
 

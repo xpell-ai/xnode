@@ -19,7 +19,7 @@
 import type { Request, Response, Router } from "express";
 import express from "express";
 
-import { _xlog } from "xpell-core";
+import { _xlog } from "@xpell/core";
 
 import type { WHAny, WHContext, WHEnvelope } from "./wh.types.js";
 import { parseEnvelope, stringifyEnvelope, makeHello } from "./wh.codec.js";

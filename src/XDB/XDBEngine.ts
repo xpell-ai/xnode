@@ -11,7 +11,7 @@
  * - Removes unused imports/vars (fieldsToDate was unused in this snippet; keep if used elsewhere)
  */
 
-import { _xlog, XResponse } from "xpell-core";
+import { _xlog, XResponse } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 
 import type XDBEntity from "./XDBEntity.js";

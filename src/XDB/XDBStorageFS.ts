@@ -6,7 +6,7 @@
 import path from "path";
 import fs from "fs";
 
-import {  _xlog } from "xpell-core";
+import {  _xlog } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import type { IXDBStorage, XDBData, XDBEntityPersisted } from "./IXDBStorage.js";
 import type { IXDBMaintenance } from "./IXDBMaintenance.js"; // optional (recommended)

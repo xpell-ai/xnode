@@ -6,7 +6,7 @@
  */
 
 import bcrypt from "bcryptjs";
-import { XObject, type XObjectData, _xlog, XResponseData, XResponse } from "xpell-core";
+import { XObject, type XObjectData, _xlog, XResponseData, XResponse } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import { _xem } from "../XEM/XEventManager.js";
 

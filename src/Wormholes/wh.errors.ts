@@ -10,7 +10,7 @@
  * - Keep this file platform-neutral (no ws/express imports).
  */
 
-import {  XError,type XErrorLevel, type XErrorMeta } from "xpell-core";
+import {  XError,type XErrorLevel, type XErrorMeta } from "@xpell/core";
 
 /* -------------------------------------------------------------------------- */
 /* Error Codes                                                                */

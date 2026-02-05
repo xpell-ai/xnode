@@ -7,7 +7,7 @@ import path from "path";
 import fs from "fs";
 
 import Database from "better-sqlite3";
-import {  _xlog } from "xpell-core";
+import {  _xlog } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import type { IXDBStorage, XDBData, XDBEntityPersisted } from "./IXDBStorage.js";
 import { XDBStorageFS } from "./XDBStorageFS.js";

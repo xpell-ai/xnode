@@ -1,13 +1,13 @@
 
-// export { XData, XData as _xd, _XData } from "xpell-core"
-// export { XParser } from "xpell-core"
-// export { XCommand, type XCommandData } from "xpell-core"
-// export { XLogger, XLogger as _xlog, _XLogger } from "xpell-core"
+// export { XData, XData as _xd, _XData } from "@xpell/core"
+// export { XParser } from "@xpell/core"
+// export { XCommand, type XCommandData } from "@xpell/core"
+// export { XLogger, XLogger as _xlog, _XLogger } from "@xpell/core"
 // export {
 //     XModule,
 //     type XModuleData,
 //     // GenericModule
-// } from "xpell-core"
+// } from "@xpell/core"
 // export {
 //     XObject,
 //     XObjectPack,
@@ -16,10 +16,10 @@
 //     type XObjectData,
 //     type XObjectOnEventIndex,
 //     type XObjectOnEventHandler
-// } from "xpell-core"
-// export { type XNanoCommandPack, type XNanoCommand } from "xpell-core"
-// export { XObjectManager } from "xpell-core"
-// export {XResponse,type XResponseData,XResponseError,XResponseOK} from "xpell-core"
+// } from "@xpell/core"
+// export { type XNanoCommandPack, type XNanoCommand } from "@xpell/core"
+// export { XObjectManager } from "@xpell/core"
+// export {XResponse,type XResponseData,XResponseError,XResponseOK} from "@xpell/core"
 
 /* -------------------------------------------------------------------------- */
 /* Core exports (SAFE + deterministic)                                        */
@@ -46,12 +46,12 @@ export type {
   XErrorMeta,
   XResponseData,
 
-} from "xpell-core";
+} from "@xpell/core";
 
 
 // 2) Export the core default (XpellEngine instance) as the DEFAULT of xpell-ui
 //    If you prefer UI default (XUI) later, change this line.
-export { default } from "xpell-core";
+export { default } from "@xpell/core";
 
 // 3) Re-export core runtime symbols explicitly EXCEPT `_xem` / `XEventManager` / `_XEventManager`
 //    because xpell-ui must expose the DOM-adapted event manager instead.
@@ -78,7 +78,7 @@ export {
   XD_FPS,
   XpellEngine,
   XResponse, XResponseOK, XResponseError
-} from "xpell-core";
+} from "@xpell/core";
 
 export {XUtils,XUtils as _xu } from "./XNUtils/XUtils.js"
 
@@ -88,6 +88,21 @@ export { XSettings as Settings } from "./XSettings/XSettings.js";
 
 export { XWebServer } from "./XServer/XWebServer.js";
 export { XNode } from "./XServer/XNode.js";
+export { ServerXVMModule } from "./modules/ServerXVMModule.js";
+export { default as ServerXVMModuleDefault } from "./modules/ServerXVMModule.js";
+export type {
+  XVMEnv,
+  XVMView,
+  XVMAppMeta,
+  XVMAppFile,
+  XVMAppBundle,
+  SubscriberTarget,
+  PushEventArgs,
+  PushEventResult,
+  ViewScope,
+  ValidationCtx,
+  ServerXVMModuleOptions,
+} from "./modules/ServerXVMModule.js";
 
 /* -------------------------------------------------------------------------- */
 /* XDB exports (auto-discovered)                                              */

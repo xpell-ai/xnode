@@ -16,7 +16,7 @@
 import type http from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
 
-import { _xlog, _xu } from "xpell-core";
+import { _xlog, _xu } from "@xpell/core";
 
 import type { WHContext, WHEnvelope, WHEvt, WHEventPayload } from "./wh.types.js";
 import { parseEnvelope, stringifyEnvelope, makeHello, makeEvt } from "./wh.codec.js";

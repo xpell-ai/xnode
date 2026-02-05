@@ -14,7 +14,7 @@
  * NOTE: Keep this file pure types. No Node/WS/Express imports.
  */
 
-import type { XResponseData } from "xpell-core";
+import type { XResponseData } from "@xpell/core";
 
 /* -------------------------------------------------------------------------- */
 /* Versioning                                                                 */
