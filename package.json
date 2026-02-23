@@ -3,7 +3,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "version": "0.0.57",
+  "version": "0.0.58-alpha.0",
   "description": "XNode  Server for Node.js (Xpell-Node)",
   "files": [
     "dist",
