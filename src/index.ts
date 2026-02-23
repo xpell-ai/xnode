@@ -127,3 +127,9 @@ export { default as XDBStorageSqlite } from "./XDB/XDBStorageSqlite.js";
 export type { IXDBStorage, XDBData, XDBEntityPersisted } from "./XDB/IXDBStorage.js";
 export type { IXDBMaintenance } from "./XDB/IXDBMaintenance.js";
 export { XpellEmbeddingProvider } from "./XDB/providers/index.js";
+
+/* -------------------------------------------------------------------------- */
+/* Wormholes (public)                                                        */
+/* -------------------------------------------------------------------------- */
+
+export * from "./Wormholes/wh.index.js";

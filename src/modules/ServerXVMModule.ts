@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { XModule, type XCommand, _xem, _xlog } from "../index.js";
+import { XModule, type XCommand, _x, _xlog } from "@xpell/core";
+import {_xem} from "../XEM/XEventManager.js";
 
 export type XVMEnv = string;
 
@@ -493,12 +494,34 @@ export class ServerXVMModule extends XModule {
     private resolve_transport_target_from_xcmd(xcmd: XCommand): SubscriberTarget {
         const cmd = xcmd as any;
         const ctx = is_plain_object(cmd?._ctx) ? cmd._ctx : undefined;
+        const params = is_plain_object(cmd?._params) ? cmd._params : {};
 
-        const wid = typeof ctx?._wid === "string" && ctx._wid.trim() ? ctx._wid.trim() : undefined;
-        const sid = typeof ctx?._sid === "string" && ctx._sid.trim() ? ctx._sid.trim() : undefined;
+        let source: "ctx" | "params_ctx" | "params_direct" = "ctx";
+
+        let wid = typeof ctx?._wid === "string" && ctx._wid.trim() ? ctx._wid.trim() : undefined;
+        let sid = typeof ctx?._sid === "string" && ctx._sid.trim() ? ctx._sid.trim() : undefined;
+
+        if (!wid && is_plain_object(params._ctx)) {
+            const pctx = params._ctx as Record<string, any>;
+            wid = typeof pctx._wid === "string" && pctx._wid.trim() ? pctx._wid.trim() : undefined;
+            sid = typeof pctx._sid === "string" && pctx._sid.trim() ? pctx._sid.trim() : sid;
+            if (wid) source = "params_ctx";
+        }
+
+        if (!wid) {
+            wid = typeof params._wid === "string" && params._wid.trim() ? params._wid.trim() : undefined;
+            sid = typeof params._sid === "string" && params._sid.trim() ? params._sid.trim() : sid;
+            if (wid) source = "params_direct";
+        }
 
         if (!wid) {
             throw new Error("Missing transport context: _ctx._wid");
+        }
+
+        if (source !== "ctx" && _x._verbose) {
+            _xlog.log(
+                `[server-xvm] transport ctx fallback used source=${source} wid=${wid} sid=${sid ?? "-"}`
+            );
         }
 
         return {
