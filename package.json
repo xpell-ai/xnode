@@ -19,7 +19,8 @@
     "build": "tsc -p .&& npm run copy-assets",
     "test": "npm run build && node ./dist/test.js",
     "docs": "typedoc --options ./typedoc.json --tsconfig ./",
-    "copy-assets": "cp -R ./public/assets ./dist/assets"
+    "copy-assets": "cp -R ./public/assets ./dist/assets",
+    "publish-alpha-next": "pnpm version prerelease --preid=alpha  && pnpm publish --tag alpha"
   },
   "author": "Tamir Fridman <tamir@aimeverse.com> (https://github.com/fridman-tamir)",
   "license": "MIT",
