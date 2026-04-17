@@ -13,7 +13,6 @@ import express from "express";
 import type { Express } from "express";
 import cors from "cors";
 import enforce from "express-sslify";
-import WebSocket from "ws";
 
 import { _x, _xlog } from "@xpell/core";
 import { _xu } from "../XNUtils/XUtils.js";
