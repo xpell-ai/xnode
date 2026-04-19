@@ -90,18 +90,13 @@ export { XWebServer } from "./XServer/XWebServer.js";
 export { XNode } from "./XServer/XNode.js";
 export { ServerXVMModule } from "./modules/ServerXVMModule.js";
 export { default as ServerXVMModuleDefault } from "./modules/ServerXVMModule.js";
+
 export type {
   XVMEnv,
   XVMView,
   XVMAppMeta,
   XVMAppFile,
   XVMAppBundle,
-  SubscriberTarget,
-  PushEventArgs,
-  PushEventResult,
-  ViewScope,
-  ValidationCtx,
-  ServerXVMModuleOptions,
 } from "./modules/ServerXVMModule.js";
 
 /* -------------------------------------------------------------------------- */
