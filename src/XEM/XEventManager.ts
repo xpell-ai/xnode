@@ -198,4 +198,5 @@ export class _XEventManager extends _XEventManagerBase {
 
 export const XEventManager = new _XEventManager();
 export const _xem = XEventManager;
+
 export default XEventManager;

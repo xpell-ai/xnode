@@ -9,6 +9,8 @@ import { XWebServer } from "./XWebServer.js";
 import type { XWebSettings } from "./XWebServer.js";
 import { PingModule } from "../modules/PingModule.js";
 import { ServerXVMModule } from "../modules/ServerXVMModule.js";
+import {setXEventManager,} from "@xpell/core";
+import { XEventManager } from "../XEM/XEventManager.js";
 
 type XNodeOptions = {
     settingsPath?: string;
@@ -56,6 +58,7 @@ export class XNode {
     }
 
     init(work_folder: string) {
+        setXEventManager(XEventManager);
         this._work_folder = work_folder;
         _xs.init(work_folder);
         this._web_server.init(work_folder);
