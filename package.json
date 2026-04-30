@@ -1,6 +1,6 @@
 {
   "name": "@xpell/node",
-  "version": "2.0.0-alpha.23",
+  "version": "2.0.0-alpha.34",
   "publishConfig": {
     "access": "public"
   },
@@ -50,7 +50,7 @@
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "express-sslify": "^1.2.0",
-    "mongoose": "^9.4.1",
+    "mongoose": "^9.6.1",
     "ws": "^8.20.0"
   }
 }

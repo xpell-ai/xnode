@@ -39,8 +39,8 @@ export { default as WHSession } from "./wh.session.js";
 /* WebSocket                                                                  */
 /* -------------------------------------------------------------------------- */
 
-export { createWormholesWSServer, wsSendEvt } from "./wh.ws.server.js";
-export type { WHWSServerOptions } from "./wh.ws.server.js";
+export { createWormholesWSServer, wsSendEvt , wsBroadcastScoped ,wsSetScope,wsGetConn,wsSendToWid,wsGetConnections,wsBroadcastAll} from "./wh.ws.server.js";
+export type { WHWSServerOptions,WHWSConn } from "./wh.ws.server.js";
 
 export { default as WHWSClient } from "./wh.ws.client.js";
 export type { WHWSClientOptions, WHWSEventHandler } from "./wh.ws.client.js";

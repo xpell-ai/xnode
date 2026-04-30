@@ -29,21 +29,36 @@ import { whInternal } from "./wh.errors.js";
 /* -------------------------------------------------------------------------- */
 
 export type WHWSServerOptions = WHGatewayOptions & {
-  _path?: string;                 // default "/wh/v2"
-  _max_payload_bytes?: number;    // default 50MB
-  _log_connect?: boolean;         // default true
-  _log_messages?: boolean;        // default false
+  _path?: string;
+  _max_payload_bytes?: number;
+  _log_connect?: boolean;
+  _log_messages?: boolean;
 };
 
-/**
- * Active WS connection handle.
- * Transport owns ws; session owns protocol state.
- */
 export type WHWSConn = {
   _ws: WebSocket;
   _session: WHSession;
   _ctx: WHContext;
 };
+
+type WHScope = {
+  _app_id?: string;
+  _env?: string;
+};
+
+/* -------------------------------------------------------------------------- */
+/* Connection Registry                                                        */
+/* -------------------------------------------------------------------------- */
+
+const connections = new Map<string, WHWSConn>();
+
+function getWid(conn: WHWSConn): string | undefined {
+  return conn._ctx._meta?._wid;
+}
+
+function isOpen(ws: WebSocket): boolean {
+  return ws.readyState === WebSocket.OPEN;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Server                                                                     */
@@ -53,20 +68,20 @@ export function createWormholesWSServer(
   server: http.Server,
   opts: WHWSServerOptions
 ): WebSocketServer {
-  const path = opts._path ?? "/wh/v2";
-  const maxPayload = opts._max_payload_bytes ?? 50 * 1024 * 1024; // 50MB
+  const ws_path = opts._path ?? "/wh/v2";
+  const maxPayload = opts._max_payload_bytes ?? 50 * 1024 * 1024;
   const logConnect = opts._log_connect !== false;
   const logMessages = opts._log_messages === true;
 
   const wss = new WebSocketServer({
     server,
-    path,
+    path: ws_path,
     maxPayload,
   });
 
   wss.on("connection", (ws: WebSocket, req) => {
     const wid = _xu.guid();
-    const sid_local = _xu.guid(); // local session instance id
+    const sid_local = _xu.guid();
     const session = new WHSession(sid_local);
 
     const ctx: WHContext = {
@@ -78,18 +93,18 @@ export function createWormholesWSServer(
         _ip: (req?.socket?.remoteAddress as string | undefined) ?? undefined,
       },
       _route: {
-        _from: { _client: "ws" }, // optional hint
+        _from: { _client: "ws" },
         _to: opts._node ? { _node: opts._node } : undefined,
       },
     };
 
     const conn: WHWSConn = { _ws: ws, _session: session, _ctx: ctx };
+    connections.set(wid, conn);
 
     if (logConnect) {
       _xlog.log(`[WH/WS] connect wid=${wid} ip=${ctx._meta?._ip ?? "-"} ua=${ctx._meta?._user_agent ?? "-"}`);
     }
 
-    // Send HELLO immediately
     try {
       const hello = makeHello(
         {
@@ -121,12 +136,10 @@ export function createWormholesWSServer(
       try {
         const env = parseEnvelope(raw);
 
-        // Sync ctx.sid with session (server may set it during AUTH)
         if (session._sid) ctx._sid = session._sid;
 
         const out = await handleEnvelope(env, ctx, opts);
 
-        // If AUTH succeeded, gateway may have updated ctx._sid and ctx._auth
         if (ctx._sid) session.setSid(ctx._sid);
         if (ctx._auth) session.setAuth(ctx._auth);
 
@@ -137,8 +150,6 @@ export function createWormholesWSServer(
 
         ws.send(outStr);
       } catch (e) {
-        // If parseEnvelope throws XError, we can't always correlate.
-        // Best effort: send an EVT "wh.error" (non-fatal) so client sees it.
         try {
           const evt: WHEvt = makeEvt(
             {
@@ -147,6 +158,7 @@ export function createWormholesWSServer(
             } as WHEventPayload,
             { _sid: session._sid }
           );
+
           ws.send(stringifyEnvelope(evt));
         } catch (e2) {
           _xlog.error("[WH/WS] fatal error sending wh.error evt", e2);
@@ -155,8 +167,17 @@ export function createWormholesWSServer(
     });
 
     ws.once("close", (code, reason) => {
-      session.rejectAllPending({ _code: "E_WH_CLOSED", _reason: reason?.toString?.() ?? "", _ws_code: code });
-      if (logConnect) _xlog.log(`[WH/WS] close wid=${wid} code=${code} reason=${reason?.toString?.() ?? ""}`);
+      session.rejectAllPending({
+        _code: "E_WH_CLOSED",
+        _reason: reason?.toString?.() ?? "",
+        _ws_code: code,
+      });
+
+      connections.delete(wid);
+
+      if (logConnect) {
+        _xlog.log(`[WH/WS] close wid=${wid} code=${code} reason=${reason?.toString?.() ?? ""}`);
+      }
     });
 
     ws.on("error", (err) => {
@@ -168,14 +189,93 @@ export function createWormholesWSServer(
 }
 
 /* -------------------------------------------------------------------------- */
-/* Server push helpers                                                        */
+/* Registry Helpers                                                           */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Send a server-initiated EVT on a specific websocket.
- * (Transport helper — you can also expose a higher-level API later.)
- */
+export function wsGetConn(wid: string): WHWSConn | undefined {
+  return connections.get(wid);
+}
+
+export function wsGetConnections(): WHWSConn[] {
+  return Array.from(connections.values());
+}
+
+export function wsSetScope(wid: string, scope: WHScope): boolean {
+  const conn = connections.get(wid);
+  if (!conn) return false;
+
+  const meta = (conn._ctx._meta ??= {}) as WHContext["_meta"] & WHScope;
+
+  if (scope._app_id !== undefined) meta._app_id = scope._app_id;
+  if (scope._env !== undefined) meta._env = scope._env;
+
+  return true;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Server Push Helpers                                                        */
+/* -------------------------------------------------------------------------- */
+
 export function wsSendEvt(ws: WebSocket, payload: WHEventPayload, sid?: string): void {
+  if (!isOpen(ws)) return;
+
   const evt = makeEvt(payload, { _sid: sid });
   ws.send(stringifyEnvelope(evt));
+}
+
+export function wsSendToWid(wid: string, payload: WHEventPayload): boolean {
+  const conn = connections.get(wid);
+  if (!conn) return false;
+
+  wsSendEvt(conn._ws, payload, conn._ctx._sid);
+  return true;
+}
+
+export function wsBroadcastScoped(
+  app_id: string,
+  env: string,
+  payload: WHEventPayload,
+  opts: { _exclude_wid?: string } = {}
+): number {
+  let sent = 0;
+  _xlog.log("[WH] broadcastScoped", {
+    _app_id: app_id,
+    _env: env,
+    _connections: connections.size
+  });
+  for (const conn of connections.values()) {
+
+    const wid = getWid(conn);
+    if (opts._exclude_wid && wid === opts._exclude_wid) continue;
+
+    const meta = conn._ctx._meta as (WHContext["_meta"] & WHScope) | undefined;
+
+    if (meta?._app_id === app_id && meta?._env === env) {
+      wsSendEvt(conn._ws, payload, conn._ctx._sid);
+      sent++;
+    }
+    _xlog.log("[WH] checking conn", {
+      wid,
+      meta: conn._ctx._meta
+    });
+  }
+
+  return sent;
+}
+
+export function wsBroadcastAll(
+  payload: WHEventPayload,
+  opts: { _exclude_wid?: string } = {}
+): number {
+  let sent = 0;
+
+  for (const conn of connections.values()) {
+    const wid = getWid(conn);
+    if (opts._exclude_wid && wid === opts._exclude_wid) continue;
+
+    wsSendEvt(conn._ws, payload, conn._ctx._sid);
+    sent++;
+  }
+
+  return sent;
 }

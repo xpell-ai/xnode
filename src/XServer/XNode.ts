@@ -8,9 +8,11 @@ import { _xu } from "../XNUtils/XUtils.js";
 import { XWebServer } from "./XWebServer.js";
 import type { XWebSettings } from "./XWebServer.js";
 import { PingModule } from "../modules/PingModule.js";
-import { ServerXVMModule } from "../modules/ServerXVMModule.js";
+import { ServerXVMModule } from "../XVM/ServerXVMModule.js";
 import {setXEventManager,} from "@xpell/core";
 import { XEventManager } from "../XEM/XEventManager.js";
+import {XAI} from "../XAI/XAI.js";
+import FlowManagerModule from "../XFM/FlowManagerModule.js";
 
 type XNodeOptions = {
     settingsPath?: string;
@@ -104,11 +106,13 @@ export class XNode {
         this._web_server.load();
         await this._web_server.start();
         _x.loadModule(new PingModule());
+        _x.loadModule(XAI);
         const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder });
         _x.loadModule(server_xvm);
         if (typeof (server_xvm as any).init_on_boot === "function") {
             await (server_xvm as any).init_on_boot();
         }
+        _x.loadModule(new FlowManagerModule());
         this._started = true;
     }
 

@@ -200,11 +200,14 @@ export type WHAuthState = {
  * Connection metadata (optional).
  */
 export type WHConnMeta = {
-  _wid?: string;        // connection id (ws) or request id (rest)
+  _wid?: string;
   _user_agent?: string;
   _ip?: string;
-};
 
+  // 🔥 NEW (for scoped broadcast)
+  _app_id?: string;
+  _env?: string;
+};
 /**
  * Gateway context passed alongside envelope handling.
  */

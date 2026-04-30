@@ -88,8 +88,8 @@ export { XSettings as Settings } from "./XSettings/XSettings.js";
 
 export { XWebServer } from "./XServer/XWebServer.js";
 export { XNode } from "./XServer/XNode.js";
-export { ServerXVMModule } from "./modules/ServerXVMModule.js";
-export { default as ServerXVMModuleDefault } from "./modules/ServerXVMModule.js";
+export { ServerXVMModule } from "./XVM/ServerXVMModule.js";
+export { default as ServerXVMModuleDefault } from "./XVM/ServerXVMModule.js";
 
 export type {
   XVMEnv,
@@ -97,7 +97,7 @@ export type {
   XVMAppMeta,
   XVMAppFile,
   XVMAppBundle,
-} from "./modules/ServerXVMModule.js";
+} from "./XVM/ServerXVMModule.js";
 
 /* -------------------------------------------------------------------------- */
 /* XDB exports (auto-discovered)                                              */
@@ -128,3 +128,11 @@ export { XpellEmbeddingProvider } from "./XDB/providers/index.js";
 /* -------------------------------------------------------------------------- */
 
 export * from "./Wormholes/wh.index.js";
+
+
+/***** XAI */
+export {XAIModule, XAI, _xai} from "./XAI/XAI.js"
+
+export {XAIRegistry} from "./XAI/XAIRegistry.js"
+
+export type {XAIProvider,XAIInput,XAIResult} from "./XAI/XAIProvider.js"

@@ -19,7 +19,7 @@
  */
 
 import { _x } from "@xpell/core";
-import {XError} from "@xpell/core";
+import { XError } from "@xpell/core";
 
 import type { XResponseData } from "@xpell/core";
 
@@ -133,13 +133,26 @@ function ensureParams(cmd: XCmd): Record<string, any> {
 function injectMeta(cmd: XCmd, ctx: WHContext): XCmd {
   const p = ensureParams(cmd);
 
-  // Snake_case contract keys for command params (xpell convention)
+  // transport metadata (legacy compatibility)
   if (ctx?._meta?._wid) p._wid = ctx._meta._wid;
   if (ctx?._sid) p._sid = ctx._sid;
 
-  // optional routing hints
+  // 🔥 NEW: attach full context (source of truth)
+  (cmd as any)._ctx = ctx;
+
+  // routing hints
   if (ctx?._route?._from) p._from = ctx._route._from;
   if (ctx?._route?._to) p._to = ctx._route._to;
+
+  // 🔥 SECURITY: NEVER trust client _auth
+  delete p._auth;
+
+  p._auth = {
+    _authenticated: ctx?._auth?._authenticated === true,
+    _clearance_level: ctx?._auth?._clearance_level ?? 0,
+    _user_id: ctx?._auth?._user_id,
+    _agent_id: ctx?._auth?._agent_id,
+  };
 
   return cmd;
 }
