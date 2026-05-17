@@ -80,7 +80,7 @@ export {
   XResponse, XResponseOK, XResponseError
 } from "@xpell/core";
 
-export {XUtils,XUtils as _xu } from "./XNUtils/XUtils.js"
+export {XUtils,_xu } from "./XNUtils/XUtils.js"
 
 export { XEventManager, XEventManager as _xem, type XEventListenerOptions, _XEventManager } from "./XEM/XEventManager.js";
 // Settings module for server properties
@@ -102,26 +102,7 @@ export type {
 /* -------------------------------------------------------------------------- */
 /* XDB exports (auto-discovered)                                              */
 /* -------------------------------------------------------------------------- */
-
-export { default as XDB } from "./XDB/XDB.js";
-export { XDBModule } from "./XDB/XDB.js";
-export type { XDBModuleInitOptions } from "./XDB/XDB.js";
-
-export { default as XDBEngine } from "./XDB/XDBEngine.js";
-export type { IXDBEmbeddingProvider, IXDBVectorQueryProvider } from "./XDB/XDBEngine.js";
-
-export { default as XDBEntity } from "./XDB/XDBEntity.js";
-export { default as XDBVector } from "./XDB/XDBVector.js";
-export { default as XDBFile } from "./XDB/XDBFile.js";
-export { default as XDBTemp } from "./XDB/XDBTemp.js";
-export { default as XDBCache } from "./XDB/XDBCache.js";
-
-export { default as XDBStorageFS } from "./XDB/XDBStorageFS.js";
-export { default as XDBStorageSqlite } from "./XDB/XDBStorageSqlite.js";
-
-export type { IXDBStorage, XDBData, XDBEntityPersisted } from "./XDB/IXDBStorage.js";
-export type { IXDBMaintenance } from "./XDB/IXDBMaintenance.js";
-export { XpellEmbeddingProvider } from "./XDB/providers/index.js";
+export * from "./XDB/index.js";
 
 /* -------------------------------------------------------------------------- */
 /* Wormholes (public)                                                        */

@@ -1,7 +1,7 @@
 
 
 import {  _xlog } from "@xpell/core"
-import { XUtils } from "../XNUtils/XUtils.js"
+import { _xu } from "../XNUtils/XUtils.js"
 import  fetch, { Blob, FormData } from 'node-fetch'
 import { readFile } from "node:fs/promises";
 
@@ -102,7 +102,7 @@ export class XCDNClient {
 
         const body = new FormData();
         const blob = new Blob([buffer], { type: mimetype });
-        let fileName = XUtils.guid()
+        let fileName = _xu.guid()
         
         if(mimetype == "image/png") {
             fileName += ".png"

@@ -6,15 +6,16 @@
 import path from "path";
 import fs from "fs";
 
-import {  _xlog } from "@xpell/core";
+import { _xlog } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import type { IXDBStorage, XDBData, XDBEntityPersisted } from "./IXDBStorage.js";
 import type { IXDBMaintenance } from "./IXDBMaintenance.js"; // optional (recommended)
 
 const DEFAULT_XDB_FOLDER = "./data/xdb/";
-const DEFAULT_XDB_DATA_FOLDER = "./data/xdb/entities/";
-const DEFAULT_XDB_CACHE_FOLDER = "./data/xdb/cache/";
-const DEFAULT_XDB_BACKUP_FOLDER = "./data/xdb/backup/";
+const DEFAULT_XDB_DATA_FOLDER = "entities/";
+const DEFAULT_XDB_CACHE_FOLDER = "cache/";
+const DEFAULT_XDB_BACKUP_FOLDER = "backup/";
+const DEFAULT_XDB_OBJECTS_FOLDER = "objects/";
 
 const _xdb_file_extension = ".json";
 const _xdb_file_bin_extension = ".data";
@@ -43,10 +44,6 @@ const _xdb_data_security = {
 
 export type XDBStorageFSOptions = {
     xdbFolder?: string;      // ./data/xdb/
-    dataFolder?: string;     // ./data/xdb/entities/
-    cacheFolder?: string;    // ./data/xdb/cache/
-    backupFolder?: string;   // ./data/xdb/backup/ (kept for folder creation compatibility)
-    objectsFolder?: string;  // ./data/xdb/objects/
 };
 
 type XDBEntityFolder = {
@@ -64,11 +61,19 @@ export class XDBStorageFS implements IXDBStorage, IXDBMaintenance {
     private _objects_folder: string;
 
     constructor(opts: XDBStorageFSOptions = {}) {
-        this._xdb_folder = opts.xdbFolder ?? DEFAULT_XDB_FOLDER;
-        this._data_folder = opts.dataFolder ?? DEFAULT_XDB_DATA_FOLDER;
-        this._cache_folder = opts.cacheFolder ?? DEFAULT_XDB_CACHE_FOLDER;
-        this._backup_folder = opts.backupFolder ?? DEFAULT_XDB_BACKUP_FOLDER;
-        this._objects_folder = opts.objectsFolder ?? (this._xdb_folder + "objects" + path.sep);
+
+        this._xdb_folder =
+            path.join(
+                path.resolve(
+                    opts.xdbFolder ??
+                    DEFAULT_XDB_FOLDER
+                ),
+                path.sep
+            );
+        this._data_folder = this._xdb_folder + DEFAULT_XDB_DATA_FOLDER
+        this._cache_folder = this._xdb_folder + DEFAULT_XDB_CACHE_FOLDER;
+        this._backup_folder = this._xdb_folder + DEFAULT_XDB_BACKUP_FOLDER;
+        this._objects_folder = this._xdb_folder + DEFAULT_XDB_OBJECTS_FOLDER;
     }
 
     // -------------------- lifecycle --------------------
@@ -127,12 +132,18 @@ export class XDBStorageFS implements IXDBStorage, IXDBMaintenance {
         return meta && Array.isArray(meta._entities) ? meta._entities : [];
     }
 
+    private pj(...parts: string[]) {
+        const jp = path.join(...parts);
+        if (!jp.endsWith(path.sep)) return jp + path.sep;
+        return jp;
+    }
+
     // -------------------- entity folders/files --------------------
     private getEntityFolders(entityName: string): XDBEntityFolder {
-        const entityFolder = this._data_folder + entityName + path.sep;
-        const vectorsFolder = entityFolder + "_vectors" + path.sep;
-        const filesFolder = entityFolder + "_files" + path.sep;
-        const tempFolder = entityFolder + "_temp" + path.sep;
+        const entityFolder = this.pj(this._data_folder, entityName);
+        const vectorsFolder = this.pj(entityFolder, "_vectors");
+        const filesFolder = this.pj(entityFolder, "_files");
+        const tempFolder = this.pj(entityFolder, "_temp");
 
         _xu.checkFolders([entityFolder, vectorsFolder, filesFolder, tempFolder]);
 

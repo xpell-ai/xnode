@@ -9,20 +9,26 @@ import { XWebServer } from "./XWebServer.js";
 import type { XWebSettings } from "./XWebServer.js";
 import { PingModule } from "../modules/PingModule.js";
 import { ServerXVMModule } from "../XVM/ServerXVMModule.js";
-import {setXEventManager,} from "@xpell/core";
-import { XEventManager } from "../XEM/XEventManager.js";
-import {XAI} from "../XAI/XAI.js";
+import { setXEventManager, } from "@xpell/core";
+import { _xem, XEventManager } from "../XEM/XEventManager.js";
+import { XAI } from "../XAI/XAI.js";
 import FlowManagerModule from "../XFM/FlowManagerModule.js";
+import { XEntityManager } from "../EntityManager/XEntityManager.js";
+import {
+    XDB, XDBStorageFS, XDBStorageSqlite, type IXDBStorage
+} from "../XDB/index.js";
+
+import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
 
 type XNodeOptions = {
-    settingsPath?: string;
-    work_folder?: string;
-    web_settings?: Partial<XWebSettings>;
-    routes?: (app: Express, server: XWebServer) => void;
-    port?: number;
-    host?: string;
+    _settings_path?: string;
+    _work_folder?: string;
+    _web_settings?: Partial<XWebSettings>;
+    _system_xapps_path?: string;
+    _port?: number;
+    _host?: string;
+    _xdb?: XDBOptions;
 };
-
 
 /**
  * Lightweight Xpell Node server bootstrapper.
@@ -43,7 +49,7 @@ export class XNode {
     // the method call all server onSetup methods
     private ensureSetup(work_folder: string) {
         this._work_folder = work_folder;
-        const server_folders = [work_folder, path.join(work_folder, "data")];
+        const server_folders = [work_folder, path.join(work_folder, "xdb")];
         const initFilePath = path.join(work_folder, ".xpell-initialized");
         if (!fs.existsSync(initFilePath)) {
             _xlog.log("⚙️ Running Xpell Server for first time , performing initial setup");
@@ -59,6 +65,31 @@ export class XNode {
         }
     }
 
+    private create_xdb_storage(options: XDBOptions,work_folder: string): IXDBStorage {
+        const root =
+            path.resolve(
+                options._root ??
+                path.join(work_folder, "xdb")
+            );
+        if (options._type === "sqlite") {
+            return new XDBStorageSqlite({
+                dbPath:
+                    options._sqlite?._db_path ??
+                    path.join(root, "xdb.sqlite"),
+                wal:
+                    options._sqlite?._wal ?? true,
+                busyTimeoutMs:
+                    options._sqlite?._busy_timeout_ms ?? 5000,
+                blobStorage:
+                    new XDBStorageFS({xdbFolder: root})
+            });
+        }
+
+        return new XDBStorageFS({
+            xdbFolder: root
+        });
+    }
+
     init(work_folder: string) {
         setXEventManager(XEventManager);
         this._work_folder = work_folder;
@@ -68,9 +99,9 @@ export class XNode {
     }
 
     private applyWebSettingsOverrides(options: XNodeOptions) {
-        const overrides: Partial<XWebSettings> = { ...(options.web_settings ?? {}) };
-        if (options.port !== undefined) overrides["http-port"] = options.port;
-        if (options.host !== undefined) overrides.domain = options.host;
+        const overrides: Partial<XWebSettings> = { ...(options._web_settings ?? {}) };
+        if (options._port !== undefined) overrides["http-port"] = options._port;
+        if (options._host !== undefined) overrides.domain = options._host;
         if (Object.keys(overrides).length === 0) return;
 
         const current = _xs.get("xweb");
@@ -85,7 +116,7 @@ export class XNode {
 
     async start(options: XNodeOptions = {}): Promise<void> {
         if (this._started) return;
-        const work_folder = options.work_folder ?? "./work";
+        const work_folder = options._work_folder ?? "./work";
 
         if (!this._settings_events_bound) {
             this.bindSettingsEvents();
@@ -100,24 +131,46 @@ export class XNode {
 
         // Example: XNode.start({ routes: (app, server) => app.get("/", (_req, res) => res.send("hello")) })
         // Example: XNode.start({ web_settings: { routes: { /* xweb route overrides */ } } })
-        if (options.routes) {
-            this._web_server.useRoutes(options.routes);
-        }
+        //TODO - add support for dynamic routes loading from options (e.g. for plugins) without needing to restart the server, currently routes can be added only via onSetup or by directly calling web_server.useRoutes() after start
+        // if (options.routes) {
+        //     this._web_server.useRoutes(options.routes);
+        // }
         this._web_server.load();
         await this._web_server.start();
-        _x.loadModule(new PingModule());
-        _x.loadModule(XAI);
-        const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder });
-        _x.loadModule(server_xvm);
-        if (typeof (server_xvm as any).init_on_boot === "function") {
-            await (server_xvm as any).init_on_boot();
-        }
-        _x.loadModule(new FlowManagerModule());
+        /* -------------------------------------------------- */
+        /* XDB                                                */
+        /* -------------------------------------------------- */
+
+        const xdb_options =
+            options._xdb ?? {};
+
+        const xdb_storage =
+            this.create_xdb_storage(
+                xdb_options,
+                work_folder
+            );
+
+        XDB.init({
+            storage: xdb_storage,
+            enableCache: xdb_options._cache ?? true,
+            workFolder: work_folder,
+            embedder: xdb_options._embedder,
+            vectorQuery: xdb_options._vector_query
+        });
+        await _x.loadModuleAsync(XDB);
+        await _x.loadModuleAsync(new PingModule());
+        await _x.loadModuleAsync(XAI);
+        await _x.loadModuleAsync(new FlowManagerModule());
+        await _x.loadModuleAsync(new XEntityManager());
+        const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder ,_system_xapps_path: options._system_xapps_path});
+        await _x.loadModuleAsync(server_xvm);
+
+
         this._started = true;
     }
 
 
-    
+
 
     /**
      * Stop the server if it is running.

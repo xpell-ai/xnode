@@ -1,4 +1,5 @@
-import { XUtils, XObject, _xlog, type XObjectData } from "@xpell/core";
+import {  XObject, _xlog, type XObjectData } from "@xpell/core";
+import { _xu } from "../XNUtils/XUtils.js";
 import { getXdbEngine } from "./xdbReady.js";
 
 export type XDBNewFileIndex = {
@@ -43,7 +44,7 @@ export class XDBFile extends XObject {
 
     // ---------- writes ----------
     addFile(file: any): string {
-        const fid = XUtils.guid();
+        const fid = _xu.guid();
         this._new_file_index[fid] = file;
         this._need_commit = true;
         this._need_save_ids.push(fid);

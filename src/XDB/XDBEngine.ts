@@ -126,6 +126,21 @@ export interface IXDBVectorQueryProvider {
     }): Promise<any[]>;
 }
 
+
+
+export type XDBOptions = {
+    _type?: "fs" | "sqlite";
+    _root?: string;
+    _cache?: boolean;
+    _sqlite?: {
+        _db_path?: string;
+        _wal?: boolean;
+        _busy_timeout_ms?: number;
+    };
+    _embedder?: IXDBEmbeddingProvider;
+    _vector_query?: IXDBVectorQueryProvider;
+};
+
 export class XDBEngine {
     _initialized = false;
     _xdb_data: XDBData;

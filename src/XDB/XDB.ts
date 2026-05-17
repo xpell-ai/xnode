@@ -8,6 +8,7 @@ import { _xem } from "../XEM/XEventManager.js";
 
 import { XDBEngine, type IXDBEmbeddingProvider, type IXDBVectorQueryProvider } from "./XDBEngine.js";
 import type { IXDBStorage } from "./IXDBStorage.js";
+import _xu from "../XNUtils/XUtils.js";
 
 import XDBEntity from "./XDBEntity.js";
 import XDBVector from "./XDBVector.js";
@@ -27,6 +28,7 @@ export type XDBModuleInitOptions = {
     vectorQuery?: IXDBVectorQueryProvider;
     envName?: string;
     enableCache?: boolean;
+    workFolder: string;
 };
 
 export class XDBModule extends XModule {
@@ -96,45 +98,52 @@ export class XDBModule extends XModule {
     // Lifecycle
     // ---------------------------------------------------------------------------
 
-    async load() {
+    override async onLoad() {
         if (!this._initOpts?.storage) {
             throw new Error(
-                "XDB.load() called without init options. Call XDB.init({ storage, ... }) before _x.loadModule(XDB)."
+                "XDB.load() called without init options..."
             );
         }
-
-        // init engine with injected providers
         this._engine = new XDBEngine({
             storage: this._initOpts.storage,
             embedder: this._initOpts.embedder,
             vectorQuery: this._initOpts.vectorQuery,
             envName: this._initOpts.envName,
         });
-
         await this._engine.init();
         _xlog.log("XDB Engine initialized");
-
-        // init cache (optional)
         if (this._initOpts.enableCache !== false) {
-            this._cache = new XDBCache();
+            this._cache = new XDBCache({cacheFolder: _xu.pathJoin(this._initOpts.workFolder, "cache")});
             await this._cache.init();
             _xlog.log("XDB Cache initialized");
         } else {
             this._cache = undefined;
-            _xlog.log("XDB Cache disabled");
+            _xlog.log(
+                "XDB Cache disabled"
+            );
         }
-
-        // register types (for object manager compatibility)
-        this.importObject(XDBEntity._xtype, XDBEntity as any);
-        this.importObject(XDBVector._xtype, XDBVector as any);
-        this.importObject(XDBFile._xtype, XDBFile as any);
-        this.importObject(XDBTemp._xtype, XDBTemp as any);
-
-        // only now announce ready
+        this.importObject(
+            XDBEntity._xtype,
+            XDBEntity as any
+        );
+        this.importObject(
+            XDBVector._xtype,
+            XDBVector as any
+        );
+        this.importObject(
+            XDBFile._xtype,
+            XDBFile as any
+        );
+        this.importObject(
+            XDBTemp._xtype,
+            XDBTemp as any
+        );
         this._ready = true;
-        _xem.fire("xdb-ready", { version: VERSION });
+        _xem.fire(
+            "xdb-ready",
+            { version: VERSION }
+        );
 
-        await super.load();
     }
 
     // ---------------------------------------------------------------------------
@@ -184,13 +193,13 @@ export class XDBModule extends XModule {
     async onFrame(frameNumber: number): Promise<void> {
         await this._cache?.onFrame(frameNumber);
 
-        if (frameNumber % ZIP_EVERY_N_FRAMES === 0) {
-            try {
-                await this._engine.zipFolder(ENTITIES_FOLDER);
-            } catch (e: any) {
-                _xlog.debug(`XDB zip skipped: ${e?.message ?? e}`);
-            }
-        }
+        // if (frameNumber % ZIP_EVERY_N_FRAMES === 0) {
+        //     try {
+        //         await this._engine.zipFolder(ENTITIES_FOLDER);
+        //     } catch (e: any) {
+        //         _xlog.debug(`XDB zip skipped: ${e?.message ?? e}`);
+        //     }
+        // }
 
         await super.onFrame(frameNumber);
     }

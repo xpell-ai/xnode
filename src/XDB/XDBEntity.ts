@@ -6,7 +6,7 @@
  */
 
 import bcrypt from "bcryptjs";
-import { XObject, type XObjectData, _xlog, XResponseData, XResponse } from "@xpell/core";
+import { XObject, type XObjectData, _xlog } from "@xpell/core";
 import _xu from "../XNUtils/XUtils.js";
 import { _xem } from "../XEM/XEventManager.js";
 
@@ -32,7 +32,16 @@ export type SortInput = {
 };
 
 export type XDBIndexData = {
-    [idx: string]: string[] | number;
+    /*
+    PRIMARY INDEX:
+    value -> numeric position
+    */
+    [idx: string]:
+    | number
+    /*UNIQUE INDEX:value -> recordId*/
+    | string
+    /* NON UNIQUE INDEX: value -> recordIds[]*/
+    | string[];
 };
 
 export type XDBEntityData = {
@@ -297,55 +306,80 @@ export class XDBEntity extends XObject {
         return await bcrypt.compare(plainText, hash);
     }
 
-    private async prepareFields(input: Record<string, any>): Promise<XResponse> {
-        const res = new XResponse();
+    private async prepareFields(input: Record<string, any>): Promise<Record<string, any>> {
         const out: Record<string, any> = {};
-
-        res._ok = true;
-        res._result = "Errors in fields: ";
-
+        const errors: string[] = [];
         for (const key of Object.keys(this._schema)) {
-            const skey = this._schema[key];
-            const ftype = String(skey._type ?? "").toLowerCase();
+            const skey =this._schema[key];
 
-            // missing value
+            const ftype =String(skey._type ?? "").toLowerCase();
+
+            /*
+            missing value
+            */
+
             if (!Object.prototype.hasOwnProperty.call(input, key)) {
                 if (ftype === "number" && skey._auto_increment) {
-                    const v = skey._auto_increment._value ?? skey._auto_increment._start;
+                    const v =skey._auto_increment._value ??skey._auto_increment._start;
                     out[key] = v;
                     skey._auto_increment._value = v + skey._auto_increment._step;
-                } else if (Object.prototype.hasOwnProperty.call(skey, "_default")) {
-                    out[key] = skey._default;
-                } else if (skey._required) {
-                    res._ok = false;
-                    res._result += `missing required field: ${key}\n`;
+
+                } else if (
+                    Object.prototype.hasOwnProperty.call(skey, "_default")
+                ) {
+                    out[key] =skey._default;
+
+                } else if (
+                    skey._required
+                ) {
+                    errors.push(`missing required field: ${key}`);
                 }
+
                 continue;
             }
 
-            // present value
-            const v = input[key];
+            /*
+            present value
+            */
 
+            const v =input[key];
+
+            /*
+            STRING
+            */
             if (ftype === "string") {
-                let sv = String(v ?? "");
-                if (skey._max_length && sv.length > skey._max_length) sv = sv.substring(0, skey._max_length);
+                let sv =String(v ?? "");
+
+                if (skey._max_length &&sv.length > skey._max_length) {
+                    sv =sv.substring(0,skey._max_length);
+                }
+
                 if (skey._min_length && sv.length < skey._min_length) {
-                    res._ok = false;
-                    res._result += `field ${key} too short\n`;
+                    errors.push(`field ${key} too short`);
                 }
+
                 if (skey._enum && !skey._enum.includes(sv)) {
-                    res._ok = false;
-                    res._result += `field ${key} not in enum\n`;
+                    errors.push(`field ${key} not in enum`);
                 }
+
                 if (skey._pattern) {
-                    const re = new RegExp(skey._pattern);
+                    const re =
+                        new RegExp(
+                            skey._pattern
+                        );
+
                     if (!re.test(sv)) {
-                        res._ok = false;
-                        res._result += `field ${key} pattern mismatch\n`;
+                        errors.push(`field ${key} pattern mismatch`);
                     }
                 }
                 out[key] = sv;
-            } else if (ftype === "number") {
+                continue;
+            }
+
+            /*
+            NUMBER
+            */
+            if (ftype === "number") {
                 if (skey._auto_increment) {
                     const cur = skey._auto_increment._value ?? skey._auto_increment._start;
                     out[key] = cur;
@@ -353,43 +387,107 @@ export class XDBEntity extends XObject {
                 } else {
                     const nv = Number(v);
                     if (Number.isNaN(nv)) {
-                        res._ok = false;
-                        res._result += `field ${key} is not a number\n`;
+                        errors.push(`field ${key} is not a number`);
                     }
                     out[key] = nv;
                 }
                 if (skey._min != null && out[key] < skey._min) {
-                    res._ok = false;
-                    res._result += `field ${key} below min\n`;
+                    errors.push(`field ${key} below min`);
                 }
+
                 if (skey._max != null && out[key] > skey._max) {
-                    res._ok = false;
-                    res._result += `field ${key} above max\n`;
+                    errors.push(`field ${key} above max`);
                 }
+
                 if (skey._enum && !skey._enum.includes(out[key])) {
-                    res._ok = false;
-                    res._result += `field ${key} not in enum\n`;
+                    errors.push(`field ${key} not in enum`);
                 }
-            } else if (ftype === "date") {
+                continue;
+            }
+            /*DATE*/
+            if (ftype === "date") {
                 out[key] = new Date(v);
-            } else if (ftype === "hash") {
-                const salt = await bcrypt.genSalt(BCRYPT_SALT_OR_ROUNDS);
-                out[key] = await bcrypt.hash(String(v ?? ""), salt);
-            } else if (ftype === "file") {
-                // store file via helper -> returns fid
+                continue;
+            }
+
+            /*HASH*/
+
+            if (ftype === "hash") {
+
+                const salt =
+                    await bcrypt.genSalt(
+                        BCRYPT_SALT_OR_ROUNDS
+                    );
+
+                out[key] =
+                    await bcrypt.hash(
+                        String(v ?? ""),
+                        salt
+                    );
+                continue;
+            }
+            /*FILE*/
+            if (ftype === "file") {
                 const fid = this._xdb_file.addFile(v);
                 out[key] = fid;
-            } else {
-                // array/object/bool/vector/matrix etc — keep raw
-                out[key] = v;
+                continue;
             }
+            /*array/object/bool/vector/matrix*/
+            out[key] = v;
         }
-
-        if (res._ok) res._result = out;
-        return res;
+        if (errors.length > 0) {
+            throw new Error(
+                errors.join("\n")
+            );
+        }
+        return out;
     }
 
     // ---------------- indexing ----------------
+
+
+    private normalizeIndexValue(value: any): string {
+        if (value === undefined || value === null) {
+            return "__null__";
+        }
+        if (typeof value === "object") {
+            return JSON.stringify(value);
+        }
+        return String(value);
+    }
+
+    private getPrimaryIndex(): XDBIndex {
+        const idx =
+            this._indices["_id"];
+        if (!idx) {
+            throw new Error(
+                "missing primary _id index"
+            );
+        }
+        return idx;
+    }
+
+    private getDataPositionById(
+        recordId: string
+    ): number {
+        const primary =
+            this.getPrimaryIndex();
+        const pos =
+            primary._data[recordId];
+        if (typeof pos !== "number") {
+            return -1;
+        }
+        return pos;
+    }
+
+    private getRecordById(recordId: string): XDBEntityData | null {
+        const pos = this.getDataPositionById(recordId);
+        if (pos < 0 || pos >= this._data.length) {
+            return null;
+        }
+        return this._data[pos];
+    }
+
 
     indexAll() {
         const indexKeys = Object.keys(this._indices);
@@ -401,46 +499,178 @@ export class XDBEntity extends XObject {
     }
 
     index(indexId: string, data?: any) {
-        const arr = data ? (Array.isArray(data) ? data : [data]) : this._data;
+        const arr =
+            data
+                ? (
+                    Array.isArray(data)
+                        ? data
+                        : [data]
+                )
+                : this._data;
         const index = this._indices[indexId];
-        if (!index) return;
-
+        if (!index) {
+            return;
+        }
         index._data = {};
-
-        for (const d of arr) {
-            if (!d || !Object.prototype.hasOwnProperty.call(d, indexId)) continue;
-
+        for (let i = 0; i < arr.length; i++) {
+            const d = arr[i];
+            if (
+                !d ||
+                !Object.prototype
+                    .hasOwnProperty
+                    .call(d, indexId)
+            ) {
+                continue;
+            }
+            const rawValue =
+                d[indexId];
+            const key =
+                this.normalizeIndexValue(
+                    rawValue
+                );
+            /*
+            PRIMARY INDEX
+            _id -> array position
+            */
             if (index._primary) {
-                index._data[d[indexId]] = this.findDataIndex(d["_id"]);
+                index._data[key] = i;
                 continue;
             }
-
+            /*
+            UNIQUE INDEX
+            email -> recordId
+            */
             if (index._unique) {
-                index._data[d[indexId]] = this.findDataIndexByField(indexId, d[indexId]);
+                index._data[key] =
+                    d["_id"];
+                continue;
+            }
+            /*
+            ARRAY INDEX
+            roles -> [recordIds]
+            */
+            const stype =
+                String(
+                    this._schema[indexId]?._type ??
+                    ""
+                ).toLowerCase();
+            if (
+                stype === "array" &&
+                Array.isArray(rawValue)
+            ) {
+                for (const item of rawValue) {
+                    const ikey =
+                        this.normalizeIndexValue(
+                            item
+                        );
+                    if (
+                        !Array.isArray(
+                            index._data[ikey]
+                        )
+                    ) {
+                        index._data[ikey] = [];
+                    }
+                    (index._data[ikey] as string[]).push(d["_id"]);
+                }
                 continue;
             }
 
-            const stype = String(this._schema[indexId]?._type ?? "").toLowerCase();
-            if (stype === "array" && Array.isArray(d[indexId])) {
-                for (const item of d[indexId]) {
-                    index._data[item] = index._data[item] || [];
-                    (index._data[item] as string[]).push(d["_id"]);
-                }
-            } else {
-                index._data[d[indexId]] = index._data[d[indexId]] || [];
-                (index._data[d[indexId]] as string[]).push(d["_id"]);
+            /*
+            NORMAL NON UNIQUE
+            */
+            if (
+                !Array.isArray(
+                    index._data[key]
+                )
+            ) {
+                index._data[key] = [];
             }
+            (index._data[key] as string[]).push(d["_id"]);
         }
     }
+
+
+    /* ========================================================== */
 
     indexAdd(entityData: any) {
         for (const indexField of Object.keys(this._indices)) {
             const idx = this._indices[indexField];
-            if (!idx) continue;
-            if (entityData && entityData[indexField] != null) {
-                idx._data[entityData[indexField]] = this.findDataIndexByField(indexField, entityData[indexField]);
+            if (!idx) {
+                continue;
             }
+            const rawValue =
+                entityData[indexField];
+            if (
+                rawValue === undefined ||
+                rawValue === null
+            ) {
+                continue;
+            }
+
+            const key =
+                this.normalizeIndexValue(
+                    rawValue
+                );
+            /*
+            PRIMARY
+            */
+            if (idx._primary) {
+                idx._data[key] =
+                    this._data.length - 1;
+                continue;
+            }
+            /*
+            UNIQUE
+            */
+            if (idx._unique) {
+                idx._data[key] =
+                    entityData._id;
+                continue;
+            }
+
+            /*
+            ARRAY FIELD
+            */
+            const stype =
+                String(
+                    this._schema[indexField]?._type ??
+                    ""
+                ).toLowerCase();
+            if (
+                stype === "array" &&
+                Array.isArray(rawValue)
+            ) {
+                for (const item of rawValue) {
+                    const ikey =
+                        this.normalizeIndexValue(
+                            item
+                        );
+                    if (
+                        !Array.isArray(
+                            idx._data[ikey]
+                        )
+                    ) {
+                        idx._data[ikey] = [];
+                    }
+                    (idx._data[ikey] as string[]).push(entityData._id);
+                }
+                continue;
+            }
+            /*
+            NORMAL NON UNIQUE
+            */
+            if (
+                !Array.isArray(
+                    idx._data[key]
+                )
+            ) {
+                idx._data[key] = [];
+            }
+
+            (idx._data[key] as string[]).push(entityData._id);
+
         }
+
     }
 
     indexDelete(deletedEntity: any) {
@@ -457,9 +687,45 @@ export class XDBEntity extends XObject {
     }
 
     findById(id: string): XDBEntityData | null {
-        const cacheIdx = this._indices["_id"]?._data?.[id] as any;
-        const idx = typeof cacheIdx === "number" ? cacheIdx : this.findDataIndex(id);
-        return idx >= 0 ? this._data[idx] : null;
+        return this.getRecordById(id);
+    }
+
+
+
+    findOneByIndex(
+        fieldName: string,
+        value: any
+    ): XDBEntityData | null {
+        const idx = this._indices[fieldName];
+        if (!idx) {
+            return null;
+        }
+        const key = this.normalizeIndexValue(value);
+        const result = idx._data[key];
+        /*
+        UNIQUE INDEX
+        */
+        if (typeof result === "string") {
+            return this.getRecordById(result);
+        }
+        /*
+        PRIMARY INDEX
+        */
+        if (typeof result === "number") {
+            return this._data[result] ?? null;
+        }
+        /*
+        NON UNIQUE
+        */
+        if (
+            Array.isArray(result) &&
+            result.length > 0
+        ) {
+            return this.getRecordById(
+                result[0]
+            );
+        }
+        return null;
     }
 
     // ---------------- embedding ----------------
@@ -492,256 +758,455 @@ export class XDBEntity extends XObject {
 
     // ---------------- CRUD ----------------
 
-    async add(data: any, autoCommit = true, indexAll = true): Promise<XResponseData> {
-        const res = new XResponse();
+    async add(
+        data: any,
+        autoCommit = true,
+        indexAll = true
+    ): Promise<XDBEntityData> {
 
-        try {
-            const fixed = await this.prepareFields(data);
-            if (!fixed._ok) {
-                res._ok = false;
-                res._result = fixed._result;
-                return res.toXData();
+        const fixedData = await this.prepareFields(data);
+        if (!fixedData._id) {
+            fixedData._id = _xu.guid();
+        }
+        if (
+            this._data.find(
+                (x: any) =>
+                    x._id === fixedData._id
+            )
+        ) {
+            throw new Error(
+                `record with _id ${fixedData._id} already exists`
+            );
+        }
+        const now = new Date();
+        const entityData: XDBEntityData = {
+            _id:
+                fixedData._id,
+            _created_at:
+                now,
+            _updated_at:
+                now
+        };
+        for (const fieldName of Object.keys(this._schema)) {
+            const v = fixedData[fieldName];
+            if (v !== undefined && v !== null) {
+                entityData[fieldName] = v;
+            }
+        }
+
+        for (const fieldName of Object.keys(this._schema)) {
+            const field = this._schema[fieldName];
+            const indexDef = field?._index;
+            const isUnique = typeof indexDef === "object" && indexDef?._unique === true;
+            if (!isUnique) {
+                continue;
             }
 
-            const fixedData = fixed._result as any;
-
-            if (!fixedData._id) fixedData._id = _xu.guid();
-            if (this._data.find((x: any) => x._id === fixedData._id)) {
-                throw new Error(`record with _id ${fixedData._id} already exists`);
+            const value = entityData[fieldName];
+            if (value === undefined || value === null) {
+                continue;
             }
-
-            const now = new Date();
-            const entityData: XDBEntityData = { _id: fixedData._id, _created_at: now, _updated_at: now };
-
-            for (const fieldName of Object.keys(this._schema)) {
-                const v = fixedData[fieldName];
-                if (v !== undefined && v !== null) entityData[fieldName] = v;
+            const idx = this._indices[fieldName];
+            const key = this.normalizeIndexValue(value);
+            if (idx && idx._data[key] !== undefined) {
+                throw new Error(
+                    `duplicate value for unique field '${fieldName}'`
+                );
             }
+        }
 
-            this._data.push(entityData);
-            this._meta._records = this._data.length;
+        this._data.push(entityData);
+        this._meta._records =
+            this._data.length;
+        if (indexAll) {
+            this.indexAdd(entityData);
+        }
+        // embed after push (needs _id)
+        await this.embedFields(
+            this._fields_lists._embedable,
+            entityData
+        );
+        this._need_save = true;
+        if (autoCommit) {
+            await this.commit();
+        }
+        return entityData;
+    }
 
-            if (indexAll) this.indexAdd(entityData);
+    private checkUpdateField(
+        fieldName: string,
+        updateValue: any
+    ): any {
+        const field = this._schema[fieldName];
 
-            // embed after push (needs _id)
-            await this.embedFields(this._fields_lists._embedable, entityData);
+        if (!field) {
+            throw new Error(
+                `Field ${fieldName} not in schema`
+            );
+        }
 
-            this._need_save = true;
+        if (field._immutable) {
+            throw new Error(
+                `Field ${fieldName} is immutable`
+            );
+        }
 
-            if (autoCommit) await this.commit();
+        if (
+            updateValue === undefined ||
+            updateValue === null
+        ) {
+            throw new Error(
+                `Field ${fieldName} value is undefined/null`
+            );
+        }
 
-            res._ok = true;
-            res._result = entityData;
-            return res.toXData();
-        } catch (e: any) {
-            res._ok = false;
-            res._result = e?.message ?? String(e);
-            return res.toXData();
+        const enums = field._enum;
+
+        if (
+            enums &&
+            enums.length > 0 &&
+            !enums.includes(updateValue)
+        ) {
+            throw new Error(`Field ${fieldName} value not in enum`);
         }
     }
 
-    private checkUpdateField(fieldName: string, updateValue: any) {
-        const res = new XResponse();
-        res._ok = true;
-        res._result = "";
-
-        if (!this._schema[fieldName]) {
-            res._ok = false;
-            res._result = `Field ${fieldName} not in schema`;
-            return res;
-        }
-        if (this._schema[fieldName]._immutable) {
-            res._ok = false;
-            res._result = `Field ${fieldName} is immutable`;
-            return res;
-        }
-        if (updateValue === undefined || updateValue === null) {
-            res._ok = false;
-            res._result = `Field ${fieldName} value is undefined/null`;
-            return res;
-        }
-        const enums = this._schema[fieldName]._enum;
-        if (enums && enums.length > 0 && !enums.includes(updateValue)) {
-            res._ok = false;
-            res._result = `Field ${fieldName} value not in enum`;
-        }
-        return res;
-    }
-
-    async update(filter: any, updates: any, autoCommit = true): Promise<XResponseData> {
-        const res = new XResponse();
-
-        if (!filter || typeof filter !== "object" || Object.keys(filter).length === 0) {
-            res._ok = false;
-            res._result = "Empty filter";
-            return res.toXData();
-        }
-        if (!updates || typeof updates !== "object" || Object.keys(updates).length === 0) {
-            res._ok = false;
-            res._result = "Empty updates";
-            return res.toXData();
+    async update(
+        filter: any,
+        updates: any,
+        autoCommit = true
+    ) {
+        if (
+            !filter ||
+            typeof filter !== "object" ||
+            Object.keys(filter).length === 0
+        ) {
+            throw new Error("Empty filter");
         }
 
-        // select data (supports semantic filtering via engine like your legacy)
+        if (
+            !updates ||
+            typeof updates !== "object" ||
+            Object.keys(updates).length === 0
+        ) {
+            throw new Error("Empty updates");
+        }
+
+        // select data
         const engine = getXdbEngine();
         let selected = this._data;
         selected = engine.filterData(selected, filter, this._schema);
-
         let updatedCount = 0;
         let requiredIndexRebuild = false;
 
         for (const row of selected) {
             const idx = this.findDataIndex(row._id);
-            if (idx < 0) continue;
+
+            if (idx < 0) {
+                continue;
+            }
 
             this._data[idx]._updated_at = new Date();
 
             for (const key of Object.keys(updates)) {
-                const valid = this.checkUpdateField(key, updates[key]);
-                if (!valid._ok) continue;
+                this.checkUpdateField(key, updates[key]);
 
                 // file type
-                if (this._fields_lists._toFile.includes(key)) {
-                    const oldFid = this._data[idx][key];
-                    if (oldFid) this._xdb_file.deleteFile(oldFid);
-                    const newFid = this._xdb_file.addFile(updates[key]);
-                    this._data[idx][key] = newFid;
+                if (
+                    this._fields_lists
+                        ._toFile
+                        .includes(key)
+                ) {
+
+                    const oldFid =
+                        this._data[idx][key];
+
+                    if (oldFid) {
+                        this._xdb_file
+                            .deleteFile(oldFid);
+                    }
+
+                    const newFid =
+                        this._xdb_file
+                            .addFile(
+                                updates[key]
+                            );
+                    this._data[idx][key] =
+                        newFid;
                 } else {
                     this._data[idx][key] = updates[key];
                 }
 
-                if (this._fields_lists._indexable.includes(key)) requiredIndexRebuild = true;
+                if (
+                    this._fields_lists
+                        ._indexable
+                        .includes(key)
+                ) {
+                    requiredIndexRebuild = true;
+                }
 
-                // if embed field changed: re-embed
-                if (this._fields_lists._embedable.includes(key)) {
-                    // delete old vectors for this field if exist
-                    const oldIds = this._entity_vectors_index[row._id]?.[key];
-                    if (oldIds?.length) this._xdb_vector.deleteVectors(oldIds);
+                // embedding refresh
+                if (
+                    this._fields_lists
+                        ._embedable
+                        .includes(key)
+                ) {
 
-                    await this.embedField(key, this._data[idx]);
+                    const oldIds =
+                        this._entity_vectors_index
+                        [row._id]?.[key];
+
+                    if (oldIds?.length) {
+
+                        this._xdb_vector
+                            .deleteVectors(oldIds);
+                    }
+
+                    await this.embedField(
+                        key,
+                        this._data[idx]
+                    );
                 }
 
                 updatedCount++;
             }
         }
 
-        if (requiredIndexRebuild) this.indexAll();
-
-        if (updatedCount > 0) {
-            this._need_save = true;
-            if (autoCommit) await this.commit();
+        if (requiredIndexRebuild) {
+            this.indexAll();
         }
 
-        res._ok = true;
-        res._result = { _meta: { _updated: updatedCount } };
-        return res.toXData();
+        if (updatedCount > 0) {
+
+            this._need_save = true;
+
+            if (autoCommit) {
+                await this.commit();
+            }
+        }
+
+        return {
+            _updated: updatedCount
+        };
     }
 
-    async delete(filter: any, autoCommit = true): Promise<XResponseData> {
-        const res = new XResponse();
-
-        if (!filter || typeof filter !== "object" || Object.keys(filter).length === 0) {
-            res._ok = false;
-            res._result = "Empty filter";
-            return res.toXData();
+    async delete(filter: any, autoCommit = true): Promise<{ _deleted: number }> {
+        if (
+            !filter ||
+            typeof filter !== "object" ||
+            Object.keys(filter).length === 0
+        ) {
+            throw new Error("Empty filter");
         }
 
         const engine = getXdbEngine();
-        const selected = engine.filterData(this._data, filter, this._schema);
+
+        const selected =
+            engine.filterData(
+                this._data,
+                filter,
+                this._schema
+            );
+
         let deleted = 0;
 
         for (const row of selected) {
-            const idx = this.findDataIndex(row._id);
-            if (idx < 0) continue;
+            const idx = this.getDataPositionById(row._id);
 
-            // delete vectors
-            const vecFields = Object.keys(this._entity_vectors_index[row._id] ?? {});
+            if (idx < 0) {
+                continue;
+            }
+
+            /*
+            delete vectors
+            */
+
+            const vecFields =
+                Object.keys(this._entity_vectors_index[row._id] ?? {});
+
             for (const f of vecFields) {
                 const vids = this._entity_vectors_index[row._id][f];
-                if (vids?.length) this._xdb_vector.deleteVectors(vids);
+
+                if (vids?.length) {
+                    this._xdb_vector.deleteVectors(vids);
+                }
             }
+
             delete this._entity_vectors_index[row._id];
             delete this._entity_matrices_index[row._id];
 
-            // delete files
+            /*
+            delete files
+            */
+
             for (const f of this._fields_lists._toFile) {
                 const fid = this._data[idx][f];
-                if (fid) this._xdb_file.deleteFile(fid);
+
+                if (fid) {
+                    this._xdb_file.deleteFile(fid);
+                }
             }
 
+            /*
+            remove row
+            */
+
             this._data.splice(idx, 1);
+
             deleted++;
         }
+
+        /*
+        IMPORTANT:
+        primary indexes store array positions.
+        splice() changes positions.
+        must rebuild indexes.
+        */
 
         if (deleted > 0) {
             this._meta._records = this._data.length;
             this.indexAll();
             this._need_save = true;
-            if (autoCommit) await this.commit();
+            if (autoCommit) {
+                await this.commit();
+            }
         }
-
-        res._ok = true;
-        res._result = `${deleted} records deleted`;
-        return res.toXData();
+        return {
+            _deleted: deleted
+        };
     }
 
     // ---------------- find (simple / portable) ----------------
 
     find(
-        filter: any,
+        filter: any = {},
         skip = 0,
         limit = 100000,
         includeScheme = false,
         reverseOrder = false,
         sortInput?: SortInput
-    ): XResponseData {
-        const res = new XResponse();
+    ) {
 
         let outData = this._data;
 
-        if (filter && typeof filter === "object" && Object.keys(filter).length > 0) {
-            const engine = getXdbEngine();
-            outData = engine.filterData(outData, filter, this._schema);
+        if (
+            filter &&
+            typeof filter === "object" &&
+            Object.keys(filter).length > 0
+        ) {
+
+            const engine =
+                getXdbEngine();
+
+            outData =
+                engine.filterData(
+                    outData,
+                    filter,
+                    this._schema
+                );
         }
 
         if (sortInput) {
-            const f = sortInput._sort_by;
-            const order = sortInput._sort_order ?? "asc";
+
+            const f =
+                sortInput._sort_by;
+
+            const order =
+                sortInput._sort_order ?? "asc";
+
             if (this._schema[f]) {
-                outData = [...outData].sort((a: any, b: any) => {
-                    const av = a[f];
-                    const bv = b[f];
-                    const dir = order === "asc" ? 1 : -1;
-                    if (av == null && bv == null) return 0;
-                    if (av == null) return -1 * dir;
-                    if (bv == null) return 1 * dir;
-                    if (typeof av === "number" && typeof bv === "number") return (av - bv) * dir;
-                    if (this._schema[f]._type === "Date") return (new Date(av).getTime() - new Date(bv).getTime()) * dir;
-                    return String(av).localeCompare(String(bv)) * dir;
-                });
+
+                outData =
+                    [...outData].sort(
+                        (a: any, b: any) => {
+
+                            const av = a[f];
+                            const bv = b[f];
+
+                            const dir =
+                                order === "asc"
+                                    ? 1
+                                    : -1;
+
+                            if (
+                                av == null &&
+                                bv == null
+                            ) {
+                                return 0;
+                            }
+
+                            if (av == null) {
+                                return -1 * dir;
+                            }
+
+                            if (bv == null) {
+                                return 1 * dir;
+                            }
+
+                            if (
+                                typeof av === "number" &&
+                                typeof bv === "number"
+                            ) {
+                                return (av - bv) * dir;
+                            }
+
+                            if (
+                                this._schema[f]._type === "Date"
+                            ) {
+                                return (
+                                    new Date(av).getTime() -
+                                    new Date(bv).getTime()
+                                ) * dir;
+                            }
+
+                            return String(av)
+                                .localeCompare(
+                                    String(bv)
+                                ) * dir;
+                        }
+                    );
             }
         }
 
-        const total = outData.length;
-        outData = outData.slice(skip, skip + limit);
-        if (reverseOrder) outData = [...outData].reverse();
+        const total =
+            outData.length;
 
-        res._ok = true;
-        res._result = {
+        outData =
+            outData.slice(
+                skip,
+                skip + limit
+            );
+
+        if (reverseOrder) {
+            outData = [...outData].reverse();
+        }
+
+        return {
             _meta: {
-                _name: this._name,
-                _skip: skip,
-                _limit: limit,
-                _total_records: total,
-                _records: outData.length,
-                ...(includeScheme ? { _schema: this._schema } : {}),
+                _name:
+                    this._name,
+                _skip:
+                    skip,
+                _limit:
+                    limit,
+                _total_records:
+                    total,
+                _records:
+                    outData.length,
+                ...(includeScheme
+                    ? {
+                        _schema:
+                            this._schema
+                    }
+                    : {})
             },
-            _data: outData,
-            _vectors_ids: this._entity_vectors_index,
-            _matrices: this._entity_matrices_index,
+            _data:
+                outData,
+            _vectors_ids:
+                this._entity_vectors_index,
+            _matrices:
+                this._entity_matrices_index
         };
-
-        return res.toXData();
     }
 }
 
