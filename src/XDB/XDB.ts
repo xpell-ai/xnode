@@ -197,7 +197,7 @@ export class XDBModule extends XModule {
         //     try {
         //         await this._engine.zipFolder(ENTITIES_FOLDER);
         //     } catch (e: any) {
-        //         _xlog.debug(`XDB zip skipped: ${e?.message ?? e}`);
+        //         _xlog.log(`XDB zip skipped: ${e?.message ?? e}`);
         //     }
         // }
 

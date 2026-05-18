@@ -70,6 +70,13 @@ export class _XNUtils extends _XUtils {
     }
   }
 
+  normalizePrompt(value: string): string {
+  return value
+    .normalize("NFKC")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 }
 
 const XUtils = new _XNUtils();

@@ -1,7 +1,13 @@
 export interface XAIInput {
+
   prompt: string;
   system?: string;
   context?: any;
+  response_format?: {
+    type: "text" | "json_object";
+  };
+  temperature?: number;
+  max_tokens?: number;
 }
 
 export interface XAIResult {
@@ -10,5 +16,8 @@ export interface XAIResult {
 }
 
 export interface XAIProvider {
-  generate(input: XAIInput): Promise<XAIResult>;
+
+  generate(
+    input: XAIInput
+  ): Promise<XAIResult>;
 }

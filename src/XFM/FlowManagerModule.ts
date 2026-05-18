@@ -113,8 +113,8 @@ export class FlowManagerModule extends XModule {
       }).toXData();
     }
 
-    _xlog.debug(`[flow] run ${flow_id} (app=${app_id}, env=${env})`);
-    _xlog.debug("[flow] ctx", ctx);
+    _xlog.log(`[flow] run ${flow_id} (app=${app_id}, env=${env})`);
+    _xlog.log("[flow] ctx", ctx);
 
     _xem.fire("flow:start", { flow_id, app_id, env, ctx });
 
@@ -128,7 +128,7 @@ export class FlowManagerModule extends XModule {
     for (let i = 0; i < flow._steps.length; i++) {
       const step = flow._steps[i];
 
-      _xlog.debug(`[flow] step ${step._id ?? "unknown"}`);
+      _xlog.log(`[flow] step ${step._id ?? "unknown"}`);
 
       _xem.fire("flow:step", {
         flow_id,
@@ -142,7 +142,7 @@ export class FlowManagerModule extends XModule {
       /* ---------------- condition ---------------- */
 
       if (step._when && !this.check_when(step._when, ctx)) {
-        _xlog.debug(`[flow] skip ${step._id ?? "unknown"}`);
+        _xlog.log(`[flow] skip ${step._id ?? "unknown"}`);
         continue;
       }
 
@@ -181,7 +181,6 @@ export class FlowManagerModule extends XModule {
 
       Object.assign(resolved_params, this.resolve_input(step._input, ctx));
 
-      _xlog.debug("[flow] resolved_params", resolved_params);
 
       /* ---------------- execute ------------------ */
 
@@ -200,6 +199,7 @@ export class FlowManagerModule extends XModule {
             ? raw
             : { _ok: true, _result: raw };
       } catch (err) {
+        _xlog.error(`[flow] step execution error in step ${step._id ?? "unknown"}`, err);
         return new XResponseError({
           _code: "FLOW_STEP_ERROR",
           _message: `Step failed: ${step._id ?? "unknown"}`,
@@ -210,8 +210,8 @@ export class FlowManagerModule extends XModule {
       last_result = result;
       ctx.step_results[step._id ?? `step_${i}`] = result;
 
-      _xlog.debug("[flow] step result", result);
-      _xlog.debug("[flow] ctx", ctx);
+      _xlog.log("[flow] step result", result);
+      _xlog.log("[flow] ctx", ctx);
 
       /* ---------------- output ------------------- */
 

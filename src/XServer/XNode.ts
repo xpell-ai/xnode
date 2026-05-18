@@ -19,6 +19,7 @@ import {
 } from "../XDB/index.js";
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
+import { XVibeModule } from "../XVIBE/XVibeModule.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -160,6 +161,7 @@ export class XNode {
         await _x.loadModuleAsync(XDB);
         await _x.loadModuleAsync(new PingModule());
         await _x.loadModuleAsync(XAI);
+        await _x.loadModuleAsync(new XVibeModule());
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());
         const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder ,_system_xapps_path: options._system_xapps_path});

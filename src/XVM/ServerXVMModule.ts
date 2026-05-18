@@ -30,7 +30,7 @@ export type XVMAppMeta = {
 export type XVMAppFile = {
   _app_id: string;
   _env: XVMEnv;
-  _system: boolean;
+  _system?: boolean;
   _meta: XVMAppMeta;
   _config: Record<string, any>;
 };
@@ -61,6 +61,7 @@ export class ServerXVMModule extends XModule {
 
   private _apps_root: string;
   private _apps: Map<string, XVMAppBundle> = new Map();
+  private _active_app_by_env: Map<string, string> = new Map();
   private _system_xapps_path?: string;
 
   constructor(opts: any = {}) {
@@ -116,6 +117,48 @@ export class ServerXVMModule extends XModule {
     return { _ok: true, _result: { _app: app_file, _created: true } };
   }
 
+
+  async _set_active_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+
+    const app_id = _xu.ensure_string(params._app_id, "_app_id");
+    const env = this.resolve_env(params);
+
+    this.get_bundle(app_id, env);
+
+    this._active_app_by_env.set(env, app_id);
+
+    _xlog.log("[server-xvm] active app set", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env
+      }
+    };
+  }
+
+  async _get_active_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const env = this.resolve_env(params);
+
+    const app_id =
+      this._active_app_by_env.get(env) ??
+      "vibe-system";
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env
+      }
+    };
+  }
+
   /* ------------------------------------------------------------------------ */
   /* GET APP                                                                  */
   /* ------------------------------------------------------------------------ */
@@ -123,8 +166,12 @@ export class ServerXVMModule extends XModule {
   async _get_app(xcmd: XCommand) {
     const params = _xu.ensure_params(xcmd?._params);
 
-    const app_id = _xu.ensure_string(params._app_id, "_app_id");
     const env = this.resolve_env(params);
+
+    const app_id =
+      typeof params._app_id === "string" && params._app_id.trim()
+        ? params._app_id.trim()
+        : this._active_app_by_env.get(env) ?? "vibe-system";
     const include_views = params._include_views === true;
     const include_flows = params._include_flows === true;
 

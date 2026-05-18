@@ -112,8 +112,7 @@ export * from "./Wormholes/wh.index.js";
 
 
 /***** XAI */
-export {XAIModule, XAI, _xai} from "./XAI/XAI.js"
+export * from "./XAI/index.js"
 
-export {XAIRegistry} from "./XAI/XAIRegistry.js"
-
-export type {XAIProvider,XAIInput,XAIResult} from "./XAI/XAIProvider.js"
+/***** XVIBE   */
+export * from "./XVIBE/index.js"
