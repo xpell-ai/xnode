@@ -182,9 +182,9 @@ export class XDBModule extends XModule {
         return this._engine.getObject(objectName, format);
     }
 
-    async hasObject(objectName: string): Promise<boolean> {
-        return await this._engine.hasObject(objectName);
-    }
+    // async hasObject(objectName: string): Promise<boolean> {
+    //     return await this._engine.hasObject(objectName);
+    // }
 
     // ---------------------------------------------------------------------------
     // Frame hook

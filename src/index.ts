@@ -45,7 +45,10 @@ export type {
   XErrorLevel,
   XErrorMeta,
   XResponseData,
-
+  XpellSkill,
+  XpellSkillType,
+  XpellSkillCommand,
+  XpellSkillModule
 } from "@xpell/core";
 
 
