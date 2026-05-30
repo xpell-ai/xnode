@@ -12,6 +12,7 @@ export type VibePromptBuildInput = {
   _artifact_type: VibeArtifactType;
   selection: VibeKnowledgeSelection;
   runtime_context?: XVibeJsonObject;
+  deterministic_skeleton?: XVibeJsonObject;
 };
 
 const DEFAULT_MAX_SKILL_PROMPT_CHARS = 5_000;
@@ -23,6 +24,7 @@ const MAX_ARRAY_ITEMS = 10;
 const MAX_PATTERN_ITEMS = 5;
 const MAX_EXAMPLE_ITEMS = 3;
 const MAX_JSON_CHARS = 1_200;
+const MAX_SKELETON_JSON_CHARS = 8_000;
 
 
 
@@ -207,6 +209,28 @@ function collect_xui_types(
   return [...types];
 }
 
+function collect_skeleton_xui_types(value: unknown, target = new Set<string>()): string[] {
+  if (!value || typeof value !== "object") return [...target];
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collect_skeleton_xui_types(item, target);
+    }
+    return [...target];
+  }
+
+  const node = value as XVibeJsonObject;
+  if (typeof node._type === "string" && node._type.trim().length > 0) {
+    target.add(node._type.trim());
+  }
+
+  if (Array.isArray(node._children)) {
+    collect_skeleton_xui_types(node._children, target);
+  }
+
+  return [...target];
+}
+
 function output_contract_for_artifact(artifact_type: VibeArtifactType): string {
   if (artifact_type === "flow") {
     return '{ "_artifact_type": "flow", "_contract_version": 1, "_flow": { "_id": "...", "_steps": [] } }';
@@ -280,6 +304,81 @@ export class VibePromptBuilder {
     this.max_user_task_chars = opts._max_user_task_chars ?? DEFAULT_MAX_USER_TASK_CHARS;
   }
 
+  private build_artifact_specific_rules(
+    artifact_type: VibeArtifactType,
+  ): string[] {
+
+    if (artifact_type === "view") {
+      return [
+        "VIEW RULES:",
+        "- Use semantic XUI objects.",
+        "- Use stack/grid/toolbar/card/field when appropriate.",
+        "- Use button for clickable actions.",
+        "- Use label with _text.",
+        "- Use class, not _class.",
+        "- When styling is requested, style-sheet MUST be the first child in _children.",
+        "- Never generate empty semantic objects.",
+        "- Every semantic object must include minimal runtime-safe fields.",
+        "- Buttons need visible _text or _label.",
+        "- field is a wrapper only.",
+        "- field input config goes in _control.",
+        "- never put _name or _placeholder directly on field.",
+        '- Fields require _control with _type and name or _name for input-like controls.',
+        "- Tables need _columns or a valid _data_source.",
+        "- KPI cards need _label/_title and _value.",
+        "- Navlists need _items or navigation children.",
+        "- Modals and drawers need content or children.",
+        "- Cards, grids, sidebars, toolbars, and xsections need meaningful children.",
+        "- Prefer XDashboard objects when available.",
+        "- Do not use generic view objects when a semantic object exists.",
+      ];
+    }
+
+    if (artifact_type === "flow") {
+      return [
+        "FLOW RULES:",
+        "- NEVER generate XUI objects.",
+        "- NEVER generate _children trees.",
+        "- NEVER generate views, pages, layouts, or UI components.",
+        "- Flow steps MUST be runtime command steps only.",
+        '- Valid flow step format: { "_id": "...", "_module": "...", "_op": "...", "_params": {} }.',
+        "- Do not generate root-level _flow._output; use step-level _output only.",
+        "- Generate deterministic flow steps.",
+        "- Use valid _id values.",
+        "- Prefer entity-manager/entity-client for data mutations.",
+        "- Flows must be data-driven and JSON-only.",
+
+        "RUNTIME MODULE CONTRACT:",
+
+        '- Use module "xd" for XData operations.',
+        '- NEVER use modules "xdata" or "xdata-binding".',
+        "- Valid xd ops: get, set, patch, delete, touch, has.",
+
+        "- Valid entity-client ops: get, find, add, update, delete, sync_entity.",
+        "- Valid xem ops: fire, on, off."
+      ];
+    }
+
+    if (artifact_type === "entity") {
+      return [
+        "ENTITY RULES:",
+        "- Generate valid XDB entity schemas.",
+        "- Use semantic field names.",
+        "- Prefer searchable/vectorizable structures.",
+      ];
+    }
+
+    if (artifact_type === "command") {
+      return [
+        "COMMAND RULES:",
+        "- Generate valid XCommand structures.",
+        "- Use _module, _op, _params.",
+      ];
+    }
+
+    return [];
+  }
+
   build(input: VibePromptBuildInput): string {
     const skills_block = format_skills_block(
       input.selection,
@@ -291,11 +390,18 @@ export class VibePromptBuilder {
     const runtime_context = has_value(input.runtime_context)
       ? compact_json(input.runtime_context, MAX_JSON_CHARS)
       : "No runtime context injected.";
+    const deterministic_skeleton =
+      input._artifact_type === "view" && has_value(input.deterministic_skeleton)
+        ? compact_json(input.deterministic_skeleton, MAX_SKELETON_JSON_CHARS)
+        : "";
 
     const allowed_xui_objects =
-      collect_xui_types(
-        input.selection
-      );
+      Array.from(new Set([
+        ...collect_xui_types(
+          input.selection
+        ),
+        ...collect_skeleton_xui_types(input.deterministic_skeleton),
+      ]));
     const prompt = [
       "You are an Xpell JSON artifact generator.",
       "Return ONLY JSON.",
@@ -332,12 +438,41 @@ export class VibePromptBuilder {
       "",
       "ONLY use _type values from the allowed list above.",
       "NEVER invent new _type values.",
+      "Use semantic UI objects whenever possible.",
+      "Prefer button over generic view for actions.",
+      "Prefer field for form inputs.",
+      "Prefer stack/grid/toolbar for layout.",
+      "Prefer label for text output.",
+      "",
+      ...this.build_artifact_specific_rules(
+        input._artifact_type
+      ),
+
       "",
       "Selected Skills:",
       skills_block,
       "",
       "Runtime Context:",
       runtime_context,
+      "",
+      "Generated artifacts in runtime context may be referenced when building new artifacts.",
+      ...(deterministic_skeleton
+        ? [
+          "",
+          "Deterministic View Skeleton:",
+          deterministic_skeleton,
+          "",
+          "SKELETON RULES:",
+          "- Use the deterministic skeleton as the starting _view.",
+          "- Preserve skeleton structure, ordering, _id, _type, and required _children arrays.",
+          "- Preserve every _flow object exactly; do not replace interaction contracts.",
+          "- Do not use _action, onClick, onclick, handler, callback, or root-level _command on buttons.",
+          "- Preserve field wrapper contracts: input config belongs inside _control.",
+          "- Never put _name or _placeholder directly on field.",
+          "- Only fill or edit labels, titles, placeholders, columns, bindings, values, variants, and classes.",
+          "- Do not remove required fields needed by the semantic validator.",
+        ]
+        : []),
       "",
       "User Task:",
       normalized_user_task,

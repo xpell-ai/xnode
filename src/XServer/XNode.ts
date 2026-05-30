@@ -20,6 +20,7 @@ import {
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
 import { XVibeModule } from "../XVIBE/XVibeModule.js";
+import { XModuleCreatorModule } from "../XGenerative/index.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -66,7 +67,7 @@ export class XNode {
         }
     }
 
-    private create_xdb_storage(options: XDBOptions,work_folder: string): IXDBStorage {
+    private create_xdb_storage(options: XDBOptions, work_folder: string): IXDBStorage {
         const root =
             path.resolve(
                 options._root ??
@@ -82,7 +83,7 @@ export class XNode {
                 busyTimeoutMs:
                     options._sqlite?._busy_timeout_ms ?? 5000,
                 blobStorage:
-                    new XDBStorageFS({xdbFolder: root})
+                    new XDBStorageFS({ xdbFolder: root })
             });
         }
 
@@ -161,10 +162,16 @@ export class XNode {
         await _x.loadModuleAsync(XDB);
         await _x.loadModuleAsync(new PingModule());
         await _x.loadModuleAsync(XAI);
+
+        await _x.loadModuleAsync(new XModuleCreatorModule({
+            _work_folder: this._work_folder
+        }));
+
+        await _x.loadModuleAsync(new XVibeModule());
         await _x.loadModuleAsync(new XVibeModule());
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());
-        const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder ,_system_xapps_path: options._system_xapps_path});
+        const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path });
         await _x.loadModuleAsync(server_xvm);
 
 

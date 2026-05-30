@@ -114,7 +114,6 @@ export class FlowManagerModule extends XModule {
     }
 
     _xlog.log(`[flow] run ${flow_id} (app=${app_id}, env=${env})`);
-    _xlog.log("[flow] ctx", ctx);
 
     _xem.fire("flow:start", { flow_id, app_id, env, ctx });
 
@@ -211,7 +210,6 @@ export class FlowManagerModule extends XModule {
       ctx.step_results[step._id ?? `step_${i}`] = result;
 
       _xlog.log("[flow] step result", result);
-      _xlog.log("[flow] ctx", ctx);
 
       /* ---------------- output ------------------- */
 

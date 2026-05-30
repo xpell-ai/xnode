@@ -9,6 +9,7 @@ Before making changes, apply:
 - /docs/skills/xpell-node
 - /docs/skills/xpell-xdb
 - /docs/skills/xpell-xvm
+- /docs/skills/xflow-manager
 
 Rules:
 - Server only.

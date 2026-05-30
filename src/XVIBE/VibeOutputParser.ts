@@ -514,7 +514,7 @@ function sanitize_parsed_object(
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      sanitize_parsed_object(item, seen);
+      sanitize_parsed_object(item, seen, depth + 1, counter);
     }
     seen.delete(value as object);
     return;
@@ -528,7 +528,7 @@ function sanitize_parsed_object(
     if (PROTOTYPE_POLLUTION_KEYS.has(key)) {
       throw new Error(`Invalid AI output: forbidden key '${key}'`);
     }
-    sanitize_parsed_object(value[key], seen);
+    sanitize_parsed_object(value[key], seen, depth + 1, counter);
   }
   seen.delete(value as object);
 }
@@ -774,9 +774,13 @@ export class VibeOutputParser {
       repaired = repair_json(extracted);
       diagnostics.push(
         create_diagnostic(
-          "VIBE_JSON_REPAIRED",
+          repaired === extracted
+            ? "VIBE_JSON_REPAIR_SKIPPED"
+            : "VIBE_JSON_REPAIR_APPLIED",
           "repair",
-          repaired === extracted ? "No JSON repair changes applied" : "Minimal JSON repair applied",
+          repaired === extracted
+            ? "JSON syntax repair was not needed"
+            : "Minimal JSON syntax repair applied",
           repaired,
         ),
       );
