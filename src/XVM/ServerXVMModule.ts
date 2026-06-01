@@ -493,7 +493,9 @@ export class ServerXVMModule extends XModule {
     bundle._app._meta._version++;
     bundle._app._meta._updated_at = _xu.to_iso_now();
 
-    this.persist_bundle(bundle);
+    this.persist_bundle(bundle, {
+      _backup_view_ids: [view_id]
+    });
 
     /* -------------------- payload -------------------- */
 
@@ -503,6 +505,9 @@ export class ServerXVMModule extends XModule {
       _view_id: view_id,
       _version: bundle._app._meta._version,
       _view: normalized,
+      ...(typeof params._generation_id === "string" && params._generation_id.trim()
+        ? { _generation_id: params._generation_id.trim() }
+        : {}),
     };
 
     /* -------------------- internal event -------------------- */
@@ -766,7 +771,53 @@ export class ServerXVMModule extends XModule {
     return typeof params._env === "string" ? params._env : DEFAULT_ENV;
   }
 
-  private persist_bundle(bundle: XVMAppBundle) {
+  private backup_existing_view_file(input: {
+    app_id: string;
+    env: string;
+    view_id: string;
+    app_dir: string;
+    view_file: string;
+  }) {
+    if (!fs.existsSync(input.view_file)) {
+      return;
+    }
+
+    try {
+      const old_views_dir =
+        path.join(input.app_dir, "old_views");
+      const timestamp =
+        new Date().toISOString().replace(/[:.]/g, "-");
+      const backup_file =
+        path.join(
+          old_views_dir,
+          `${input.view_id}.${timestamp}.json`
+        );
+
+      fs.mkdirSync(old_views_dir, { recursive: true });
+      fs.copyFileSync(input.view_file, backup_file);
+
+      _xlog.log("[server-xvm] view backup created", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _backup_file: backup_file
+      });
+    } catch (err) {
+      _xlog.warn("[server-xvm] view backup failed", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _error: err instanceof Error ? err.message : String(err)
+      });
+    }
+  }
+
+  private persist_bundle(
+    bundle: XVMAppBundle,
+    opts: {
+      _backup_view_ids?: string[];
+    } = {}
+  ) {
     this.assert_mutable_bundle(bundle);
 
     const app_dir = path.join(
@@ -790,9 +841,25 @@ export class ServerXVMModule extends XModule {
       JSON.stringify(bundle._app, null, 2)
     );
 
+    const backup_view_ids =
+      new Set(opts._backup_view_ids ?? []);
+
     for (const view_id of Object.keys(bundle._views || {})) {
+      const view_file =
+        path.join(views_dir, `${view_id}.json`);
+
+      if (backup_view_ids.has(view_id)) {
+        this.backup_existing_view_file({
+          app_id: bundle._app._app_id,
+          env: bundle._app._env,
+          view_id,
+          app_dir,
+          view_file
+        });
+      }
+
       fs.writeFileSync(
-        path.join(views_dir, `${view_id}.json`),
+        view_file,
         JSON.stringify(bundle._views[view_id], null, 2)
       );
     }

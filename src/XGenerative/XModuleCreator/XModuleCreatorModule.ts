@@ -2,11 +2,13 @@ import {
   mkdir,
   readFile,
   readdir,
+  rename,
+  symlink,
   writeFile
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   XModule,
@@ -28,6 +30,7 @@ import type {
   XModuleCreatorError,
   XModuleCreatorGenerateJsResult,
   XModuleCreatorGetSpecResult,
+  XModuleCreatorImplementGeneratedModuleResult,
   XModuleCreatorListSpecsResult,
   XModuleCreatorLoadGeneratedModuleResult,
   XModuleCreatorModuleOptions,
@@ -45,28 +48,52 @@ const MANIFEST_FILE =
 const MODULE_FILE =
   "module.js";
 
+const PACKAGE_FILE =
+  "package.json";
+
+const REGISTRY_FILE =
+  "registry.json";
+
+const PACKAGE_ROOT =
+  path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../.."
+  );
+
 const SAFE_MODULE_OR_OP_NAME =
   /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
 
 const SAFE_PARAM_NAME =
   /^_?[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
 
-const FORBIDDEN_GENERATED_CONTENT = [
-  "eval(",
-  "Function(",
-  "child_process",
-  "process.exit",
-  "import(",
-  "fetch(",
-  "http.",
-  "https.",
-  "fs.",
-  "setInterval(",
-  "setTimeout(",
-  "Worker(",
-  "vm.",
-  "globalThis.process"
+const FORBIDDEN_GENERATED_PATTERNS = [
+  /\beval\s*\(/,
+  /\bFunction\s*\(/,
+  /\bchild_process\b/,
+  /\bprocess\.exit\b/,
+  /\bimport\s*\(/,
+  /\bfetch\s*\(/,
+  /\bhttps?\./,
+  /\bfs\./,
+  /\bsetInterval\s*\(/,
+  /\bsetTimeout\s*\(/,
+  /\bWorker\s*\(/,
+  /\bglobalThis\.process\b/,
+  /\bnode:vm\b/,
+  /\brequire\(["']vm["']\)/,
 ];
+
+const PLACEHOLDER_IMPLEMENTATION_PATTERNS = [
+  { _label: "TODO", _pattern: /\bTODO\b/i },
+  { _label: "FIXME", _pattern: /\bFIXME\b/i },
+  { _label: "implement here", _pattern: /\bimplement\b[\s\S]{0,80}\bhere\b/i },
+  { _label: "implement logic", _pattern: /\bimplement\b[\s\S]{0,80}\blogic\b/i },
+  { _label: "not implemented", _pattern: /\bnot\s+implemented\b/i },
+  { _label: "placeholder", _pattern: /\bplaceholder\b/i },
+];
+
+type XModuleCreatorValidationCategory =
+  NonNullable<XModuleCreatorError["_category"]>;
 
 function ok<T extends Record<string, unknown>>(
   payload: T
@@ -80,13 +107,15 @@ function ok<T extends Record<string, unknown>>(
 function fail(
   _code: string,
   _message: string,
-  _details?: Record<string, unknown>
+  _details?: Record<string, unknown>,
+  _category?: XModuleCreatorValidationCategory
 ): XModuleCreatorResult {
   return {
     _ok: false,
     _error: {
       _code,
       _message,
+      ...(_category ? { _category } : {}),
       ...(_details ? { _details } : {})
     }
   };
@@ -162,6 +191,54 @@ function module_file_path(
   );
 }
 
+function registry_path(
+  work_folder: string
+) {
+  return path.join(
+    work_folder,
+    ARTIFACT_ROOT,
+    REGISTRY_FILE
+  );
+}
+
+async function ensure_generated_package_resolution(
+  artifact_path: string
+) {
+  const scope_path =
+    path.join(
+      artifact_path,
+      "node_modules",
+      "@xpell"
+    );
+  const link_path =
+    path.join(
+      scope_path,
+      "node"
+    );
+
+  await mkdir(
+    scope_path,
+    { recursive: true }
+  );
+
+  try {
+    await symlink(
+      PACKAGE_ROOT,
+      link_path,
+      "dir"
+    );
+  } catch (err: unknown) {
+    const code =
+      is_record(err)
+        ? err.code
+        : undefined;
+
+    if (code !== "EEXIST") {
+      throw err;
+    }
+  }
+}
+
 function to_pascal_case(
   value: string
 ) {
@@ -201,12 +278,236 @@ function generated_json(
   return JSON.stringify(value, null, 2);
 }
 
+function content_sha256(
+  content: string
+) {
+  return createHash("sha256")
+    .update(content, "utf-8")
+    .digest("hex");
+}
+
 function manifest_sha256(
   manifest_json: string
 ) {
-  return createHash("sha256")
-    .update(manifest_json, "utf-8")
-    .digest("hex");
+  return content_sha256(manifest_json);
+}
+
+type XGeneratedModuleRegistryState =
+  | "pending_implementation"
+  | "implemented";
+
+type XGeneratedModuleRegistryEntry = {
+  _id: string;
+  _name: string;
+  _target: "server";
+  _artifact_path: string;
+  _manifest_file: string;
+  _module_file: string;
+  _manifest_sha256: string;
+  _module_sha256: string;
+  _autoload: boolean;
+  _state?: XGeneratedModuleRegistryState;
+  _implementation_complete?: boolean;
+  _created_by: "module-creator";
+  _created_at: number;
+  _updated_at: number;
+};
+
+type XGeneratedModuleRegistry = {
+  _version: 1;
+  _modules: Record<string, XGeneratedModuleRegistryEntry | unknown>;
+};
+
+type XModuleCreatorAutoloadStats = {
+  _loaded_count: number;
+  _skipped_count: number;
+  _failed_count: number;
+};
+
+function module_creator_debug_log(
+  message: string,
+  data?: Record<string, unknown>
+) {
+  if (Boolean((_xlog as unknown as { _debug?: boolean })._debug)) {
+    _xlog.log(
+      message,
+      data
+    );
+  }
+}
+
+function fresh_generated_module_registry(): XGeneratedModuleRegistry {
+  return {
+    _version: 1,
+    _modules: {}
+  };
+}
+
+async function read_generated_module_registry(
+  registry_file: string
+): Promise<XGeneratedModuleRegistry> {
+  try {
+    const registry_json =
+      await readFile(
+        registry_file,
+        "utf-8"
+      );
+
+    const registry =
+      JSON.parse(registry_json) as unknown;
+
+    if (
+      is_record(registry) &&
+      registry._version === 1 &&
+      is_record(registry._modules)
+    ) {
+      return {
+        _version: 1,
+        _modules: { ...registry._modules }
+      };
+    }
+  } catch (err: unknown) {
+    const code =
+      is_record(err)
+        ? err.code
+        : undefined;
+
+    if (code === "ENOENT") {
+      return fresh_generated_module_registry();
+    }
+  }
+
+  _xlog.warn("[module-creator] malformed registry ignored", {
+    _registry_file: registry_file
+  });
+
+  return fresh_generated_module_registry();
+}
+
+function is_trusted_autoload_registry_entry(
+  entry: unknown
+): entry is XGeneratedModuleRegistryEntry {
+  return (
+    is_record(entry) &&
+    entry._autoload === true &&
+    entry._created_by === "module-creator" &&
+    entry._target === "server" &&
+    typeof entry._id === "string" &&
+    SAFE_MODULE_OR_OP_NAME.test(entry._id) &&
+    typeof entry._name === "string" &&
+    SAFE_MODULE_OR_OP_NAME.test(entry._name) &&
+    typeof entry._manifest_sha256 === "string" &&
+    entry._manifest_sha256.trim().length > 0 &&
+    typeof entry._module_sha256 === "string" &&
+    entry._module_sha256.trim().length > 0
+  );
+}
+
+function registry_entry_state(
+  entry: unknown
+): XGeneratedModuleRegistryState {
+  if (
+    is_record(entry) &&
+    entry._state === "pending_implementation"
+  ) {
+    return "pending_implementation";
+  }
+
+  return "implemented";
+}
+
+function registry_entry_pending_implementation(
+  entry: unknown
+) {
+  return registry_entry_state(entry) === "pending_implementation";
+}
+
+async function read_generated_module_registry_entry(
+  work_folder: string,
+  module_id: string
+) {
+  const registry =
+    await read_generated_module_registry(
+      registry_path(work_folder)
+    );
+
+  return registry._modules[module_id];
+}
+
+async function update_generated_module_registry(
+  work_folder: string,
+  spec: XGeneratedModuleSpec,
+  manifest_json: string,
+  module_js: string,
+  state: XGeneratedModuleRegistryState
+) {
+  const artifact_path =
+    planned_artifact_path(
+      work_folder,
+      spec._id
+    );
+  const manifest_file =
+    manifest_path(artifact_path);
+  const module_file =
+    module_file_path(artifact_path);
+  const registry_file =
+    registry_path(work_folder);
+  const registry =
+    await read_generated_module_registry(
+      registry_file
+    );
+  const now =
+    Date.now();
+  const existing_entry =
+    registry._modules[spec._id];
+  const existing_created_at =
+    is_record(existing_entry) &&
+      typeof existing_entry._created_at === "number"
+      ? existing_entry._created_at
+      : undefined;
+  const manifest_hash =
+    manifest_sha256(manifest_json);
+  const module_hash =
+    content_sha256(module_js);
+  const implementation_complete =
+    state === "implemented";
+
+  registry._modules[spec._id] = {
+    _id: spec._id,
+    _name: spec._name,
+    _target: "server",
+    _artifact_path: artifact_path,
+    _manifest_file: manifest_file,
+    _module_file: module_file,
+    _manifest_sha256: manifest_hash,
+    _module_sha256: module_hash,
+    _autoload: implementation_complete,
+    _state: state,
+    _implementation_complete: implementation_complete,
+    _created_by: "module-creator",
+    _created_at: existing_created_at ?? now,
+    _updated_at: now
+  };
+
+  await writeFile(
+    `${registry_file}.tmp`,
+    JSON.stringify(registry, null, 2),
+    "utf-8"
+  );
+
+  await rename(
+    `${registry_file}.tmp`,
+    registry_file
+  );
+
+  _xlog.log("[module-creator] registry updated", {
+    _module_id: spec._id,
+    _registry_file: registry_file,
+    _state: state,
+    _autoload: implementation_complete,
+    _manifest_sha256: manifest_hash,
+    _module_sha256: module_hash
+  });
 }
 
 function empty_generated_module_checks() {
@@ -230,9 +531,19 @@ function empty_generated_module_checks() {
 function has_forbidden_generated_content(
   module_js: string
 ) {
-  return FORBIDDEN_GENERATED_CONTENT.some((token) =>
-    module_js.includes(token)
+  return FORBIDDEN_GENERATED_PATTERNS.some((pattern) =>
+    pattern.test(module_js)
   );
+}
+
+function detect_placeholder_implementation_patterns(
+  method_source: string
+) {
+  return PLACEHOLDER_IMPLEMENTATION_PATTERNS
+    .filter((pattern) =>
+      pattern._pattern.test(method_source)
+    )
+    .map((pattern) => pattern._label);
 }
 
 function extract_generated_method_names(
@@ -242,7 +553,7 @@ function extract_generated_method_names(
     [];
 
   const method_pattern =
-    /^\s{2}(_[a-z][a-z0-9_]*)\(\)\s*\{/gm;
+    /^\s{2}(?:async\s+)?(_[a-z][a-z0-9_]*)\([^)]*\)\s*\{/gm;
 
   let match: RegExpExecArray | null;
 
@@ -260,7 +571,7 @@ function extract_public_method_names(
     [];
 
   const method_pattern =
-    /^\s{2}([A-Za-z_$][A-Za-z0-9_$]*)\(\)\s*\{/gm;
+    /^\s{2}(?:async\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\([^)]*\)\s*\{/gm;
 
   let match: RegExpExecArray | null;
 
@@ -370,6 +681,549 @@ function public_methods_match_manifest(
   );
 }
 
+type XDeclaredGeneratedMethod = {
+  _method_name: string;
+  _start: number;
+  _end: number;
+  _body_start: number;
+  _body_end: number;
+  _source: string;
+};
+
+function find_matching_brace(
+  source: string,
+  open_index: number
+) {
+  let depth =
+    0;
+  let quote:
+    | "\""
+    | "'"
+    | "`"
+    | undefined;
+  let escaped =
+    false;
+  let in_line_comment =
+    false;
+  let in_block_comment =
+    false;
+
+  for (let index = open_index; index < source.length; index++) {
+    const char =
+      source[index];
+    const next =
+      source[index + 1];
+
+    if (in_line_comment) {
+      if (char === "\n") {
+        in_line_comment = false;
+      }
+      continue;
+    }
+
+    if (in_block_comment) {
+      if (
+        char === "*" &&
+        next === "/"
+      ) {
+        in_block_comment = false;
+        index++;
+      }
+      continue;
+    }
+
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (char === quote) {
+        quote = undefined;
+      }
+      continue;
+    }
+
+    if (
+      char === "/" &&
+      next === "/"
+    ) {
+      in_line_comment = true;
+      index++;
+      continue;
+    }
+
+    if (
+      char === "/" &&
+      next === "*"
+    ) {
+      in_block_comment = true;
+      index++;
+      continue;
+    }
+
+    if (
+      char === "\"" ||
+      char === "'" ||
+      char === "`"
+    ) {
+      quote = char;
+      continue;
+    }
+
+    if (char === "{") {
+      depth++;
+      continue;
+    }
+
+    if (char === "}") {
+      depth--;
+
+      if (depth === 0) {
+        return index;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function extract_declared_generated_methods(
+  module_js: string,
+  spec: XGeneratedModuleSpec
+) {
+  const methods =
+    new Map<string, XDeclaredGeneratedMethod>();
+
+  for (const op of spec._ops) {
+    const method_name =
+      op_method_name(op._name);
+    const method_pattern =
+      new RegExp(
+        `^  (?:async\\s+)?${escape_regexp(method_name)}\\([^)]*\\)\\s*\\{`,
+        "m"
+      );
+    const match =
+      method_pattern.exec(module_js);
+
+    if (!match) {
+      continue;
+    }
+
+    const body_start =
+      module_js.indexOf(
+        "{",
+        match.index
+      );
+    const body_end =
+      find_matching_brace(
+        module_js,
+        body_start
+      );
+
+    if (
+      body_start < 0 ||
+      body_end < 0
+    ) {
+      continue;
+    }
+
+    methods.set(
+      method_name,
+      {
+        _method_name: method_name,
+        _start: match.index,
+        _end: body_end + 1,
+        _body_start: body_start,
+        _body_end: body_end,
+        _source: module_js.slice(
+          match.index,
+          body_end + 1
+        )
+      }
+    );
+  }
+
+  return methods;
+}
+
+function strip_declared_method_bodies(
+  module_js: string,
+  spec: XGeneratedModuleSpec
+) {
+  const methods =
+    Array.from(
+      extract_declared_generated_methods(
+        module_js,
+        spec
+      ).values()
+    ).sort((a, b) => b._body_start - a._body_start);
+
+  let out =
+    module_js;
+
+  for (const method of methods) {
+    out =
+      `${out.slice(0, method._body_start + 1)}/*__generated_method_body__*/${out.slice(method._body_end)}`;
+  }
+
+  return out;
+}
+
+function normalize_replacement_body(
+  body_source: string
+) {
+  const lines =
+    body_source
+      .trim()
+      .split("\n");
+  const non_empty_indents =
+    lines
+      .filter((line) => line.trim().length > 0)
+      .map((line) => /^(\s*)/.exec(line)?.[1].length ?? 0);
+  const common_indent =
+    non_empty_indents.length > 0
+      ? Math.min(...non_empty_indents)
+      : 0;
+
+  return lines
+    .map((line) =>
+      line.trim().length === 0
+        ? ""
+        : `    ${line.slice(common_indent).trimEnd()}`
+    )
+    .join("\n");
+}
+
+function strip_js_comments(
+  source: string
+) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/.*$/gm, "");
+}
+
+function is_explicitly_trivial_generated_op(
+  op?: XGeneratedModuleOpSpec
+) {
+  if (!op) {
+    return false;
+  }
+
+  const param_count =
+    op._params && is_record(op._params)
+      ? Object.keys(op._params).length
+      : 0;
+  const result_count =
+    op._result && is_record(op._result)
+      ? Object.keys(op._result).length
+      : 0;
+
+  if (param_count > 0 || result_count > 0) {
+    return false;
+  }
+
+  return /^(ping|pong|health|status|version|noop|no-op)$/i.test(op._name);
+}
+
+function is_non_trivial_generated_op(
+  op?: XGeneratedModuleOpSpec
+) {
+  if (!op) {
+    return true;
+  }
+
+  if (is_explicitly_trivial_generated_op(op)) {
+    return false;
+  }
+
+  const has_params =
+    op._params && is_record(op._params) &&
+    Object.keys(op._params).length > 0;
+  const has_result =
+    op._result && is_record(op._result) &&
+    Object.keys(op._result).length > 0;
+
+  if (has_params || has_result) {
+    return true;
+  }
+
+  return !/^(ping|pong|health|status|version|noop|no-op)$/i.test(op._name);
+}
+
+function method_body_has_meaningful_behavior(
+  body_source: string
+) {
+  const source =
+    strip_js_comments(body_source);
+
+  return (
+    /\b(?:if|switch|for|while|catch|throw|await)\b/.test(source) ||
+    /\?[\s\S]*:/.test(source) ||
+    /\bthis\.[A-Za-z_$][A-Za-z0-9_$]*\s*=/.test(source) ||
+    /\bthis\.[A-Za-z_$][A-Za-z0-9_$]*\.(?:push|set|add|delete|clear|splice)\s*\(/.test(source) ||
+    /\b(?:Math\.[A-Za-z]+|Number|String|Boolean|JSON\.parse|Date\.now)\s*\(/.test(source) ||
+    /\.(?:map|reduce|filter|sort|trim|split|join|toLowerCase|toUpperCase|replace|slice|substring|includes|match|test|find|some|every)\s*\(/.test(source) ||
+    /(?:\+\+|--|[-+*/%]=)/.test(source) ||
+    /[A-Za-z0-9_$)\]]\s*[-+*/%]\s*[A-Za-z0-9_$([{"']/.test(source)
+  );
+}
+
+function method_body_returns_params_only(
+  body_source: string
+) {
+  return /return\s+(?:params|xcmd\._params|xcmd\s*&&\s*xcmd\._params)\s*;/.test(body_source) ||
+    /return\s*\{\s*(?:_ok\s*:\s*true\s*,\s*)?(?:_result\s*:\s*)?(?:params|xcmd\._params)\s*,?\s*\}\s*;?/s.test(body_source);
+}
+
+function method_body_returns_success_only(
+  body_source: string
+) {
+  return /return\s*\{\s*_ok\s*:\s*true\s*,?\s*\}\s*;?\s*$/s.test(body_source);
+}
+
+function method_body_returns_constant_message(
+  body_source: string
+) {
+  return /return\s*\{[\s\S]*(?:_message|message)\s*:\s*["'`][^"'`]*["'`][\s\S]*\}\s*;?\s*$/s.test(body_source) &&
+    !/\$\{/.test(body_source) &&
+    !method_body_has_meaningful_behavior(body_source);
+}
+
+function validate_weak_method_behavior(
+  method_name: string,
+  body_source: string,
+  op?: XGeneratedModuleOpSpec,
+  module_id?: string
+): XModuleCreatorResult<{ _body: string }> | undefined {
+  if (!is_non_trivial_generated_op(op)) {
+    return undefined;
+  }
+
+  const weak_reasons: string[] =
+    [];
+
+  if (method_body_returns_params_only(body_source)) {
+    weak_reasons.push("returns params without implementing behavior");
+  }
+
+  if (method_body_returns_success_only(body_source)) {
+    weak_reasons.push("returns only success true");
+  }
+
+  if (method_body_returns_constant_message(body_source)) {
+    weak_reasons.push("returns a constant message");
+  }
+
+  if (!method_body_has_meaningful_behavior(body_source)) {
+    weak_reasons.push("contains no branching, state mutation, calculation, validation, or meaningful transform");
+  }
+
+  if (weak_reasons.length === 0) {
+    return undefined;
+  }
+
+  return fail(
+    "E_MODULE_CREATOR_IMPLEMENTATION_WEAK_BEHAVIOR",
+    "Method replacement appears to be stub behavior for a non-trivial generated op",
+    {
+      ...(module_id ? { _id: module_id } : {}),
+      _method_name: method_name,
+      ...(op ? { _op_name: op._name } : {}),
+      _reasons: weak_reasons
+    },
+    "weak_behavior"
+  ) as XModuleCreatorResult<{ _body: string }>;
+}
+
+function validate_method_replacement_source(
+  method_name: string,
+  method_source: string,
+  module_id?: string,
+  op?: XGeneratedModuleOpSpec
+): XModuleCreatorResult<{ _body: string }> {
+  if (
+    typeof method_source !== "string" ||
+    method_source.trim().length === 0
+  ) {
+    return fail(
+      "E_MODULE_CREATOR_IMPLEMENTATION_METHOD_EMPTY",
+      "Method replacement source must be a non-empty string",
+      { _method_name: method_name },
+      "syntax_or_shape_error"
+    ) as XModuleCreatorResult<{ _body: string }>;
+  }
+
+  const placeholder_patterns =
+    detect_placeholder_implementation_patterns(
+      method_source
+    );
+
+  if (placeholder_patterns.length > 0) {
+    _xlog.warn(
+      "[module-creator] placeholder implementation rejected",
+      {
+        ...(module_id ? { _module_id: module_id } : {}),
+        _method_name: method_name,
+        _placeholders: placeholder_patterns,
+        _source: method_source
+      }
+    );
+
+    return fail(
+      "E_MODULE_CREATOR_IMPLEMENTATION_PLACEHOLDER",
+      "Method replacement contains placeholder implementation text",
+      {
+        ...(module_id ? { _id: module_id } : {}),
+        _method_name: method_name,
+        _placeholders: placeholder_patterns
+      },
+      "placeholder_content"
+    ) as XModuleCreatorResult<{ _body: string }>;
+  }
+
+  if (has_forbidden_generated_content(method_source)) {
+    return fail(
+      "E_MODULE_CREATOR_IMPLEMENTATION_FORBIDDEN_CONTENT",
+      "Method replacement contains forbidden runtime content",
+      { _method_name: method_name },
+      "forbidden_content"
+    ) as XModuleCreatorResult<{ _body: string }>;
+  }
+
+  if (
+    /^\s*import\s+/m.test(method_source) ||
+    /^\s*export\s+/m.test(method_source) ||
+    /\bclass\s+[A-Za-z_$]/.test(method_source) ||
+    /\bstatic\s+_/.test(method_source) ||
+    /\bconstructor\s*\(/.test(method_source)
+  ) {
+    return fail(
+      "E_MODULE_CREATOR_IMPLEMENTATION_SCOPE_VIOLATION",
+      "Method replacement may not change imports, exports, classes, static metadata, or constructor",
+      { _method_name: method_name },
+      "syntax_or_shape_error"
+    ) as XModuleCreatorResult<{ _body: string }>;
+  }
+
+  const trimmed =
+    method_source.trim();
+  const method_header_pattern =
+    new RegExp(
+      `^(?:async\\s+)?${escape_regexp(method_name)}\\s*\\(([^)]*)\\)\\s*\\{`
+    );
+  const method_match =
+    method_header_pattern.exec(trimmed);
+
+  let body_source =
+    trimmed;
+  let argument_alias:
+    | string
+    | undefined;
+
+  if (method_match) {
+    const body_start =
+      trimmed.indexOf(
+        "{",
+        method_match.index
+      );
+    const body_end =
+      find_matching_brace(
+        trimmed,
+        body_start
+      );
+
+    if (
+      body_start < 0 ||
+      body_end < 0 ||
+      trimmed.slice(body_end + 1).trim().length > 0
+    ) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_METHOD_INVALID",
+        "Method replacement must contain exactly one method declaration",
+        { _method_name: method_name },
+        "syntax_or_shape_error"
+      ) as XModuleCreatorResult<{ _body: string }>;
+    }
+
+    body_source =
+      trimmed.slice(
+        body_start + 1,
+        body_end
+      );
+
+    const first_param =
+      method_match[1]
+        ?.split(",")[0]
+        ?.trim();
+
+    if (
+      first_param &&
+      SAFE_PARAM_NAME.test(first_param) &&
+      new RegExp(`\\b${escape_regexp(first_param)}\\b`).test(body_source) &&
+      !new RegExp(`\\b(?:const|let|var)\\s+${escape_regexp(first_param)}\\b`).test(body_source)
+    ) {
+      argument_alias =
+        `const ${first_param} = arguments[0];`;
+    }
+  } else if (/^(?:async\s+)?_[a-z][a-z0-9_]*\s*\(/.test(trimmed)) {
+    return fail(
+      "E_MODULE_CREATOR_IMPLEMENTATION_METHOD_MISMATCH",
+      "Method replacement declaration does not match the declared manifest op method",
+      { _method_name: method_name },
+      "syntax_or_shape_error"
+    ) as XModuleCreatorResult<{ _body: string }>;
+  }
+
+  const weak_behavior =
+    validate_weak_method_behavior(
+      method_name,
+      body_source,
+      op,
+      module_id
+    );
+
+  if (weak_behavior) {
+    return weak_behavior;
+  }
+
+  return ok({
+    _body: normalize_replacement_body(
+      argument_alias
+        ? `${argument_alias}\n${body_source}`
+        : body_source
+    )
+  });
+}
+
+function replace_generated_method(
+  module_js: string,
+  method: XDeclaredGeneratedMethod,
+  method_body: string
+) {
+  return `${module_js.slice(0, method._body_start + 1)}\n${method_body}\n  ${module_js.slice(method._body_end)}`;
+}
+
+async function update_generated_module_registry_after_module_change(
+  work_folder: string,
+  spec: XGeneratedModuleSpec,
+  manifest_json: string,
+  module_js: string
+) {
+  await update_generated_module_registry(
+    work_folder,
+    spec,
+    manifest_json,
+    module_js,
+    "implemented"
+  );
+}
+
 function generated_metadata_valid(
   spec: XGeneratedModuleSpec,
   module_js: string
@@ -448,6 +1302,15 @@ function render_generated_module_js(
       return acc;
     }, {});
 
+  const skill_export_ops =
+    spec._ops.map((op) => ({
+      _name: op._name,
+      _scope: "module",
+      _description: op._description,
+      ...(op._params ? { _params: op._params } : {}),
+      ...(op._result ? { _result: op._result } : {})
+    }));
+
   const skill_prefix =
     generated_json({
       _id: spec._id,
@@ -465,7 +1328,7 @@ function render_generated_module_js(
             _name: spec._name,
             _scope: "server",
             _description: description,
-            _ops: "__XMODULE_CREATOR_OPS__"
+            _ops: skill_export_ops
           }
         ]
       },
@@ -475,19 +1338,86 @@ function render_generated_module_js(
         "Generated module code must not add undeclared ops.",
         "Generated module code must not add undeclared imports."
       ]
-    })
-      .replace(
-        "\"__XMODULE_CREATOR_OPS__\"",
-        `Object.values(${class_name}._ops)`
-      );
+    });
+
+  const op_behaviors =
+    is_record(spec._meta) && is_record(spec._meta._op_behaviors)
+      ? spec._meta._op_behaviors
+      : {};
 
   const methods =
-    spec._ops.map((op) => `  ${op_method_name(op._name)}() {
+    spec._ops.map((op) => {
+      const behavior =
+        typeof op_behaviors[op._name] === "string"
+          ? op_behaviors[op._name]
+          : undefined;
+
+      if (behavior === "safe_arithmetic_add_sub") {
+        return `  async ${op_method_name(op._name)}(xcmd) {
+    const params =
+      xcmd && typeof xcmd._params === "object" && xcmd._params !== null && !Array.isArray(xcmd._params)
+        ? xcmd._params
+        : {};
+    let expression =
+      typeof params.expression === "string"
+        ? params.expression
+        : typeof params._expression === "string"
+          ? params._expression
+          : "";
+
+    if (typeof params._xdata_key === "string" && params._xdata_key.trim()) {
+      return {
+        _ok: false,
+        _error: {
+          _code: "E_CALC_XDATA_UNSUPPORTED",
+          _message: "_xdata_key is unsupported in generated server modules because server xd is not client xd."
+        }
+      };
+    }
+
+    const normalized_expression = expression.trim().replace(/=$/, "");
+
+    if (!/^[0-9+\\-.\\s]+$/.test(normalized_expression) || !/[0-9]/.test(normalized_expression)) {
+      return {
+        _ok: false,
+        _error: {
+          _code: "E_CALC_UNSAFE_EXPRESSION",
+          _message: "Expression may contain only numbers, spaces, +, -, decimal point, and an optional trailing =."
+        }
+      };
+    }
+
+    const tokens = normalized_expression.match(/[+-]?\\s*(?:\\d+(?:\\.\\d+)?|\\.\\d+)/g) ?? [];
+    const compact = normalized_expression.replace(/\\s+/g, "");
+    if (tokens.join("").replace(/\\s+/g, "") !== compact) {
+      return {
+        _ok: false,
+        _error: {
+          _code: "E_CALC_INVALID_EXPRESSION",
+          _message: "Expression is not a valid addition/subtraction expression."
+        }
+      };
+    }
+
+    const result = tokens.reduce((sum, token) => sum + Number(token.replace(/\\s+/g, "")), 0);
+
+    return {
+      _ok: true,
+      _result: {
+        result,
+        value: String(result)
+      }
+    };
+  }`;
+      }
+
+      return `  ${op_method_name(op._name)}() {
     return {
       _ok: true,
       _message: "Not implemented"
     };
-  }`).join("\n\n");
+  }`;
+    }).join("\n\n");
 
   return `/**
  * @xmodule_generated
@@ -823,6 +1753,17 @@ export class XModuleCreatorModule extends XModule {
           _id: "string",
           _reload: "boolean"
         }
+      },
+      "implement-generated-module": {
+        _name: "implement-generated-module",
+        _scope: "module",
+        _description:
+          "Apply controlled method-body replacements to declared ops in a generated module artifact.",
+        _params: {
+          _id: "string",
+          _implementation_request: "string",
+          _context: "Record<string, unknown>"
+        }
       }
     };
 
@@ -836,13 +1777,301 @@ export class XModuleCreatorModule extends XModule {
     });
     this._work_folder =
       typeof opts._work_folder === "string" &&
-      opts._work_folder.trim()
+        opts._work_folder.trim()
         ? opts._work_folder
         : undefined;
   }
 
   override async onLoad() {
     _xlog.log("[module-creator] loaded");
+    await this.autoload_registered_modules();
+  }
+
+  private warn_autoload_skip(
+    module_id: string,
+    reason: string,
+    error?: unknown
+  ) {
+    _xlog.warn("[module-creator] registered module autoload skipped", {
+      _module_id: module_id,
+      _reason: reason,
+      ...(error
+        ? { _error: error instanceof Error ? error.message : String(error) }
+        : {})
+    });
+  }
+
+  private warn_autoload_failed(
+    module_id: string,
+    reason: string,
+    error?: unknown
+  ) {
+    _xlog.warn("[module-creator] registered module autoload failed", {
+      _module_id: module_id,
+      _reason: reason,
+      ...(error
+        ? { _error: error instanceof Error ? error.message : String(error) }
+        : {})
+    });
+  }
+
+  private warn_autoload_pending_implementation(
+    module_id: string
+  ) {
+    _xlog.warn("[module-creator] autoload skipped pending implementation", {
+      _module_id: module_id,
+      _state: "pending_implementation"
+    });
+  }
+
+  private async autoload_registered_module(
+    entry: XGeneratedModuleRegistryEntry,
+    stats: XModuleCreatorAutoloadStats
+  ) {
+    const id =
+      entry._id;
+    const artifact_path =
+      planned_artifact_path(
+        this._work_folder!,
+        id
+      );
+    const manifest_file =
+      manifest_path(artifact_path);
+    const module_file =
+      module_file_path(artifact_path);
+
+    let manifest_json: string;
+    let module_js: string;
+    let spec: unknown;
+
+    try {
+      manifest_json =
+        await readFile(
+          manifest_file,
+          "utf-8"
+        );
+      module_js =
+        await readFile(
+          module_file,
+          "utf-8"
+        );
+      spec =
+        JSON.parse(manifest_json);
+    } catch (err: unknown) {
+      stats._skipped_count++;
+      this.warn_autoload_skip(
+        id,
+        "artifact_read_failed",
+        err
+      );
+      return;
+    }
+
+    const manifest_hash =
+      content_sha256(manifest_json);
+    const module_hash =
+      content_sha256(module_js);
+
+    if (
+      manifest_hash !== entry._manifest_sha256 ||
+      module_hash !== entry._module_sha256
+    ) {
+      stats._skipped_count++;
+      this.warn_autoload_skip(
+        id,
+        "hash_mismatch"
+      );
+      return;
+    }
+
+    const validation =
+      await this._validate_generated_module({
+        _module: XModuleCreatorModule._name,
+        _op: "validate-generated-module",
+        _params: {
+          _id: id
+        }
+      } as unknown as XCommand);
+
+    if (
+      !validation._ok ||
+      !validation._valid
+    ) {
+      stats._skipped_count++;
+      this.warn_autoload_skip(
+        id,
+        "validation_failed"
+      );
+      return;
+    }
+
+    if (!is_record(spec)) {
+      stats._skipped_count++;
+      this.warn_autoload_skip(
+        id,
+        "invalid_manifest"
+      );
+      return;
+    }
+
+    const valid_spec =
+      spec as XGeneratedModuleSpec;
+
+    if (
+      valid_spec._id !== entry._id ||
+      valid_spec._name !== entry._name
+    ) {
+      stats._skipped_count++;
+      this.warn_autoload_skip(
+        id,
+        "registry_manifest_mismatch"
+      );
+      return;
+    }
+
+    if (_x.getModule(valid_spec._name)) {
+      stats._skipped_count++;
+      _xlog.log("[module-creator] registered module already loaded", {
+        _module_id: id,
+        _name: valid_spec._name
+      });
+      return;
+    }
+
+    const load_result =
+      await this._load_generated_module({
+        _module: XModuleCreatorModule._name,
+        _op: "load-generated-module",
+        _params: {
+          _id: id
+        }
+      } as unknown as XCommand);
+
+    if (!load_result._ok) {
+      stats._failed_count++;
+      this.warn_autoload_failed(
+        id,
+        "load_failed",
+        JSON.stringify(load_result)
+      );
+      return;
+    }
+
+    stats._loaded_count++;
+    _xlog.log("[module-creator] registered module autoloaded", {
+      _module_id: id,
+      _name: load_result._name
+    });
+  }
+
+  private async autoload_registered_modules() {
+    const stats: XModuleCreatorAutoloadStats =
+    {
+      _loaded_count: 0,
+      _skipped_count: 0,
+      _failed_count: 0
+    };
+
+    if (!this._work_folder) {
+      module_creator_debug_log(
+        "[module-creator] autoload skipped; work folder missing"
+      );
+      return;
+    }
+
+    _xlog.log("[module-creator] autoload registered modules start");
+
+    const registry_file =
+      registry_path(this._work_folder);
+
+    try {
+      let registry_json: string;
+
+      try {
+        registry_json =
+          await readFile(
+            registry_file,
+            "utf-8"
+          );
+      } catch (err: unknown) {
+        const code =
+          is_record(err)
+            ? err.code
+            : undefined;
+
+        if (code === "ENOENT") {
+          _xlog.log("[module-creator] autoload registered modules complete", stats);
+          return;
+        }
+
+        throw err;
+      }
+
+      let registry: unknown;
+
+      try {
+        registry =
+          JSON.parse(registry_json);
+      } catch (err: unknown) {
+        _xlog.warn("[module-creator] malformed registry ignored", {
+          _registry_file: registry_file,
+          _error: err instanceof Error ? err.message : String(err)
+        });
+        _xlog.log("[module-creator] autoload registered modules complete", stats);
+        return;
+      }
+
+      if (
+        !is_record(registry) ||
+        registry._version !== 1 ||
+        !is_record(registry._modules)
+      ) {
+        _xlog.warn("[module-creator] malformed registry ignored", {
+          _registry_file: registry_file
+        });
+        _xlog.log("[module-creator] autoload registered modules complete", stats);
+        return;
+      }
+
+      for (const [module_id, entry] of Object.entries(registry._modules)) {
+        if (registry_entry_pending_implementation(entry)) {
+          stats._skipped_count++;
+          this.warn_autoload_pending_implementation(module_id);
+          continue;
+        }
+
+        if (!is_trusted_autoload_registry_entry(entry)) {
+          stats._skipped_count++;
+          this.warn_autoload_skip(
+            module_id,
+            "untrusted_registry_entry"
+          );
+          continue;
+        }
+
+        try {
+          await this.autoload_registered_module(
+            entry,
+            stats
+          );
+        } catch (err: unknown) {
+          stats._failed_count++;
+          this.warn_autoload_failed(
+            entry._id,
+            "unexpected_autoload_error",
+            err
+          );
+        }
+      }
+    } catch (err: unknown) {
+      _xlog.warn("[module-creator] registered module autoload failed", {
+        _module_id: "*",
+        _reason: "autoload_registry_failed",
+        _error: err instanceof Error ? err.message : String(err)
+      });
+    }
+
+    _xlog.log("[module-creator] autoload registered modules complete", stats);
   }
 
   async _create_module_spec(
@@ -858,7 +2087,7 @@ export class XModuleCreatorModule extends XModule {
       return fail(
         "E_MODULE_CREATOR_INVALID_SPEC",
         "Module spec failed validation",
-      { _errors: validation }
+        { _errors: validation }
       ) as XModuleCreatorCreateSpecResult;
     }
 
@@ -900,6 +2129,30 @@ export class XModuleCreatorModule extends XModule {
     if (!generation._ok) {
       return generation as XModuleCreatorCreateSpecResult;
     }
+
+    const saved_manifest_json =
+      await readFile(
+        manifest_path(artifact_path),
+        "utf-8"
+      );
+    const saved_module_js =
+      await readFile(
+        module_file_path(artifact_path),
+        "utf-8"
+      );
+
+    await update_generated_module_registry(
+      this._work_folder,
+      generation._spec,
+      saved_manifest_json,
+      saved_module_js,
+      "pending_implementation"
+    );
+
+    _xlog.log("[module-creator] module created in pending state", {
+      _module_id: spec._id,
+      _artifact_path: artifact_path
+    });
 
     return ok({
       _spec: generation._spec,
@@ -1143,6 +2396,349 @@ export class XModuleCreatorModule extends XModule {
     );
   }
 
+  async _implement_generated_module(
+    xcmd: XCommand
+  ): Promise<XModuleCreatorImplementGeneratedModuleResult> {
+    const id =
+      read_id_param(xcmd._params);
+    const params =
+      is_record(xcmd._params)
+        ? xcmd._params
+        : {};
+    const context =
+      is_record(params._context)
+        ? params._context
+        : {};
+    const method_sources =
+      is_record(context._methods)
+        ? context._methods
+        : undefined;
+
+    if (
+      typeof id !== "string" ||
+      !SAFE_MODULE_OR_OP_NAME.test(id)
+    ) {
+      return fail(
+        "E_MODULE_CREATOR_INVALID_ID",
+        "Invalid '_id': expected snake_case/kebab-case safe module id",
+        { _field: "_id" }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    if (!this._work_folder) {
+      return fail(
+        "E_MODULE_CREATOR_WORK_FOLDER_REQUIRED",
+        "XModuleCreatorModule requires '_work_folder' for generated module implementation"
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    if (!method_sources) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_METHODS_REQUIRED",
+        "implement-generated-module requires '_context._methods' with method replacements keyed by declared method name",
+        {
+          _id: id,
+          _implementation_request:
+            typeof params._implementation_request === "string"
+              ? params._implementation_request
+              : undefined
+        }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    const artifact_path =
+      planned_artifact_path(
+        this._work_folder,
+        id
+      );
+    const module_file =
+      module_file_path(artifact_path);
+
+    const validation_before =
+      await this._validate_generated_module({
+        _module: XModuleCreatorModule._name,
+        _op: "validate-generated-module",
+        _params: {
+          _id: id
+        }
+      } as unknown as XCommand);
+
+    if (
+      !validation_before._ok ||
+      !validation_before._valid
+    ) {
+      return fail(
+        "E_MODULE_CREATOR_VALIDATION_FAILED",
+        "Generated module validation failed before implementation; refusing to edit",
+        {
+          _id: id,
+          _validation: validation_before
+        }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    let manifest_json: string;
+    let module_js: string;
+    let spec: unknown;
+
+    try {
+      const manifest =
+        await read_manifest_file(artifact_path);
+
+      manifest_json =
+        manifest.manifest_json;
+      spec =
+        manifest.spec;
+      module_js =
+        await readFile(
+          module_file,
+          "utf-8"
+        );
+    } catch {
+      return fail(
+        "E_MODULE_CREATOR_READ_FAILED",
+        "Failed to read generated module artifact for implementation",
+        { _id: id, _artifact_path: artifact_path }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    const manifest_errors =
+      validate_spec(spec);
+
+    if (manifest_errors.length > 0) {
+      return fail(
+        "E_MODULE_CREATOR_INVALID_STORED_SPEC",
+        "Stored module spec failed validation",
+        {
+          _id: id,
+          _artifact_path: artifact_path,
+          _errors: manifest_errors
+        }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    const valid_spec =
+      spec as XGeneratedModuleSpec;
+    const declared_methods =
+      extract_declared_generated_methods(
+        module_js,
+        valid_spec
+      );
+    const declared_method_names =
+      new Set(
+        valid_spec._ops.map((op) => op_method_name(op._name))
+      );
+    const declared_ops_by_method =
+      new Map<string, XGeneratedModuleOpSpec>(
+        valid_spec._ops.map((op) => [
+          op_method_name(op._name),
+          op
+        ])
+      );
+    const requested_method_names =
+      Object.keys(method_sources);
+
+    if (requested_method_names.length === 0) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_METHODS_REQUIRED",
+        "No method replacements were provided",
+        { _id: id }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    for (const method_name of requested_method_names) {
+      if (!declared_method_names.has(method_name)) {
+        return fail(
+          "E_MODULE_CREATOR_IMPLEMENTATION_UNDECLARED_METHOD",
+          "Method replacement is not declared by manifest ops",
+          {
+            _id: id,
+            _method_name: method_name
+          }
+        ) as XModuleCreatorImplementGeneratedModuleResult;
+      }
+
+      if (!declared_methods.has(method_name)) {
+        return fail(
+          "E_MODULE_CREATOR_IMPLEMENTATION_METHOD_NOT_FOUND",
+          "Declared generated method was not found in module.js",
+          {
+            _id: id,
+            _method_name: method_name
+          }
+        ) as XModuleCreatorImplementGeneratedModuleResult;
+      }
+    }
+
+    let next_module_js =
+      module_js;
+    const replacements =
+      requested_method_names
+        .map((method_name) => ({
+          method: declared_methods.get(method_name)!,
+          source: method_sources[method_name]
+        }))
+        .sort((a, b) => b.method._body_start - a.method._body_start);
+    const implemented_methods: string[] =
+      [];
+
+    for (const replacement of replacements) {
+      if (typeof replacement.source !== "string") {
+        return fail(
+          "E_MODULE_CREATOR_IMPLEMENTATION_METHOD_INVALID",
+          "Method replacement source must be a string",
+          {
+            _id: id,
+            _method_name: replacement.method._method_name
+          }
+        ) as XModuleCreatorImplementGeneratedModuleResult;
+      }
+
+      _xlog.log(
+        "[module-creator] validating implementation source",
+        {
+          _module_id: id,
+          _method_name: replacement.method._method_name,
+          _source: replacement.source
+        }
+      );
+
+      const validated_replacement =
+        validate_method_replacement_source(
+          replacement.method._method_name,
+          replacement.source,
+          id,
+          declared_ops_by_method.get(replacement.method._method_name)
+        );
+
+      if (!validated_replacement._ok) {
+        _xlog.warn(
+          "[module-creator] implementation validation failed",
+          {
+            _module_id: id,
+            _method_name: replacement.method._method_name,
+            _source: replacement.source,
+            _error: validated_replacement
+          }
+        );
+
+        return validated_replacement as XModuleCreatorImplementGeneratedModuleResult;
+      }
+
+      next_module_js =
+        replace_generated_method(
+          next_module_js,
+          replacement.method,
+          validated_replacement._body
+        );
+      implemented_methods.push(
+        replacement.method._method_name
+      );
+    }
+
+    if (
+      strip_declared_method_bodies(
+        module_js,
+        valid_spec
+      ) !==
+      strip_declared_method_bodies(
+        next_module_js,
+        valid_spec
+      )
+    ) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_SCOPE_VIOLATION",
+        "Implementation changed generated module content outside declared method bodies",
+        { _id: id }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    const manifest_hash =
+      manifest_sha256(manifest_json);
+    const expected_class_name =
+      module_class_name(valid_spec._name);
+    const candidate_valid =
+      generated_metadata_valid(valid_spec, next_module_js) &&
+      manifest_hash_valid(next_module_js, manifest_hash) &&
+      imports_are_valid(next_module_js) &&
+      new RegExp(
+        `export class ${escape_regexp(expected_class_name)}\\b`
+      ).test(next_module_js) &&
+      new RegExp(
+        `export class ${escape_regexp(expected_class_name)} extends XModule\\b`
+      ).test(next_module_js) &&
+      next_module_js.includes(
+        `static _name = ${JSON.stringify(valid_spec._name)};`
+      ) &&
+      module_ops_match_manifest(valid_spec, next_module_js) &&
+      generated_skill_valid(valid_spec, next_module_js) &&
+      public_methods_match_manifest(valid_spec, next_module_js) &&
+      !has_forbidden_generated_content(next_module_js);
+
+    if (!candidate_valid) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_VALIDATION_FAILED",
+        "Implemented module candidate failed static validation before write",
+        { _id: id }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    await writeFile(
+      module_file,
+      next_module_js,
+      "utf-8"
+    );
+
+    const validation_after =
+      await this._validate_generated_module({
+        _module: XModuleCreatorModule._name,
+        _op: "validate-generated-module",
+        _params: {
+          _id: id
+        }
+      } as unknown as XCommand);
+
+    if (
+      !validation_after._ok ||
+      !validation_after._valid
+    ) {
+      return fail(
+        "E_MODULE_CREATOR_IMPLEMENTATION_VALIDATION_FAILED",
+        "Implemented module failed validate-generated-module after write",
+        {
+          _id: id,
+          _validation: validation_after
+        }
+      ) as XModuleCreatorImplementGeneratedModuleResult;
+    }
+
+    await update_generated_module_registry_after_module_change(
+      this._work_folder,
+      valid_spec,
+      manifest_json,
+      next_module_js
+    );
+
+    _xlog.log("[module-creator] module marked implemented", {
+      _module_id: id,
+      _implemented_methods: implemented_methods
+    });
+
+    _xlog.log("[module-creator] generated module implemented", {
+      _module_id: id,
+      _implemented_methods: implemented_methods
+    });
+
+    return ok({
+      _id: id,
+      _artifact_path: artifact_path,
+      _module_file: module_file,
+      _implemented_methods: implemented_methods,
+      _module_sha256: content_sha256(next_module_js),
+      _validation: validation_after
+    });
+  }
+
   async _load_generated_module(
     xcmd: XCommand
   ): Promise<XModuleCreatorLoadGeneratedModuleResult> {
@@ -1184,6 +2780,28 @@ export class XModuleCreatorModule extends XModule {
       _artifact_path: artifact_path,
       _reload: reload
     });
+
+    const registry_entry =
+      await read_generated_module_registry_entry(
+        this._work_folder,
+        id
+      );
+
+    if (registry_entry_pending_implementation(registry_entry)) {
+      _xlog.log("[module-creator] generated module load failed", {
+        _module_id: id,
+        _reason: "pending_implementation"
+      });
+
+      return fail(
+        "E_MODULE_CREATOR_PENDING_IMPLEMENTATION",
+        "Generated module implementation has not completed; refusing to load",
+        {
+          _id: id,
+          _state: "pending_implementation"
+        }
+      ) as XModuleCreatorLoadGeneratedModuleResult;
+    }
 
     const validation =
       await this._validate_generated_module({
@@ -1602,6 +3220,18 @@ export class XModuleCreatorModule extends XModule {
       checks._forbidden_content =
         has_forbidden_generated_content(module_js);
 
+      if (checks._forbidden_content) {
+        const matched =
+          FORBIDDEN_GENERATED_PATTERNS
+            .filter(pattern => pattern.test(module_js))
+            .map(pattern => pattern.toString());
+
+        _xlog.warn("[module-creator] forbidden content matched", {
+          _module_id: id,
+          _matched: matched
+        });
+      }
+
       if (!checks._generated_metadata_valid) {
         push_error(
           errors,
@@ -1847,6 +3477,18 @@ export class XModuleCreatorModule extends XModule {
         manifest_hash
       ),
       "utf-8"
+    );
+
+    await writeFile(
+      path.join(artifact_path, PACKAGE_FILE),
+      JSON.stringify({
+        type: "module"
+      }, null, 2),
+      "utf-8"
+    );
+
+    await ensure_generated_package_resolution(
+      artifact_path
     );
 
     _xlog.log("[module-creator] artifact metadata generated", {

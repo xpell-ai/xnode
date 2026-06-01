@@ -15,8 +15,11 @@ export type VibeRuntimeCapabilityRegistry = {
   _semantic_object_ids: string[];
   _module_ids: string[];
   _ops: string[];
+  _module_ops: Record<string, string[]>;
   _capability_keywords: string[];
 };
+
+export type VibeModuleTarget = "server" | "client" | null;
 
 export type VibeIntentPlan = XVibeIntentIR & {
   _intent_type: string;
@@ -29,6 +32,11 @@ export type VibeIntentPlan = XVibeIntentIR & {
   _style: XVibeIntentIRStyle;
   _xui_objects: string[];
   _modules: string[];
+  _requires_module: boolean;
+  _module_target: VibeModuleTarget;
+  _module_name?: string;
+  _module_ops: string[];
+  _module_reason?: string;
   _entities: XVibeIntentIREntity[];
   _capabilities: string[];
   _crud_ops: string[];
@@ -51,12 +59,14 @@ const INTENT_REGION_IDS = [
   "content",
 ];
 const INTENT_OBJECT_IDS = [
+  "view",
   "sidebar",
   "navlist",
   "toolbar",
   "field",
   "button",
   "xsection",
+  "stack",
   "grid",
   "card",
   "kpi-card",
@@ -70,11 +80,51 @@ const INTENT_OBJECT_IDS = [
 const INTENT_OBJECT_ALIASES: Record<string, string> = {
   "nav-list": "navlist",
   section: "xsection",
-  stack: "xsection",
-  view: "xsection",
 };
+const SIMPLE_UI_CRUD_REGION_IDS = new Set([
+  "records_table",
+  "create_modal",
+  "details_drawer",
+  "filters",
+]);
+const SIMPLE_UI_REGION_TERMS: Record<string, string[]> = {
+  sidebar: ["sidebar", "side bar"],
+  toolbar: ["toolbar", "tool bar"],
+  content: ["content"],
+  kpi_grid: ["kpi", "kpis", "metrics"],
+};
+const UI_ENTITY_NAMES = new Set([
+  "view",
+  "views",
+  "page",
+  "pages",
+  "screen",
+  "screens",
+  "layout",
+  "layouts",
+  "dashboard",
+  "dashboards",
+  "form",
+  "forms",
+  "button",
+  "buttons",
+  "grid",
+  "grids",
+  "row",
+  "rows",
+  "column",
+  "columns",
+]);
 const ENTITY_STOP_WORDS = new Set([
   "xpell",
+  "view",
+  "views",
+  "page",
+  "pages",
+  "screen",
+  "screens",
+  "layout",
+  "layouts",
   "statistic",
   "statistics",
   "status",
@@ -104,8 +154,33 @@ const ENTITY_STOP_WORDS = new Set([
   "entity",
   "entities",
 ]);
+const BUSINESS_ENTITY_WORDS = [
+  "account",
+  "accounts",
+  "client",
+  "clients",
+  "contact",
+  "contacts",
+  "customer",
+  "customers",
+  "invoice",
+  "invoices",
+  "order",
+  "orders",
+  "product",
+  "products",
+  "user",
+  "users",
+];
 const EXPLICIT_MULTI_ENTITY_PATTERN =
   /\b(?:entities|models|tables|schemas)\b[\s\S]{0,80}\b(?:and|,)\b|\b[a-z][a-z0-9_-]*s?\s*(?:,|\band\b)\s*[a-z][a-z0-9_-]*s?\s+(?:entities|models|tables|schemas|records)\b/u;
+
+type VibeInferredModuleRequirement = {
+  _module_target: Exclude<VibeModuleTarget, null>;
+  _module_name: string;
+  _module_ops: string[];
+  _module_reason: string;
+};
 
 function is_plain_object(value: unknown): value is XVibeJsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -116,7 +191,75 @@ function unique(values: string[]): string[] {
 }
 
 function normalize_lookup_key(value: string): string {
+  return value.trim().toLowerCase().replace(/-/g, "_");
+}
+
+function normalize_prompt_text(value: string): string {
   return value.trim().toLowerCase();
+}
+
+function has_explicit_flow_intent(text: string): boolean {
+  return (
+    /\bflow-[a-z0-9][a-z0-9_-]*\b/u.test(text) ||
+    /\b(?:trigger|triggers|triggering|run|runs|running|execute|executes|executing|call|calls|calling)\s+(?:a|an|the)?\s*flow\b/u.test(text) ||
+    /\bflow\s+(?:trigger|action|button)\b/u.test(text)
+  );
+}
+
+function extract_prompt_flow_ids(text: string): string[] {
+  const matches = text.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? [];
+  return unique(matches.map((match) => match.toLowerCase()));
+}
+
+export function has_explicit_data_or_crud_intent(prompt: string): boolean {
+  const text = normalize_prompt_text(prompt);
+  if (!text) return false;
+
+  if (/\b(?:crud|records?|database|entities|entity|collections?|schemas?|persist|persistence|data records?|entity management)\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:delete|update)\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\bedit\s+(?:a|an|the)?\s*record\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:customer|customers|user|users|product|products|order|orders|invoice|invoices)\s+records?\s+table\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\btable\s+of\s+(?:customer|customers|user|users|product|products|order|orders|invoice|invoices|[a-z][a-z0-9_-]*\s+records?)\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:orders?|invoices?)\b/u.test(text)) {
+    return true;
+  }
+
+  const action_entity_pattern = /\b(?:save|add|create|edit|update|delete|manage|list|track|find)\s+(?:a|an|the)?\s*([a-z][a-z0-9_-]*)\b/gu;
+  let match = action_entity_pattern.exec(text);
+  while (match) {
+    const noun = match[1];
+    if (BUSINESS_ENTITY_WORDS.includes(noun) && !UI_ENTITY_NAMES.has(noun)) {
+      return true;
+    }
+    match = action_entity_pattern.exec(text);
+  }
+
+  return false;
+}
+
+export function is_simple_ui_prompt(prompt: string): boolean {
+  const text = normalize_prompt_text(prompt);
+  if (!text) return false;
+
+
+  if (has_explicit_data_or_crud_intent(text)) return false;
+
+  return /\b(?:view|page|screen|layout|dashboard|form|button|buttons|grid|grids|row|rows|column|columns|card|cards|toolbar|sidebar|table|cells?)\b/u.test(text);
 }
 
 function append_unique(target: string[], values: string[]): void {
@@ -155,12 +298,30 @@ function add_strings(target: string[], value: unknown): void {
   target.push(...normalize_string_array(value));
 }
 
+function add_module_op(
+  capabilities: VibeRuntimeCapabilityRegistry,
+  module_name: unknown,
+  op_name: unknown,
+): void {
+  if (typeof module_name !== "string" || typeof op_name !== "string") return;
+  const module_id = module_name.trim();
+  const op = op_name.trim();
+  if (!module_id || !op) return;
+
+  const key = normalize_lookup_key(module_id);
+  const existing = capabilities._module_ops[key] ?? [];
+  if (!existing.includes(op)) {
+    capabilities._module_ops[key] = [...existing, op];
+  }
+}
+
 export class VibeIntentPlanner {
   empty_runtime_capabilities(): VibeRuntimeCapabilityRegistry {
     return {
       _semantic_object_ids: [],
       _module_ids: [],
       _ops: [],
+      _module_ops: {},
       _capability_keywords: [],
     };
   }
@@ -194,7 +355,12 @@ export class VibeIntentPlanner {
 
         add_string(capabilities._module_ids, module_item._id);
         add_string(capabilities._module_ids, module_item._name);
+        const module_name =
+          typeof module_item._name === "string"
+            ? module_item._name
+            : module_item._id;
         this.collect_ops(module_item._ops, capabilities);
+        this.collect_module_ops(module_name, module_item._ops, capabilities);
         add_strings(capabilities._capability_keywords, module_item._capabilities);
 
         if (Array.isArray(module_item._skills)) {
@@ -215,6 +381,11 @@ export class VibeIntentPlanner {
       _semantic_object_ids: unique(capabilities._semantic_object_ids),
       _module_ids: unique(capabilities._module_ids),
       _ops: unique(capabilities._ops),
+      _module_ops: Object.entries(capabilities._module_ops)
+        .reduce<Record<string, string[]>>((acc, [module_name, ops]) => {
+          acc[module_name] = unique(ops);
+          return acc;
+        }, {}),
       _capability_keywords: unique(capabilities._capability_keywords),
     };
 
@@ -275,7 +446,7 @@ export class VibeIntentPlanner {
       intent_type,
     );
 
-    const plan = {
+    const plan: VibeIntentPlan = {
       _ir_version: INTENT_IR_VERSION,
       _intent_type: intent_type,
       _artifact_types: this.normalize_selected_values(source._artifact_types, base_plan?._artifact_types),
@@ -296,8 +467,46 @@ export class VibeIntentPlanner {
         ...entity_ids,
         ...this.normalize_selected_values(source._entity_keywords, base_plan?._entity_keywords),
       ]),
+      _requires_module: false,
+      _module_target: null,
+      _module_ops: [],
       _runtime_capabilities: runtime_capabilities,
     };
+
+    const module_requirement =
+      this.normalize_module_requirement(
+        source,
+        base_plan,
+        runtime_capabilities,
+      );
+
+    plan._requires_module = module_requirement._requires_module;
+    plan._module_target = module_requirement._module_target;
+    plan._module_ops = module_requirement._module_ops;
+
+    if (module_requirement._module_name) {
+      plan._module_name = module_requirement._module_name;
+    }
+
+    if (module_requirement._module_reason) {
+      plan._module_reason = module_requirement._module_reason;
+    }
+
+    if (
+      !plan._requires_module &&
+      module_requirement._module_name &&
+      runtime_capabilities._module_ids
+        .map((item) => normalize_lookup_key(item))
+        .includes(normalize_lookup_key(module_requirement._module_name))
+    ) {
+      append_unique(plan._modules, [module_requirement._module_name]);
+      plan._modules =
+        this.normalize_selected_values(
+          plan._modules,
+          [],
+          runtime_capabilities._module_ids,
+        );
+    }
 
     // verbose_log("[xvibe] intent planning:result", plan);
     // verbose_log("[xvibe] intent IR result", {
@@ -326,12 +535,18 @@ export class VibeIntentPlanner {
     return plan;
   }
 
+  apply_ui_only_guard(prompt: string, plan: VibeIntentPlan): VibeIntentPlan {
+    return this.apply_ui_only_guard_internal(prompt, plan, true);
+  }
+
   infer_intent_plan(
     prompt: string,
     app_plan: unknown,
     runtime_capabilities: VibeRuntimeCapabilityRegistry = this.empty_runtime_capabilities(),
   ): VibeIntentPlan {
+    const prompt_text = normalize_prompt_text(prompt);
     const text = `${prompt} ${JSON.stringify(app_plan ?? {})}`.toLowerCase();
+    const explicit_data_or_crud_intent = has_explicit_data_or_crud_intent(prompt);
     const inferred: Omit<VibeIntentPlan, "_runtime_capabilities"> = {
       _ir_version: INTENT_IR_VERSION,
       _intent_type: "app",
@@ -350,6 +565,9 @@ export class VibeIntentPlanner {
       _ui_keywords: [],
       _flow_keywords: [],
       _entity_keywords: [],
+      _requires_module: false,
+      _module_target: null,
+      _module_ops: [],
     };
 
     if (this.contains_any(text, ["dashboard", "analytics", "metrics", "reports", "overview"])) {
@@ -365,7 +583,7 @@ export class VibeIntentPlanner {
       };
     }
 
-    if (this.contains_any(text, ["crud", "create", "edit", "update", "delete", "manage", "admin", "records", "table", "entity"])) {
+    if (explicit_data_or_crud_intent || this.contains_any(prompt_text, ["admin"])) {
       inferred._intent_type = inferred._intent_type === "app" ? "crud-app" : inferred._intent_type;
       append_unique(inferred._artifact_types, ["entity", "flow"]);
       append_unique(inferred._regions, ["toolbar", "records_table", "create_modal", "details_drawer", "filters"]);
@@ -375,6 +593,17 @@ export class VibeIntentPlanner {
       this.add_available(inferred._crud_ops, ["find", "list", "add", "get", "update", "delete"], runtime_capabilities._ops);
       append_unique(inferred._capabilities, ["entity", "crud", "storage"]);
     }
+
+    this.add_available(
+      inferred._objects,
+      this.infer_prompt_ui_objects(prompt_text, runtime_capabilities),
+      runtime_capabilities._semantic_object_ids,
+    );
+    this.add_available(
+      inferred._xui_objects,
+      this.infer_prompt_ui_objects(prompt_text, runtime_capabilities),
+      runtime_capabilities._semantic_object_ids,
+    );
 
     if (this.contains_any(text, ["navigation", "navigate", "route", "router", "menu", "sidebar", "nav"])) {
       append_unique(inferred._regions, ["sidebar", "content"]);
@@ -390,6 +619,46 @@ export class VibeIntentPlanner {
       this.add_available(inferred._modules, ["xem", "wormholes"], runtime_capabilities._module_ids);
       append_unique(inferred._capabilities, ["realtime", "events", "streaming"]);
       append_unique(inferred._flow_keywords, ["realtime", "events"]);
+    }
+
+    if (has_explicit_flow_intent(prompt_text)) {
+      append_unique(inferred._artifact_types, ["flow"]);
+      append_unique(inferred._flow_keywords, extract_prompt_flow_ids(prompt_text));
+    }
+
+    const module_requirement =
+      this.infer_module_requirement(prompt_text, runtime_capabilities);
+    if (module_requirement) {
+      append_unique(inferred._artifact_types, ["flow"]);
+      inferred._module_name = module_requirement._module_name;
+      inferred._module_target = module_requirement._module_target;
+      inferred._module_ops = module_requirement._module_ops;
+      inferred._module_reason = module_requirement._module_reason;
+      const available =
+        this.runtime_module_requirement_available(
+          module_requirement._module_name,
+          module_requirement._module_ops,
+          runtime_capabilities,
+        );
+      inferred._requires_module = !available;
+      if (available) {
+        append_unique(inferred._modules, [module_requirement._module_name]);
+      }
+
+      verbose_log("[xvibe] intent module inference", {
+        _module_name: module_requirement._module_name,
+        _module_target: module_requirement._module_target,
+        _module_ops: module_requirement._module_ops,
+        _requires_module: !available,
+        _reason: module_requirement._module_reason,
+      });
+
+      if (available) {
+        verbose_log("[xvibe] module capability available", {
+          _module_name: module_requirement._module_name,
+          _module_ops: module_requirement._module_ops,
+        });
+      }
     }
 
     if (this.contains_any(text, ["storage", "state", "persist", "database", "save", "load"])) {
@@ -440,7 +709,7 @@ export class VibeIntentPlanner {
       append_unique(inferred._entity_keywords, inferred._entities.map((entity) => entity._id));
       const primary_entity = inferred._entities[0];
       if (primary_entity) {
-        inferred._actions.push(...this.infer_crud_actions(text, primary_entity._id, inferred._crud_ops));
+        inferred._actions.push(...this.infer_crud_actions(prompt_text, primary_entity._id, inferred._crud_ops));
         if (inferred._objects.includes("table")) {
           inferred._bindings.push({
             _target: `${primary_entity._id}-table`,
@@ -450,7 +719,170 @@ export class VibeIntentPlanner {
       }
     }
 
-    return this.normalize_intent_plan(inferred, runtime_capabilities);
+    return this.apply_ui_only_guard_internal(
+      prompt,
+      this.normalize_intent_plan(inferred, runtime_capabilities),
+      false,
+    );
+  }
+
+  private apply_ui_only_guard_internal(
+    prompt: string,
+    plan: VibeIntentPlan,
+    should_log: boolean,
+  ): VibeIntentPlan {
+    if (plan._requires_module || plan._module_ops.length > 0) {
+      return plan;
+    }
+
+    if (!is_simple_ui_prompt(prompt) || has_explicit_data_or_crud_intent(prompt)) {
+      return plan;
+    }
+
+    const before_intent_type = plan._intent_type;
+    const removed_entities_count = plan._entities.length;
+    const removed_actions_count = plan._actions.length;
+    const flow_ids = extract_prompt_flow_ids(prompt);
+    const has_flow = flow_ids.length > 0;
+
+    const guarded: VibeIntentPlan = {
+      ...plan,
+
+      _intent_type: "view",
+
+      _artifact_types:
+        has_flow
+          ? ["view", "flow"]
+          : ["view"],
+
+      _entities: [],
+
+      _regions:
+        this.filter_simple_ui_regions(
+          prompt,
+          plan._regions
+        ),
+
+      _objects:
+        this.merge_prompt_ui_objects(
+          prompt,
+          plan._objects,
+          plan._runtime_capabilities
+        ),
+
+      _actions: [],
+      _bindings: [],
+      _modules: [],
+      _requires_module: false,
+      _module_target: null,
+      _module_name: undefined,
+      _module_ops: [],
+      _module_reason: undefined,
+      _crud_ops: [],
+
+      _xui_objects:
+        this.merge_prompt_ui_objects(
+          prompt,
+          plan._xui_objects,
+          plan._runtime_capabilities
+        ),
+
+      _flow_keywords:
+        has_flow
+          ? flow_ids
+          : [],
+
+      _entity_keywords: [],
+    };
+
+    if (should_log) {
+      _xlog.log("[xvibe] intent ui-only guard applied", {
+        _prompt: prompt,
+        _before_intent_type: before_intent_type,
+        _after_intent_type: guarded._intent_type,
+        _removed_entities_count: removed_entities_count,
+        _removed_actions_count: removed_actions_count,
+      });
+    }
+
+    return guarded;
+  }
+
+  private filter_simple_ui_regions(prompt: string, regions: string[]): string[] {
+    const text = normalize_prompt_text(prompt);
+    return regions.filter((region) => {
+      if (SIMPLE_UI_CRUD_REGION_IDS.has(region)) return false;
+      const terms = SIMPLE_UI_REGION_TERMS[region];
+      return Array.isArray(terms) && terms.some((term) => text.includes(term));
+    });
+  }
+
+  private merge_prompt_ui_objects(
+    prompt: string,
+    existing: string[],
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): string[] {
+    return this.normalize_intent_objects(
+      [
+        ...existing,
+        ...this.infer_prompt_ui_objects(prompt, runtime_capabilities),
+      ],
+      runtime_capabilities._semantic_object_ids,
+    );
+  }
+
+  private infer_prompt_ui_objects(
+    prompt: string,
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): string[] {
+    const text = normalize_prompt_text(prompt);
+    const objects: string[] = [];
+
+    if (/\b(?:view|page|screen|layout|dashboard)\b/u.test(text)) {
+      objects.push("view");
+    }
+    if (/\bbuttons?\b/u.test(text)) {
+      objects.push("button");
+    }
+    if (/\b(?:cards?)\b/u.test(text)) {
+      objects.push("card");
+      this.add_layout_object(objects, runtime_capabilities);
+    }
+    if (/\b(?:grid|grids|row|rows|column|columns|aligned|layout)\b/u.test(text)) {
+      this.add_layout_object(objects, runtime_capabilities);
+    }
+    if (/\btoolbar\b/u.test(text)) {
+      objects.push("toolbar");
+    }
+    if (/\bsidebar\b/u.test(text)) {
+      objects.push("sidebar");
+    }
+    if (/\bforms?\b/u.test(text)) {
+      objects.push("form");
+    }
+    if (/\btable\b/u.test(text)) {
+      objects.push("table");
+    }
+
+    return unique(objects);
+  }
+
+  private add_layout_object(
+    objects: string[],
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): void {
+    const runtime_ids = new Set(
+      runtime_capabilities._semantic_object_ids.map((item) => normalize_lookup_key(item)),
+    );
+
+    if (runtime_ids.size === 0 || runtime_ids.has("grid")) {
+      objects.push("grid");
+      return;
+    }
+
+    if (runtime_ids.has("stack")) {
+      objects.push("stack");
+    }
   }
 
   private normalize_selected_values(
@@ -959,13 +1391,264 @@ export class VibeIntentPlanner {
 
   private normalize_runtime_capabilities(value: unknown): VibeRuntimeCapabilityRegistry {
     const source = is_plain_object(value) ? value : {};
+    const module_ops: Record<string, string[]> = {};
+    if (is_plain_object(source._module_ops)) {
+      for (const [module_name, ops] of Object.entries(source._module_ops)) {
+        module_ops[normalize_lookup_key(module_name)] = normalize_string_array(ops);
+      }
+    }
 
     return {
       _semantic_object_ids: normalize_string_array(source._semantic_object_ids),
       _module_ids: normalize_string_array(source._module_ids),
       _ops: normalize_string_array(source._ops),
+      _module_ops: module_ops,
       _capability_keywords: normalize_string_array(source._capability_keywords),
     };
+  }
+
+  private normalize_module_requirement(
+    source: XVibeJsonObject,
+    base_plan: Partial<VibeIntentPlan> | undefined,
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): {
+    _requires_module: boolean;
+    _module_target: VibeModuleTarget;
+    _module_name?: string;
+    _module_ops: string[];
+    _module_reason?: string;
+  } {
+    const raw_module_name =
+      typeof source._module_name === "string" && source._module_name.trim()
+        ? source._module_name.trim()
+        : base_plan?._module_name;
+    const module_name =
+      typeof raw_module_name === "string" && raw_module_name.trim()
+        ? raw_module_name.trim()
+        : undefined;
+    const module_ops = unique([
+      ...normalize_string_array(base_plan?._module_ops),
+      ...normalize_string_array(source._module_ops),
+    ]);
+    const raw_target =
+      source._module_target ?? base_plan?._module_target;
+    const module_target: VibeModuleTarget =
+      raw_target === "server" || raw_target === "client"
+        ? raw_target
+        : module_name
+          ? "server"
+          : null;
+    const module_reason =
+      typeof source._module_reason === "string" && source._module_reason.trim()
+        ? source._module_reason.trim()
+        : base_plan?._module_reason;
+    const requested_requires =
+      source._requires_module === true ||
+      (
+        source._requires_module !== false &&
+        base_plan?._requires_module === true
+      );
+    const available =
+      module_name && module_ops.length > 0
+        ? this.runtime_module_requirement_available(
+          module_name,
+          module_ops,
+          runtime_capabilities,
+        )
+        : false;
+
+    if (available) {
+      verbose_log("[xvibe] module capability available", {
+        _module_name: module_name,
+        _module_ops: module_ops,
+      });
+    }
+
+    return {
+      _requires_module: Boolean(requested_requires && !available),
+      _module_target: requested_requires && !available ? module_target : available ? null : module_target,
+      ...(module_name ? { _module_name: module_name } : {}),
+      _module_ops: module_ops,
+      ...(module_reason ? { _module_reason: module_reason } : {}),
+    };
+  }
+
+  private infer_module_requirement(
+    prompt_text: string,
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): VibeInferredModuleRequirement | undefined {
+    const candidates: VibeInferredModuleRequirement[] = [];
+    const RESERVED_MODULE_NAME_WORDS = new Set([
+      "server",
+      "client",
+      "xmodule",
+      "module",
+      "with",
+      "op",
+      "operation",
+    ]);
+    if (
+      /\b(?:calculate|calculates|calculation|evaluate expression|evaluate an expression|math result|calculator equals|equals button|equals)\b/u
+        .test(prompt_text) &&
+      !/\b(?:button layout|buttons only|button wiring|wire buttons|display buttons)\b/u.test(prompt_text)
+    ) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: "calc",
+        _module_ops: ["evaluate"],
+        _module_reason: "Expression evaluation requires custom behavior outside XUI/xd.",
+      });
+    }
+
+    if (/\b(?:generate|export|create)\s+(?:a\s+)?pdf\b|\bpdf\s+(?:export|generation)\b/u.test(prompt_text)) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: "pdf",
+        _module_ops: ["generate"],
+        _module_reason: "PDF generation/export requires a server behavior module when no runtime PDF capability exists.",
+      });
+    }
+
+    if (/\b(?:send|deliver)\s+(?:an?\s+)?email\b|\bemail\s+(?:send|delivery)\b/u.test(prompt_text)) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: "email",
+        _module_ops: ["send"],
+        _module_reason: "Email sending requires a server behavior module when no mail runtime capability exists.",
+      });
+    }
+
+    if (/\b(?:call|fetch|request)\s+(?:an?\s+)?external\s+api\b|\bfetch weather\b|\bweather\b/u.test(prompt_text)) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: prompt_text.includes("weather") ? "weather" : "api",
+        _module_ops: ["fetch"],
+        _module_reason: "External API access requires a server behavior module when no runtime API capability exists.",
+      });
+    }
+
+    if (/\b(?:payment|charge|checkout)\b/u.test(prompt_text)) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: "payment",
+        _module_ops: ["charge"],
+        _module_reason: "Payment behavior requires a server behavior module when no payment runtime capability exists.",
+      });
+    }
+
+    if (/\bwebhook\b/u.test(prompt_text)) {
+      candidates.push({
+        _module_target: "server",
+        _module_name: "webhook",
+        _module_ops: ["handle"],
+        _module_reason: "Webhook behavior requires a server behavior module when no webhook runtime capability exists.",
+      });
+    }
+
+    if (
+      /\b(?:create|build|generate|add|make)\s+(?:a|an\s+)?(?:server\s+)?(?:xmodule|module)\b/u
+        .test(prompt_text)
+    ) {
+      const opMatches =
+        [
+          ...prompt_text.matchAll(
+            /\bop(?:eration)?\s+(?:named|called)?\s*(_?[a-z][a-z0-9_-]*)\b/gu
+          )
+        ]
+          .map((match) => match[1]?.replace(/^_/, ""))
+          .filter((value): value is string => Boolean(value));
+
+      const namedModuleMatch =
+        /\b(?:xmodule|module)\s+(?:named|called)\s+([a-z][a-z0-9_-]*)\b/u
+          .exec(prompt_text);
+
+      const beforeModuleMatch =
+        /\b([a-z][a-z0-9_-]*)\s+(?:xmodule|module)\b/u
+          .exec(prompt_text);
+
+      const candidateModuleName =
+        namedModuleMatch?.[1] ??
+        beforeModuleMatch?.[1];
+
+      const moduleName =
+        candidateModuleName && !RESERVED_MODULE_NAME_WORDS.has(candidateModuleName)
+          ? candidateModuleName
+          : this.infer_module_name_from_ops(opMatches) ??
+          "generated-module";
+
+      candidates.push({
+        _module_target: "server",
+        _module_name: moduleName,
+        _module_ops:
+          opMatches.length > 0
+            ? unique(opMatches)
+            : ["run"],
+        _module_reason:
+          "User explicitly requested creation of a server module.",
+      });
+    }
+
+
+    for (const candidate of candidates) {
+      if (
+        this.runtime_module_requirement_available(
+          candidate._module_name,
+          candidate._module_ops,
+          runtime_capabilities,
+        )
+      ) {
+        return candidate;
+      }
+    }
+
+    return candidates[0];
+  }
+
+  private infer_module_name_from_ops(ops: string[]): string | undefined {
+    if (
+      ops.some((op) =>
+        op.includes("calc") ||
+        op.includes("calculate") ||
+        op.includes("evaluate")
+      )
+    ) {
+      return "calc";
+    }
+
+    return undefined;
+  }
+
+  private runtime_module_requirement_available(
+    module_name: string,
+    module_ops: string[],
+    runtime_capabilities: VibeRuntimeCapabilityRegistry,
+  ): boolean {
+    const requested_module_key = normalize_lookup_key(module_name);
+    const module_ids = runtime_capabilities._module_ids.map((item) => normalize_lookup_key(item));
+    const ops = runtime_capabilities._ops.map((item) => normalize_lookup_key(item));
+    const module_present = module_ids.includes(requested_module_key);
+    const requested_ops = module_ops.map((item) => normalize_lookup_key(item));
+    const module_specific_ops = runtime_capabilities._module_ops[requested_module_key]
+      ?.map((item) => normalize_lookup_key(item)) ?? [];
+
+    if (
+      module_present &&
+      requested_ops.every((op) => module_specific_ops.includes(op) || ops.includes(op))
+    ) {
+      return true;
+    }
+
+    const capability_terms = runtime_capabilities._capability_keywords
+      .map((item) => normalize_lookup_key(item));
+
+    return requested_ops.every((op) =>
+      capability_terms.includes(`${requested_module_key}_${op}`) ||
+      capability_terms.includes(`${requested_module_key}:${op}`) ||
+      (
+        capability_terms.includes(requested_module_key) &&
+        capability_terms.includes(op)
+      )
+    );
   }
 
   private collect_skill_capabilities(
@@ -981,10 +1664,38 @@ export class VibeIntentPlanner {
     }
     if (is_plain_object(skill._exports)) {
       add_strings(capabilities._semantic_object_ids, skill._exports._xui_objects);
-      add_strings(capabilities._module_ids, skill._exports._modules);
+      this.collect_exported_modules(skill._exports._modules, capabilities);
       add_strings(capabilities._capability_keywords, skill._exports._capabilities);
     }
     this.collect_ops(skill._ops, capabilities);
+  }
+
+  private collect_exported_modules(
+    value: unknown,
+    capabilities: VibeRuntimeCapabilityRegistry,
+  ): void {
+    if (!Array.isArray(value)) {
+      add_strings(capabilities._module_ids, value);
+      return;
+    }
+
+    for (const module_item of value) {
+      if (typeof module_item === "string") {
+        add_string(capabilities._module_ids, module_item);
+        continue;
+      }
+
+      if (!is_plain_object(module_item)) continue;
+      add_string(capabilities._module_ids, module_item._name);
+      add_string(capabilities._module_ids, module_item._id);
+      const module_name =
+        typeof module_item._name === "string"
+          ? module_item._name
+          : module_item._id;
+      this.collect_ops(module_item._ops, capabilities);
+      this.collect_module_ops(module_name, module_item._ops, capabilities);
+      add_strings(capabilities._capability_keywords, module_item._capabilities);
+    }
   }
 
   private collect_object_capabilities(
@@ -1007,9 +1718,13 @@ export class VibeIntentPlanner {
     value: unknown,
     capabilities: VibeRuntimeCapabilityRegistry,
   ): void {
-    if (!Array.isArray(value)) return;
+    const ops = Array.isArray(value)
+      ? value
+      : is_plain_object(value)
+        ? Object.values(value)
+        : [];
 
-    for (const op of value) {
+    for (const op of ops) {
       if (typeof op === "string") {
         add_string(capabilities._ops, op);
         continue;
@@ -1017,6 +1732,29 @@ export class VibeIntentPlanner {
       if (is_plain_object(op)) {
         add_string(capabilities._ops, op._name);
         add_string(capabilities._ops, op._op);
+      }
+    }
+  }
+
+  private collect_module_ops(
+    module_name: unknown,
+    value: unknown,
+    capabilities: VibeRuntimeCapabilityRegistry,
+  ): void {
+    const ops = Array.isArray(value)
+      ? value
+      : is_plain_object(value)
+        ? Object.values(value)
+        : [];
+
+    for (const op of ops) {
+      if (typeof op === "string") {
+        add_module_op(capabilities, module_name, op);
+        continue;
+      }
+      if (is_plain_object(op)) {
+        add_module_op(capabilities, module_name, op._name);
+        add_module_op(capabilities, module_name, op._op);
       }
     }
   }

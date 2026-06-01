@@ -53,6 +53,12 @@ export type XModuleCreatorModuleOptions = {
 export type XModuleCreatorError = {
   _code: string;
   _message: string;
+  _category?:
+    | "placeholder_content"
+    | "forbidden_content"
+    | "syntax_or_shape_error"
+    | "weak_behavior"
+    | "unknown";
   _details?: Record<string, unknown>;
 };
 
@@ -127,6 +133,16 @@ export type XModuleCreatorLoadGeneratedModuleResult =
     _loaded: true;
     _reloaded: boolean;
     _skills_available: boolean;
+  }>;
+
+export type XModuleCreatorImplementGeneratedModuleResult =
+  XModuleCreatorResult<{
+    _id: string;
+    _artifact_path: string;
+    _module_file: string;
+    _implemented_methods: string[];
+    _module_sha256: string;
+    _validation: XModuleCreatorValidateGeneratedModuleResult;
   }>;
 
 export type XModuleCreatorListSpecsResult =
