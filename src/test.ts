@@ -17,6 +17,7 @@ import {
 } from "./XVIBE/VibePromptBuilder.js";
 import type { XVibeViewArtifact } from "./XVIBE/VibeOutputParser.js";
 import { VibeIntentPlanner } from "./XVIBE/VibeIntentPlanner.js";
+import { XMutator } from "./XMutator/XMutator.js";
 
 type ValidateGeneratedArtifact = (input: {
   _artifact_type: "view";
@@ -34,6 +35,223 @@ function strip_when_prompt_disallows_flow(prompt: string, view: XVibeViewArtifac
 
   return strip_unrequested_flow_triggers(view);
 }
+
+const xmutator = new XMutator();
+
+const label_replace_view = {
+  _id: "view",
+  _type: "view",
+  _children: [
+    {
+      _id: "before",
+      _type: "label",
+      _text: "Before",
+    },
+    {
+      _id: "a",
+      _type: "label",
+      _text: "Old",
+    },
+    {
+      _id: "after",
+      _type: "label",
+      _text: "After",
+    },
+  ],
+};
+const label_replace_original = JSON.parse(JSON.stringify(label_replace_view));
+const label_replacement = {
+  _id: "a",
+  _type: "label",
+  _text: "New",
+};
+const label_replace_result =
+  xmutator.replace_by_id(label_replace_view, "a", label_replacement);
+
+assert.deepEqual(label_replace_result, {
+  _id: "view",
+  _type: "view",
+  _children: [
+    {
+      _id: "before",
+      _type: "label",
+      _text: "Before",
+    },
+    {
+      _id: "a",
+      _type: "label",
+      _text: "New",
+    },
+    {
+      _id: "after",
+      _type: "label",
+      _text: "After",
+    },
+  ],
+});
+assert.deepEqual(label_replace_view, label_replace_original);
+assert.deepEqual(label_replace_result._children.map((child: any) => child._id), ["before", "a", "after"]);
+assert.deepEqual(xmutator.find_by_id(label_replace_result, "a"), label_replacement);
+assert.equal(xmutator.has_id(label_replace_result, "a"), true);
+
+const nested_grid_view = {
+  _id: "view",
+  _type: "view",
+  _children: [
+    {
+      _id: "header",
+      _type: "label",
+      _text: "Header",
+    },
+    {
+      _id: "grid",
+      _type: "grid",
+      _children: [
+        {
+          _id: "cell-a",
+          _type: "label",
+          _text: "A",
+        },
+        {
+          _id: "b",
+          _type: "button",
+          _text: "Old",
+        },
+        {
+          _id: "cell-c",
+          _type: "label",
+          _text: "C",
+        },
+      ],
+    },
+    {
+      _id: "footer",
+      _type: "label",
+      _text: "Footer",
+    },
+  ],
+};
+const nested_grid_original = JSON.parse(JSON.stringify(nested_grid_view));
+const button_replacement = {
+  _id: "b",
+  _type: "button",
+  _text: "New",
+  _variant: "primary",
+};
+const nested_grid_result =
+  xmutator.replace_by_id(nested_grid_view, "b", button_replacement);
+
+assert.deepEqual(nested_grid_result, {
+  _id: "view",
+  _type: "view",
+  _children: [
+    {
+      _id: "header",
+      _type: "label",
+      _text: "Header",
+    },
+    {
+      _id: "grid",
+      _type: "grid",
+      _children: [
+        {
+          _id: "cell-a",
+          _type: "label",
+          _text: "A",
+        },
+        {
+          _id: "b",
+          _type: "button",
+          _text: "New",
+          _variant: "primary",
+        },
+        {
+          _id: "cell-c",
+          _type: "label",
+          _text: "C",
+        },
+      ],
+    },
+    {
+      _id: "footer",
+      _type: "label",
+      _text: "Footer",
+    },
+  ],
+});
+assert.deepEqual(nested_grid_view, nested_grid_original);
+assert.deepEqual(nested_grid_result._children.map((child: any) => child._id), ["header", "grid", "footer"]);
+assert.deepEqual(nested_grid_result._children[1]._children.map((child: any) => child._id), ["cell-a", "b", "cell-c"]);
+assert.deepEqual(xmutator.find_by_id(nested_grid_result, "b"), button_replacement);
+
+const missing_target_view = {
+  _id: "view",
+  _type: "view",
+  _children: [
+    {
+      _id: "a",
+      _type: "label",
+      _text: "A",
+    },
+    {
+      _id: "grid",
+      _type: "grid",
+      _children: [
+        {
+          _id: "b",
+          _type: "button",
+          _text: "B",
+        },
+      ],
+    },
+  ],
+};
+const missing_target_original = JSON.parse(JSON.stringify(missing_target_view));
+const missing_target_result =
+  xmutator.replace_by_id(missing_target_view, "missing", {
+    _id: "missing",
+    _type: "label",
+  });
+
+assert.deepEqual(missing_target_result, missing_target_original);
+assert.deepEqual(missing_target_view, missing_target_original);
+assert.deepEqual(missing_target_result._children.map((child: any) => child._id), ["a", "grid"]);
+assert.equal(xmutator.has_id(missing_target_result, "missing"), false);
+
+const root_replace_view = {
+  _id: "root",
+  _type: "view",
+  _children: [
+    {
+      _id: "a",
+      _type: "label",
+      _text: "A",
+    },
+  ],
+};
+const root_replace_original = JSON.parse(JSON.stringify(root_replace_view));
+const root_replacement = {
+  _id: "root",
+  _type: "view",
+  _children: [
+    {
+      _id: "new-a",
+      _type: "label",
+      _text: "New A",
+    },
+    {
+      _id: "new-b",
+      _type: "button",
+      _text: "New B",
+    },
+  ],
+};
+const root_replace_result =
+  xmutator.replace_by_id(root_replace_view, "root", root_replacement);
+
+assert.deepEqual(root_replace_result, root_replacement);
+assert.deepEqual(root_replace_view, root_replace_original);
+assert.deepEqual(root_replace_result._children.map((child: any) => child._id), ["new-a", "new-b"]);
 
 const plain_buttons_prompt = "create new row of buttons in the view";
 const hallucinated_button_view: XVibeViewArtifact = {

@@ -47,6 +47,7 @@ export type XVMAppBundle = {
 const DEFAULT_ENV = "default";
 const DEFAULT_WORK_FOLDER = "./work";
 const XVM_FOLDER = "xvm/apps";
+const GENERATED_MODULE_REGISTRY_FILE = "generated/xmodules/registry.json";
 
 const EVT_UPDATE = "server-xvm:update";
 
@@ -54,11 +55,37 @@ function app_scope_key(app_id: string, env: string): string {
   return `${env}::${app_id}`;
 }
 
+function server_xvm_verbose_log(message: string, data?: Record<string, unknown>) {
+  const logger = _xlog as unknown as { _debug?: boolean; _verbose?: boolean };
+  if (logger._debug === true || logger._verbose === true) {
+    _xlog.log(message, data);
+  }
+}
+
+function registry_entry_state(entry: Record<string, any>): string {
+  return typeof entry._state === "string" && entry._state.trim()
+    ? entry._state
+    : "implemented";
+}
+
+function registry_entry_ops(entry: Record<string, any>): string[] {
+  return Array.isArray(entry._ops)
+    ? entry._ops
+      .map((op: unknown) => {
+        if (typeof op === "string") return op;
+        if (_xu.is_plain_object(op) && typeof op._name === "string") return op._name;
+        return undefined;
+      })
+      .filter((op: unknown): op is string => typeof op === "string")
+    : [];
+}
+
 /* -------------------------------------------------------------------------- */
 
 export class ServerXVMModule extends XModule {
   static _name = "server-xvm";
 
+  private _work_folder: string;
   private _apps_root: string;
   private _apps: Map<string, XVMAppBundle> = new Map();
   private _active_app_by_env: Map<string, string> = new Map();
@@ -68,6 +95,7 @@ export class ServerXVMModule extends XModule {
     super({ _name: ServerXVMModule._name });
 
     const work_folder = opts._work_folder ?? DEFAULT_WORK_FOLDER;
+    this._work_folder = work_folder;
     this._apps_root = opts._apps_root ?? path.join(work_folder, XVM_FOLDER);
     this._system_xapps_path = typeof opts._system_xapps_path === "string" && opts._system_xapps_path
       ? path.resolve(opts._system_xapps_path)
@@ -234,6 +262,36 @@ export class ServerXVMModule extends XModule {
     };
   }
 
+  async _list_views(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+
+    const app_id = _xu.ensure_string(params._app_id, "_app_id");
+    const env = this.resolve_env(params);
+
+    const bundle = this.get_bundle(app_id, env);
+    const views = Object.values(bundle._views || {});
+
+    server_xvm_verbose_log("[server-xvm] list views", {
+      _app_id: app_id,
+      _env: env,
+      _count: views.length
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _views: views.map((view) => ({
+          _id: view._id,
+          _type: view._type,
+          _title: view._title ?? view._name ?? view._id,
+          _children_count: Array.isArray(view._children)
+            ? view._children.length
+            : 0
+        })),
+      },
+    };
+  }
+
   /* ------------------------------------------------------------------------ */
   /* FLOW APIs                                                                */
   /* ------------------------------------------------------------------------ */
@@ -296,12 +354,38 @@ export class ServerXVMModule extends XModule {
     const env = this.resolve_env(params);
 
     const bundle = this.get_bundle(app_id, env);
+    const flows = Object.values(bundle._flows || {});
+
+    server_xvm_verbose_log("[server-xvm] list flows", {
+      _app_id: app_id,
+      _env: env,
+      _count: flows.length
+    });
 
     return {
       _ok: true,
       _result: {
-        _flows: Object.keys(bundle._flows || {}),
+        _flows: flows.map((flow) => ({
+          _id: flow._id,
+          _type: flow._type,
+          _title: flow._title ?? flow._name ?? flow._id
+        })),
       },
+    };
+  }
+
+  async _list_generated_modules(_xcmd: XCommand) {
+    const modules = this.read_generated_module_registry_modules();
+
+    server_xvm_verbose_log("[server-xvm] list generated modules", {
+      _count: modules.length
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _modules: modules
+      }
     };
   }
 
@@ -542,6 +626,44 @@ export class ServerXVMModule extends XModule {
     };
   }
 
+  async _save_view_json(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+
+    const app_id = _xu.ensure_string(params._app_id, "_app_id");
+    const env = this.resolve_env(params);
+    const view_id = _xu.ensure_string(params._view_id, "_view_id");
+    const view = params._view;
+
+    if (!_xu.is_plain_object(view)) {
+      throw new XError("E_XVM_INVALID_PAYLOAD", "Missing _view");
+    }
+
+    if (view._type !== "view") {
+      throw new XError("E_XVM_INVALID_PAYLOAD", "_view._type must be view");
+    }
+
+    const normalized: XVMView = {
+      ...view,
+      _id: view_id
+    };
+
+    server_xvm_verbose_log("[server-xvm] save view json", {
+      _app_id: app_id,
+      _env: env,
+      _view_id: view_id
+    });
+
+    return this._push_update({
+      ...xcmd,
+      _params: {
+        ...params,
+        _app_id: app_id,
+        _env: env,
+        _view: normalized
+      }
+    } as unknown as XCommand);
+  }
+
   override async onLoad() {
     await super.onLoad();
     await this.init_on_boot();
@@ -751,6 +873,39 @@ export class ServerXVMModule extends XModule {
       });
       return {};
     }
+  }
+
+  private read_generated_module_registry_modules() {
+    const registry_file = path.join(
+      this._work_folder,
+      GENERATED_MODULE_REGISTRY_FILE
+    );
+
+    if (!fs.existsSync(registry_file)) {
+      return [];
+    }
+
+    let registry: any;
+    try {
+      registry = JSON.parse(fs.readFileSync(registry_file, "utf-8"));
+    } catch {
+      return [];
+    }
+
+    const modules = registry?._version === 1 && _xu.is_plain_object(registry?._modules)
+      ? registry._modules
+      : {};
+
+    return Object.values(modules)
+      .filter((entry): entry is Record<string, any> => _xu.is_plain_object(entry))
+      .map((entry) => ({
+        _name: typeof entry._name === "string"
+          ? entry._name
+          : "",
+        _state: registry_entry_state(entry),
+        _autoload: entry._autoload === true,
+        _ops: registry_entry_ops(entry)
+      }));
   }
 
   private assert_mutable_bundle(bundle: XVMAppBundle) {

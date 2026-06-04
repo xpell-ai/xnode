@@ -58,6 +58,7 @@ export type XModuleCreatorError = {
     | "forbidden_content"
     | "syntax_or_shape_error"
     | "weak_behavior"
+    | "helper_method_misplaced"
     | "unknown";
   _details?: Record<string, unknown>;
 };

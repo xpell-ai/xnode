@@ -119,3 +119,6 @@ export * from "./XAI/index.js"
 
 /***** XVIBE   */
 export * from "./XVIBE/index.js"
+
+/***** XMUTATOR   */
+export * from "./XMutator/index.js"

@@ -1,7 +1,6 @@
 
 import path from "path";
 import fs from "fs";
-import type { Express } from "express";
 import { _x, _xlog } from "@xpell/core";
 import { _xs } from "../XSettings/XSettings.js";
 import { _xu } from "../XNUtils/XUtils.js";
@@ -21,6 +20,7 @@ import {
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
 import { XVibeModule } from "../XVIBE/XVibeModule.js";
 import { XModuleCreatorModule } from "../XGenerative/index.js";
+import { XMutatorModule } from "../XMutator/XMutatorModule.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -167,7 +167,7 @@ export class XNode {
             _work_folder: this._work_folder
         }));
 
-        await _x.loadModuleAsync(new XVibeModule());
+        await _x.loadModuleAsync(new XMutatorModule());
         await _x.loadModuleAsync(new XVibeModule());
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());

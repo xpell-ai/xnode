@@ -1,6 +1,8 @@
+import fs from "node:fs";
+import path from "node:path";
 import { _x, _xlog, XCommand, XModule, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
-import { VibeKnowledgeSelector } from "./VibeKnowledgeSelector.js";
+import { VibeKnowledgeSelector, type VibeKnowledgeSelection } from "./VibeKnowledgeSelector.js";
 import { wsBroadcastScoped } from "../Wormholes/wh.index.js";
 
 
@@ -60,6 +62,23 @@ const BUILTIN_SERVER_MODULES = new Set([
   "studio",
   "xtest",
 ]);
+const FALLBACK_XUI_VALIDATION_TYPES = new Set([
+  "view",
+  "style-sheet",
+  "label",
+  "grid",
+  "button",
+  "toolbar",
+  "field",
+  "textarea",
+  "card",
+  "xsection",
+  "table",
+  "navlist",
+  "badge",
+  "modal",
+  "drawer",
+]);
 
 type XVibeGeneratedArtifact =
   | XVibeViewArtifact
@@ -70,6 +89,76 @@ type XVibeGeneratedArtifact =
 type XVibeArtifactValidationResult =
   | { _ok: true; _errors: [] }
   | { _ok: false; _errors: string[] };
+
+type XVibeViewMutationOperation = XVibeJsonObject & {
+  _op_type: "update_props";
+  _target_id: string;
+  _props: XVibeJsonObject;
+};
+
+type XVibeViewMutationArtifact = XVibeJsonObject & {
+  _artifact_type: "view-mutation";
+  _contract_version: 1;
+  _ops: XVibeViewMutationOperation[];
+};
+
+type XVibeViewMutationDecisionReason =
+  | "eligible"
+  | "not_refine"
+  | "not_view"
+  | "missing_view_id"
+  | "missing_current_view"
+  | "prompt_not_safe"
+  | "excluded_keyword"
+  | "no_target_hint";
+
+type XVibeViewMutationDecisionLog = {
+  _eligible: boolean;
+  _mode: VibeAIMode;
+  _artifact_type: string;
+  _view_id: string | null;
+  _prompt: string;
+  _reason: XVibeViewMutationDecisionReason;
+  _has_current_view: boolean;
+  _current_view_id: string | null;
+  _children_count: number;
+};
+
+type XVibeRunValidationArchive = {
+  _validation_result?: XVibeArtifactValidationResult;
+  _repair_attempts?: XVibeJsonObject[];
+  _repair_errors?: unknown[];
+  _repaired_validation_result?: XVibeArtifactValidationResult;
+};
+
+type XVibeRunArchiveTimelineItem = {
+  _stage: string;
+  _message?: string;
+  _t_ms: number;
+  _at: string;
+  _details?: Record<string, unknown>;
+};
+
+type XVibeRunArchiveData = {
+  _generation_id?: string;
+  _app_id?: string;
+  _env?: string;
+  _view_id?: string;
+  _mode?: VibeAIMode;
+  _artifact_type?: string;
+  _created_at?: string;
+  _user_prompt?: string;
+  _final_prompt?: string;
+  _intent_plan?: unknown;
+  _selected_skill_ids?: string[];
+  _selected_skills?: unknown;
+  _runtime_context?: unknown;
+  _ai_output?: unknown;
+  _validation?: XVibeRunValidationArchive | XVibeJsonObject;
+  _result?: XVibeJsonObject;
+  _duration_ms?: number;
+  _timeline?: XVibeRunArchiveTimelineItem[];
+};
 
 type XVibeRuntimeRegistry = {
   _xui_types: Set<string>;
@@ -121,6 +210,11 @@ type XVibeModuleCreatorSpec = {
 type XVibeGeneratedModuleImplementationMethods =
   Record<string, string>;
 
+type XVibeGeneratedModuleImplementationSources = {
+  _method_sources: Record<string, string>;
+  _helper_sources: Record<string, string>;
+};
+
 type XVibeServerModuleCallGraph =
   Record<string, string[]>;
 
@@ -129,6 +223,7 @@ type XVibeGeneratedModuleImplementationValidationCategory =
   | "forbidden_content"
   | "syntax_or_shape_error"
   | "weak_behavior"
+  | "helper_method_misplaced"
   | "unknown";
 
 type XVibeGeneratedModuleRejectedAttempt = {
@@ -137,7 +232,15 @@ type XVibeGeneratedModuleRejectedAttempt = {
   _validation_errors: unknown;
   _method_sources?: Record<string, string>;
   _method_source_excerpts?: Record<string, string>;
+  _helper_sources?: Record<string, string>;
+  _helper_source_excerpts?: Record<string, string>;
 };
+
+type XVibeGenerationProgressCallback = (
+  stage: string,
+  message: string,
+  details?: Record<string, unknown>,
+) => void;
 
 class XVibeStructuredError extends Error {
   readonly _payload: XVibeJsonObject;
@@ -372,7 +475,16 @@ export function build_generated_module_implementation_prompt(input: {
   if (rejected_categories.has("syntax_or_shape_error")) {
     retry_instructions.push(
       "Previous implementation was rejected for syntax or method shape.",
-      "Return exactly one method declaration string for each declared method, with the correct underscore method name."
+      "Return exactly one method declaration string for each declared method, with the correct underscore method name.",
+      "Return helper methods using method syntax under _helper_sources."
+    );
+  }
+
+  if (rejected_categories.has("helper_method_misplaced")) {
+    retry_instructions.push(
+      "checkWinner and makeState must be returned under _helper_sources without leading underscores.",
+      "Do not put helper methods in _method_sources.",
+      "Do not prefix helper names with underscores."
     );
   }
 
@@ -381,13 +493,18 @@ export function build_generated_module_implementation_prompt(input: {
     "Return strict JSON only.",
     "",
     "Output contract:",
-    '{ "_methods": { "_methodName": "async _methodName(xcmd) { ... }" } }',
+    '{ "_method_sources": { "_methodName": "async _methodName(xcmd) { ... }" }, "_helper_sources": { "helperName": "helperName(value) { ... }" } }',
     "",
     "Rules:",
+    "Public command methods go in _method_sources.",
+    "Internal helpers go in _helper_sources.",
+    "Do not prefix helper names with '_'.",
+    "Do not put helper methods in _method_sources.",
     "Return method implementations only.",
     "Do not return full module.js.",
     "Do not include imports, exports, class declarations, static metadata, or constructor.",
     "Implement only declared operation methods listed below.",
+    "Helper methods must not be runtime ops and must not modify static _ops or the manifest.",
     "Use only local JavaScript.",
     "Use xcmd and xcmd._params for inputs.",
     "Return JSON-safe objects.",
@@ -444,7 +561,7 @@ export function build_generated_module_implementation_prompt(input: {
 
 function parse_generated_module_implementation_methods(
   value: unknown
-): XVibeGeneratedModuleImplementationMethods {
+): XVibeGeneratedModuleImplementationSources {
   const parsed =
     JSON.parse(
       repair_json(
@@ -454,14 +571,27 @@ function parse_generated_module_implementation_methods(
       )
     ) as unknown;
 
-  if (!is_plain_object(parsed) || !is_plain_object(parsed._methods)) {
-    throw new Error("Invalid generated module implementation response: missing '_methods'");
+  if (!is_plain_object(parsed)) {
+    throw new Error("Invalid generated module implementation response: expected object");
   }
 
-  const methods: XVibeGeneratedModuleImplementationMethods =
+  const raw_method_sources =
+    is_plain_object(parsed._method_sources)
+      ? parsed._method_sources
+      : is_plain_object(parsed._methods)
+        ? parsed._methods
+        : {};
+  const raw_helper_sources =
+    is_plain_object(parsed._helper_sources)
+      ? parsed._helper_sources
+      : {};
+
+  const method_sources: XVibeGeneratedModuleImplementationMethods =
+    {};
+  const helper_sources: XVibeGeneratedModuleImplementationMethods =
     {};
 
-  for (const [method_name, method_source] of Object.entries(parsed._methods)) {
+  for (const [method_name, method_source] of Object.entries(raw_method_sources)) {
     if (
       typeof method_name !== "string" ||
       !method_name.startsWith("_") ||
@@ -471,15 +601,34 @@ function parse_generated_module_implementation_methods(
       throw new Error("Invalid generated module implementation response: method sources must be non-empty strings");
     }
 
-    methods[method_name] =
+    method_sources[method_name] =
       method_source;
   }
 
-  if (Object.keys(methods).length === 0) {
-    throw new Error("Invalid generated module implementation response: no methods returned");
+  for (const [helper_name, helper_source] of Object.entries(raw_helper_sources)) {
+    if (
+      typeof helper_name !== "string" ||
+      typeof helper_source !== "string" ||
+      helper_source.trim().length === 0
+    ) {
+      throw new Error("Invalid generated module implementation response: helper sources must be non-empty strings");
+    }
+
+    helper_sources[helper_name] =
+      helper_source;
   }
 
-  return methods;
+  if (
+    Object.keys(method_sources).length === 0 &&
+    Object.keys(helper_sources).length === 0
+  ) {
+    throw new Error("Invalid generated module implementation response: no method or helper sources returned");
+  }
+
+  return {
+    _method_sources: method_sources,
+    _helper_sources: helper_sources,
+  };
 }
 
 function unwrap_command_result(value: unknown): unknown {
@@ -541,6 +690,7 @@ function normalize_implementation_validation_category(
     value === "forbidden_content" ||
     value === "syntax_or_shape_error" ||
     value === "weak_behavior" ||
+    value === "helper_method_misplaced" ||
     value === "unknown"
   ) {
     return value;
@@ -575,6 +725,10 @@ function classify_implementation_validation_failure(
 
   if (code === "E_MODULE_CREATOR_IMPLEMENTATION_WEAK_BEHAVIOR") {
     return "weak_behavior";
+  }
+
+  if (code === "E_MODULE_CREATOR_HELPER_METHOD_MISPLACED") {
+    return "helper_method_misplaced";
   }
 
   if (
@@ -646,6 +800,314 @@ function error_summary(error: unknown): XVibeJsonObject | string {
   }
 
   return String(error);
+}
+
+function safe_archive_segment(value: unknown, fallback: string): string {
+  const raw =
+    typeof value === "string" && value.trim().length > 0
+      ? value.trim()
+      : fallback;
+  const safe =
+    raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
+
+  return safe.length > 0 ? safe : fallback;
+}
+
+function safe_short_id(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function archive_timestamp(value?: string): string {
+  const timestamp =
+    value && value.trim()
+      ? value
+      : new Date().toISOString();
+
+  return timestamp.replace(/[:.]/g, "-");
+}
+
+function write_archive_file(file_path: string, content: string): void {
+  const temp_path = `${file_path}.${Date.now()}-${safe_short_id()}.tmp`;
+  fs.writeFileSync(temp_path, content, "utf-8");
+  fs.renameSync(temp_path, file_path);
+}
+
+function write_archive_json(file_path: string, value: unknown): void {
+  write_archive_file(file_path, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function has_archive_value(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value === "string") return value.length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (is_plain_object(value)) return Object.keys(value).length > 0;
+  return true;
+}
+
+function record_archive_stage(
+  archive: XVibeRunArchiveData | undefined,
+  started_at: number | undefined,
+  stage: string,
+  message?: string,
+  details?: Record<string, unknown>,
+): void {
+  try {
+    if (!archive || typeof started_at !== "number") return;
+
+    archive._timeline =
+      archive._timeline ?? [];
+    archive._timeline.push({
+      _stage: stage,
+      ...(message ? { _message: message } : {}),
+      _t_ms: Date.now() - started_at,
+      _at: new Date().toISOString(),
+      ...(details && Object.keys(details).length > 0
+        ? { _details: details }
+        : {}),
+    });
+  } catch (error) {
+    _xlog.warn("[xvibe] run archive failed", {
+      _error: error_summary(error),
+    });
+  }
+}
+
+function compact_view_summary(view: unknown): XVibeJsonObject | undefined {
+  if (!is_plain_object(view)) return undefined;
+
+  return {
+    ...(typeof view._id === "string" ? { _id: view._id } : {}),
+    ...(typeof view._type === "string" ? { _type: view._type } : {}),
+    ...(typeof view._title === "string" ? { _title: view._title } : {}),
+    ...(typeof view._label === "string" ? { _label: view._label } : {}),
+    _children_count:
+      Array.isArray(view._children)
+        ? view._children.length
+        : 0,
+  };
+}
+
+function runtime_context_archive_payload(
+  runtime_context: unknown,
+): unknown {
+  if (!is_plain_object(runtime_context)) {
+    return runtime_context;
+  }
+
+  const current_view =
+    runtime_context._current_view;
+
+  return {
+    ...runtime_context,
+    ...(is_plain_object(current_view)
+      ? {
+        _current_view_id:
+          typeof current_view._id === "string"
+            ? current_view._id
+            : runtime_context._view_id,
+        _current_view_summary:
+          compact_view_summary(current_view),
+      }
+      : {}),
+  };
+}
+
+function selected_skills_archive_payload(
+  selection?: VibeKnowledgeSelection,
+): XVibeJsonObject | undefined {
+  if (!selection) return undefined;
+
+  return {
+    _selected_skill_ids: selection.skill_ids,
+    _skills: selection.skills,
+    _diagnostics: selection.diagnostics,
+  };
+}
+
+function extract_persisted_version(value: unknown): number | string | undefined {
+  if (!is_plain_object(value)) return undefined;
+
+  if (
+    typeof value._version === "number" ||
+    typeof value._version === "string"
+  ) {
+    return value._version;
+  }
+
+  if (is_plain_object(value._result)) {
+    return extract_persisted_version(value._result);
+  }
+
+  return undefined;
+}
+
+function archive_result_from_response(
+  artifact_type: string,
+  response: unknown,
+): XVibeJsonObject {
+  const result =
+    is_plain_object(response) && is_plain_object(response._result)
+      ? response._result
+      : {};
+
+  return {
+    _artifact_type:
+      typeof result._artifact_type === "string"
+        ? result._artifact_type
+        : artifact_type,
+    ...(typeof result._artifact_id === "string"
+      ? { _artifact_id: result._artifact_id }
+      : {}),
+    ...(typeof result._view_id === "string"
+      ? { _view_id: result._view_id }
+      : {}),
+    ...(typeof result._flow_id === "string"
+      ? { _flow_id: result._flow_id }
+      : {}),
+    ...(typeof result._entity_id === "string"
+      ? { _entity_id: result._entity_id }
+      : {}),
+    _success: generation_result_is_ok(response),
+    ...(is_plain_object(response) && response._ok === false
+      ? { _error: response._error ?? response._result ?? response }
+      : {}),
+  };
+}
+
+function resolve_xvibe_work_folder(): string {
+  const get_module =
+    (_x as unknown as { getModule?: (name: string) => unknown }).getModule;
+
+  if (typeof get_module === "function") {
+    const server_xvm =
+      get_module.call(_x, "server-xvm");
+
+    if (
+      is_plain_object(server_xvm) &&
+      typeof server_xvm._work_folder === "string" &&
+      server_xvm._work_folder.trim().length > 0
+    ) {
+      return server_xvm._work_folder;
+    }
+  }
+
+  return "./work";
+}
+
+function archive_vibe_run(data: XVibeRunArchiveData): void {
+  try {
+    if (
+      typeof data._app_id !== "string" ||
+      data._app_id.trim().length === 0
+    ) {
+      return;
+    }
+
+    const created_at = data._created_at ?? new Date().toISOString();
+    const generation_id =
+      data._generation_id && data._generation_id.trim()
+        ? data._generation_id.trim()
+        : safe_short_id();
+    const app_id = data._app_id.trim();
+    const env =
+      typeof data._env === "string" && data._env.trim()
+        ? data._env.trim()
+        : DEFAULT_ENV;
+    const run_dir =
+      path.join(
+        resolve_xvibe_work_folder(),
+        "xvm",
+        "apps",
+        safe_archive_segment(env, DEFAULT_ENV),
+        safe_archive_segment(app_id, "app"),
+        "vibe-runs",
+        `${archive_timestamp(created_at)}_${safe_archive_segment(generation_id, "run")}`,
+      );
+
+    fs.mkdirSync(run_dir, { recursive: true });
+
+    const request_payload: XVibeJsonObject = {
+      _generation_id: generation_id,
+      _app_id: app_id,
+      _env: env,
+      ...(data._view_id ? { _view_id: data._view_id } : {}),
+      ...(data._mode ? { _mode: data._mode } : {}),
+      ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
+      _created_at: created_at,
+      ...(data._user_prompt !== undefined ? { _user_prompt: data._user_prompt } : {}),
+    };
+
+    write_archive_json(path.join(run_dir, "request.json"), request_payload);
+
+    if (data._user_prompt !== undefined) {
+      write_archive_file(path.join(run_dir, "prompt.txt"), data._user_prompt);
+    }
+
+    if (data._final_prompt !== undefined) {
+      write_archive_file(path.join(run_dir, "final-prompt.txt"), data._final_prompt);
+    }
+
+    if (has_archive_value(data._intent_plan)) {
+      write_archive_json(path.join(run_dir, "intent-plan.json"), data._intent_plan);
+    }
+
+    const selected_skills =
+      has_archive_value(data._selected_skills)
+        ? data._selected_skills
+        : has_archive_value(data._selected_skill_ids)
+          ? { _selected_skill_ids: data._selected_skill_ids }
+          : undefined;
+    if (selected_skills !== undefined) {
+      write_archive_json(path.join(run_dir, "selected-skills.json"), selected_skills);
+    }
+
+    if (has_archive_value(data._runtime_context)) {
+      write_archive_json(
+        path.join(run_dir, "runtime-context.json"),
+        runtime_context_archive_payload(data._runtime_context),
+      );
+    }
+
+    if (has_archive_value(data._ai_output)) {
+      write_archive_json(path.join(run_dir, "ai-output.json"), data._ai_output);
+    }
+
+    if (has_archive_value(data._validation)) {
+      write_archive_json(path.join(run_dir, "validation.json"), data._validation);
+    }
+
+    if (has_archive_value(data._timeline)) {
+      write_archive_json(path.join(run_dir, "timeline.json"), data._timeline);
+    }
+
+    if (has_archive_value(data._result)) {
+      write_archive_json(path.join(run_dir, "result.json"), data._result);
+    }
+
+    write_archive_json(path.join(run_dir, "summary.json"), {
+      _generation_id: generation_id,
+      _app_id: app_id,
+      _env: env,
+      ...(data._view_id ? { _view_id: data._view_id } : {}),
+      ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
+      ...(data._mode ? { _mode: data._mode } : {}),
+      _success: data._result?._success === true,
+      _selected_skill_ids: data._selected_skill_ids ?? [],
+      ...(typeof data._duration_ms === "number" ? { _duration_ms: data._duration_ms } : {}),
+      _created_at: created_at,
+    });
+
+    _xlog.log("[xvibe] run archived", {
+      _app_id: app_id,
+      _env: env,
+      _generation_id: generation_id,
+      _archive_dir: run_dir,
+    });
+  } catch (error) {
+    _xlog.warn("[xvibe] run archive failed", {
+      _error: error_summary(error),
+    });
+  }
 }
 
 function generation_artifact_stage_fields(result: unknown): XVibeJsonObject {
@@ -814,6 +1276,26 @@ function parser_diagnostic(error: unknown): XVibeParserDiagnostic | undefined {
 
 function parser_diagnostics(error: unknown): XVibeParserDiagnostic[] | undefined {
   return error instanceof VibeOutputParserError ? error._diagnostics : undefined;
+}
+
+function archive_failure_result(
+  artifact_type: VibeArtifactType,
+  error: unknown,
+  requested_view_id?: string,
+): XVibeJsonObject {
+  const diagnostic = parser_diagnostic(error);
+  const diagnostics = parser_diagnostics(error);
+  const structured = structured_error_payload(error);
+
+  return {
+    _artifact_type: artifact_type,
+    ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+    _success: false,
+    _error: error_summary(error),
+    ...(diagnostic ? { _diagnostic: diagnostic } : {}),
+    ...(diagnostics ? { _diagnostics: diagnostics } : {}),
+    ...(structured ? { _structured_error_payload: structured } : {}),
+  };
 }
 
 function assert_no_duplicate_child_ids(children: unknown, context: string): void {
@@ -1850,6 +2332,7 @@ export class XVibeModule extends XModule {
     originating_view?: unknown;
     server_module_call_graph?: XVibeServerModuleCallGraph;
     _allow_skeleton_fallback?: boolean;
+    _progress?: XVibeGenerationProgressCallback;
   }): Promise<unknown> {
     const module_ops =
       input.spec._ops.map((op) => op._name);
@@ -1893,6 +2376,15 @@ export class XVibeModule extends XModule {
         _attempt: attempt,
         _max_attempts: GENERATED_MODULE_IMPLEMENTATION_MAX_ATTEMPTS,
       });
+      input._progress?.(
+        "module-implementing",
+        "Implementing module...",
+        {
+          _module_name: input.spec._name,
+          _module_ops: module_ops,
+          _attempt: attempt,
+        },
+      );
 
       const implementation_prompt =
         build_generated_module_implementation_prompt({
@@ -1920,7 +2412,7 @@ export class XVibeModule extends XModule {
         });
       }
 
-      let methods: XVibeGeneratedModuleImplementationMethods | undefined;
+      let implementation_sources: XVibeGeneratedModuleImplementationSources | undefined;
 
       try {
         const xai_result =
@@ -1937,7 +2429,7 @@ export class XVibeModule extends XModule {
             } as any),
           );
 
-        methods =
+        implementation_sources =
           parse_generated_module_implementation_methods(xai_result);
       } catch (error) {
         validation_errors = {
@@ -1967,13 +2459,23 @@ export class XVibeModule extends XModule {
 
       _xlog.log("[xvibe] generated module implementation received", {
         _module_name: input.spec._name,
-        _methods: Object.keys(methods),
-        _method_sources: methods,
+        _methods: Object.keys(implementation_sources._method_sources),
+        _method_sources: implementation_sources._method_sources,
+        _helper_sources: implementation_sources._helper_sources,
       });
 
       let implementation_response: unknown;
 
       try {
+        input._progress?.(
+          "module-validating",
+          "Validating module...",
+          {
+            _module_name: input.spec._name,
+            _module_ops: module_ops,
+            _attempt: attempt,
+          },
+        );
         implementation_response =
           await _x.execute({
             _module: "module-creator",
@@ -1982,7 +2484,9 @@ export class XVibeModule extends XModule {
               _id: input.spec._id,
               _implementation_request: input.user_request,
               _context: {
-                _methods: methods,
+                _methods: implementation_sources._method_sources,
+                _method_sources: implementation_sources._method_sources,
+                _helper_sources: implementation_sources._helper_sources,
               },
             },
           } as any);
@@ -2000,8 +2504,10 @@ export class XVibeModule extends XModule {
           _attempt: attempt,
           _category: "unknown",
           _validation_errors: validation_errors,
-          _method_sources: methods,
-          _method_source_excerpts: method_source_excerpts(methods),
+          _method_sources: implementation_sources._method_sources,
+          _method_source_excerpts: method_source_excerpts(implementation_sources._method_sources),
+          _helper_sources: implementation_sources._helper_sources,
+          _helper_source_excerpts: method_source_excerpts(implementation_sources._helper_sources),
         });
 
         _xlog.warn("[module-creator] implementation validation failed", {
@@ -2031,8 +2537,10 @@ export class XVibeModule extends XModule {
           _attempt: attempt,
           _category: category,
           _validation_errors: implementation_result,
-          _method_sources: methods,
-          _method_source_excerpts: method_source_excerpts(methods),
+          _method_sources: implementation_sources._method_sources,
+          _method_source_excerpts: method_source_excerpts(implementation_sources._method_sources),
+          _helper_sources: implementation_sources._helper_sources,
+          _helper_source_excerpts: method_source_excerpts(implementation_sources._helper_sources),
         });
 
         _xlog.warn("[module-creator] implementation validation failed", {
@@ -2097,6 +2605,7 @@ export class XVibeModule extends XModule {
     runtime_mode: string;
     prompt: string;
     intent_plan: VibeIntentPlan;
+    _progress?: XVibeGenerationProgressCallback;
   }): Promise<XVibeServerModuleEnsureResult> {
     if (
       input.intent_plan._requires_module === true &&
@@ -2136,6 +2645,14 @@ export class XVibeModule extends XModule {
       _module_ops: requirement._module_ops,
       ...(requirement._module_reason ? { _module_reason: requirement._module_reason } : {}),
     });
+    input._progress?.(
+      "module-planning",
+      "Planning module...",
+      {
+        _module_name: requirement._module_name,
+        _module_ops: requirement._module_ops,
+      },
+    );
 
     const spec =
       this.build_server_module_spec(requirement);
@@ -2144,6 +2661,15 @@ export class XVibeModule extends XModule {
       _module_name: spec._name,
       _module_ops: spec._ops.map((op) => op._name),
     });
+    const module_create_started_at = Date.now();
+    input._progress?.(
+      "module-creating",
+      "Creating module...",
+      {
+        _module_name: spec._name,
+        _module_ops: spec._ops.map((op) => op._name),
+      },
+    );
 
     const create_result = unwrap_command_result(
       await _x.execute({
@@ -2155,13 +2681,25 @@ export class XVibeModule extends XModule {
       } as any)
     );
 
+    const module_implement_started_at = Date.now();
     const implementation_result =
       await this.implement_generated_module_from_spec({
         spec,
         user_request: input.prompt,
         server_module_call_graph: {},
+        _progress: input._progress,
       });
 
+    input._progress?.(
+      "module-loading",
+      "Loading module...",
+      {
+        _module_name: spec._name,
+        _module_ops: spec._ops.map((op) => op._name),
+        _duration_ms: Date.now() - module_implement_started_at,
+        _create_duration_ms: module_implement_started_at - module_create_started_at,
+      },
+    );
     const load_result = unwrap_command_result(
       await _x.execute({
         _module: "module-creator",
@@ -2229,6 +2767,7 @@ export class XVibeModule extends XModule {
     prompt: string;
     view: XVibeJsonObject;
     runtime_skills: unknown;
+    _progress?: XVibeGenerationProgressCallback;
   }): Promise<XVibeViewServerModuleEnsureResult> {
     const calls =
       collect_view_server_module_calls(input.view);
@@ -2263,6 +2802,14 @@ export class XVibeModule extends XModule {
         _module_ops: [...ops].sort(),
         _module_reason: "Generated view references this server module via xvm.call-server.",
       };
+      input._progress?.(
+        "module-planning",
+        "Planning module...",
+        {
+          _module_name: requirement._module_name,
+          _module_ops: requirement._module_ops,
+        },
+      );
       const spec =
         this.build_server_module_spec(requirement);
 
@@ -2270,6 +2817,15 @@ export class XVibeModule extends XModule {
         _module_name: spec._name,
         _module_ops: spec._ops.map((op) => op._name),
       });
+      const module_create_started_at = Date.now();
+      input._progress?.(
+        "module-creating",
+        "Creating module...",
+        {
+          _module_name: spec._name,
+          _module_ops: spec._ops.map((op) => op._name),
+        },
+      );
 
       const create_result = unwrap_command_result(
         await _x.execute({
@@ -2281,14 +2837,26 @@ export class XVibeModule extends XModule {
         } as any),
       );
 
+      const module_implement_started_at = Date.now();
       const implementation_result =
         await this.implement_generated_module_from_spec({
           spec,
           user_request: input.prompt,
           current_or_generated_view: input.view,
           server_module_call_graph: view_server_module_calls_to_data(calls),
+          _progress: input._progress,
         });
 
+      input._progress?.(
+        "module-loading",
+        "Loading module...",
+        {
+          _module_name: spec._name,
+          _module_ops: spec._ops.map((op) => op._name),
+          _duration_ms: Date.now() - module_implement_started_at,
+          _create_duration_ms: module_implement_started_at - module_create_started_at,
+        },
+      );
       const load_result = unwrap_command_result(
         await _x.execute({
           _module: "module-creator",
@@ -2368,6 +2936,34 @@ export class XVibeModule extends XModule {
         _error: error_summary(error),
       });
     }
+  }
+
+  private push_generation_archive_stage(input: {
+    archive?: XVibeRunArchiveData;
+    started_at?: number;
+    app_id: string;
+    env: string;
+    stage: string;
+    message: string;
+    generation_id?: string;
+    details?: Record<string, unknown>;
+  }): void {
+    record_archive_stage(
+      input.archive,
+      input.started_at,
+      input.stage,
+      input.message,
+      input.details,
+    );
+
+    this.push_generation_stage(
+      input.app_id,
+      input.env,
+      input.stage,
+      input.message,
+      input.generation_id,
+      input.details as XVibeJsonObject | undefined,
+    );
   }
 
   private broadcast_generation_failed(
@@ -2493,6 +3089,600 @@ export class XVibeModule extends XModule {
     });
 
     return current_result._view;
+  }
+
+  private get_view_mutation_prompt_decision(
+    prompt: string,
+    current_view: unknown
+  ): {
+    _eligible: boolean;
+    _reason: XVibeViewMutationDecisionReason;
+  } {
+    if (typeof prompt !== "string" || prompt.trim().length === 0) {
+      return {
+        _eligible: false,
+        _reason: "prompt_not_safe",
+      };
+    }
+
+    if (!is_plain_object(current_view)) {
+      return {
+        _eligible: false,
+        _reason: "missing_current_view",
+      };
+    }
+
+    const normalized_prompt =
+      prompt
+        .toLowerCase()
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+    const full_generation_patterns = [
+      /\bcreate\b.*\bapp\b/,
+      /\brebuild\b/,
+      /\bredesign\b/,
+      /\bregenerate\b/,
+      /\bnew game\b/,
+      /\bdashboard\b/,
+      /\bform\b/,
+      /\blayout\b/,
+      /\bpage\b/,
+    ];
+
+    if (
+      full_generation_patterns.some((pattern) =>
+        pattern.test(normalized_prompt)
+      )
+    ) {
+      return {
+        _eligible: false,
+        _reason: "excluded_keyword",
+      };
+    }
+
+    const mutation_patterns = [
+      /\bchange\b/,
+      /\bupdate\b/,
+      /\breplace\b/,
+      /\brename\b/,
+      /\bmove\b/,
+      /\badd class\b/,
+      /\bchange text\b/,
+      /\bchange href\b/,
+      /\bchange target\b/,
+      /\bchange label\b/,
+      /\bchange button\b/,
+    ];
+
+    if (
+      !mutation_patterns.some((pattern) =>
+        pattern.test(normalized_prompt)
+      )
+    ) {
+      return {
+        _eligible: false,
+        _reason: "no_target_hint",
+      };
+    }
+
+    return {
+      _eligible: true,
+      _reason: "eligible",
+    };
+  }
+
+  private should_use_view_mutation(
+    prompt: string,
+    current_view: unknown
+  ): boolean {
+    return this.get_view_mutation_prompt_decision(prompt, current_view)._eligible;
+  }
+
+  private build_view_mutation_refine_decision(input: {
+    _mode: VibeAIMode;
+    _artifact_type: string;
+    _view_id?: string;
+    _prompt: string;
+    _current_view: unknown;
+    _eligible?: boolean;
+  }): XVibeViewMutationDecisionLog {
+    const current_view = input._current_view;
+    const has_current_view = is_plain_object(current_view);
+    const current_view_id =
+      has_current_view && typeof current_view._id === "string"
+        ? current_view._id
+        : null;
+    const children_count =
+      has_current_view && Array.isArray(current_view._children)
+        ? current_view._children.length
+        : 0;
+
+    let prompt_decision:
+      | {
+        _eligible: boolean;
+        _reason: XVibeViewMutationDecisionReason;
+      }
+      | undefined;
+
+    let reason: XVibeViewMutationDecisionReason;
+    if (input._mode !== "refine") {
+      reason = "not_refine";
+    } else if (input._artifact_type !== "view") {
+      reason = "not_view";
+    } else if (!input._view_id) {
+      reason = "missing_view_id";
+    } else {
+      prompt_decision =
+        this.get_view_mutation_prompt_decision(input._prompt, current_view);
+      reason = prompt_decision._reason;
+    }
+
+    const eligible =
+      input._eligible ??
+      (prompt_decision
+        ? prompt_decision._eligible
+        : false);
+
+    return {
+      _eligible: eligible,
+      _mode: input._mode,
+      _artifact_type: input._artifact_type,
+      _view_id: input._view_id ?? null,
+      _prompt: input._prompt,
+      _reason: reason,
+      _has_current_view: has_current_view,
+      _current_view_id: current_view_id,
+      _children_count: children_count,
+    };
+  }
+
+  private log_view_mutation_refine_decision(input: {
+    _mode: VibeAIMode;
+    _artifact_type: string;
+    _view_id?: string;
+    _prompt: string;
+    _current_view: unknown;
+    _eligible?: boolean;
+  }): XVibeViewMutationDecisionLog {
+    const decision = this.build_view_mutation_refine_decision(input);
+    _xlog.log("[xvibe] mutation refine decision", decision);
+    return decision;
+  }
+
+  private collect_view_target_ids(
+    value: unknown,
+    ids: string[] = [],
+  ): string[] {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        this.collect_view_target_ids(item, ids);
+      }
+      return ids;
+    }
+
+    if (!is_plain_object(value)) {
+      return ids;
+    }
+
+    if (typeof value._id === "string" && value._id.trim().length > 0) {
+      ids.push(value._id);
+    }
+
+    for (const child of Object.values(value)) {
+      if (is_plain_object(child) || Array.isArray(child)) {
+        this.collect_view_target_ids(child, ids);
+      }
+    }
+
+    return ids;
+  }
+
+  private find_view_node_by_id(
+    value: unknown,
+    target_id: string,
+  ): XVibeJsonObject | undefined {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const found = this.find_view_node_by_id(item, target_id);
+        if (found) return found;
+      }
+      return undefined;
+    }
+
+    if (!is_plain_object(value)) {
+      return undefined;
+    }
+
+    if (value._id === target_id) {
+      return value;
+    }
+
+    for (const child of Object.values(value)) {
+      if (is_plain_object(child) || Array.isArray(child)) {
+        const found = this.find_view_node_by_id(child, target_id);
+        if (found) return found;
+      }
+    }
+
+    return undefined;
+  }
+
+  private stable_json(value: unknown): string {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => this.stable_json(item)).join(",")}]`;
+    }
+
+    if (is_plain_object(value)) {
+      return `{${Object.keys(value)
+        .sort()
+        .map((key) =>
+          `${JSON.stringify(key)}:${this.stable_json(value[key])}`
+        )
+        .join(",")}}`;
+    }
+
+    return JSON.stringify(value) ?? "undefined";
+  }
+
+  private json_values_equal(a: unknown, b: unknown): boolean {
+    return this.stable_json(a) === this.stable_json(b);
+  }
+
+  private prompt_explicitly_requests_mutation_key(
+    prompt: string,
+    key: string,
+  ): boolean {
+    const normalized_prompt =
+      prompt
+        .toLowerCase()
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const escaped_key =
+      key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    if (new RegExp(`\\b${escaped_key}\\b`, "i").test(prompt)) {
+      return true;
+    }
+
+    if (key === "_on") {
+      return /\b(event handler|handlers|wiring|click handler|on click)\b/.test(normalized_prompt);
+    }
+
+    if (key === "_on_mount") {
+      return /\b(on mount|mount handler|mount behavior)\b/.test(normalized_prompt);
+    }
+
+    if (key === "_data_source") {
+      return /\b(data source|data binding|datasource)\b/.test(normalized_prompt);
+    }
+
+    if (key === "_on_data") {
+      return /\b(on data|data handler|data handling)\b/.test(normalized_prompt);
+    }
+
+    if (key === "_children") {
+      return /\b(children|child nodes|child objects)\b/.test(normalized_prompt);
+    }
+
+    return false;
+  }
+
+  private build_view_mutation_prompt(input: {
+    prompt: string;
+    current_view: unknown;
+  }): string {
+    const target_ids =
+      this.collect_view_target_ids(input.current_view)
+        .filter((id, index, ids) => ids.indexOf(id) === index)
+        .slice(0, 200);
+
+    const mutation_prompt = [
+      "You are an Xpell view mutation planner.",
+      "Return strict JSON only.",
+      "Generate mutation operations instead of full view JSON.",
+      "",
+      "Output contract:",
+      JSON.stringify(
+        {
+          _artifact_type: "view-mutation",
+          _contract_version: 1,
+          _ops: [
+            {
+              _op_type: "update_props",
+              _target_id: "...",
+              _props: {},
+            },
+          ],
+        },
+        null,
+        2,
+      ),
+      "",
+      "Rules:",
+      "- Use update_props only.",
+      "- update_props is required for text, class, style, href, target, title, and value changes.",
+      "- _target_id must already exist in Current View JSON.",
+      "- _props must contain only the changed properties.",
+      "- If _props includes _id, it must equal _target_id.",
+      "- Preserve existing wiring.",
+      "- Never include _on, _on_mount, _data_source, _on_data, or _children in _props unless explicitly requested.",
+      "- Return only the minimal operations needed for the requested edit.",
+      "- Do not return _view.",
+      "- Do not return full view JSON.",
+      "",
+      "Existing target ids:",
+      target_ids.length > 0 ? target_ids.join(", ") : "(none)",
+      "",
+      "Current View JSON:",
+      JSON.stringify(input.current_view, null, 2),
+      "",
+      "User Edit Request:",
+      input.prompt,
+    ].join("\n");
+
+    _xlog.log("[xvibe] mutation prompt built");
+
+    return mutation_prompt;
+  }
+
+  private parse_view_mutation_output(input: {
+    xai_result: unknown;
+    prompt: string;
+    current_view: unknown;
+  }): XVibeViewMutationArtifact {
+    const parsed =
+      JSON.parse(
+        repair_json(
+          extract_balanced_json(
+            read_generated_text(input.xai_result),
+          ),
+        ),
+      ) as unknown;
+
+    if (!is_plain_object(parsed)) {
+      throw new Error("Invalid mutation output: expected object root");
+    }
+
+    if (parsed._artifact_type !== "view-mutation") {
+      throw new Error("Invalid mutation output: expected _artifact_type 'view-mutation'");
+    }
+
+    if (parsed._contract_version !== 1) {
+      throw new Error("Invalid mutation output: expected _contract_version 1");
+    }
+
+    if (!Array.isArray(parsed._ops)) {
+      throw new Error("Invalid mutation output: expected _ops array");
+    }
+
+    if (parsed._ops.length === 0) {
+      throw new Error("Invalid mutation output: expected at least one op");
+    }
+
+    const protected_props =
+      ["_on", "_on_mount", "_data_source", "_on_data", "_children"];
+
+    for (const [index, op] of parsed._ops.entries()) {
+      if (!is_plain_object(op)) {
+        throw new Error(`Invalid mutation op at index ${index}: expected object`);
+      }
+
+      if (op._op_type !== "update_props") {
+        throw new Error(`Invalid mutation op at index ${index}: update_props only`);
+      }
+
+      if (typeof op._target_id !== "string" || op._target_id.trim().length === 0) {
+        throw new Error(`Invalid mutation op at index ${index}: expected _target_id`);
+      }
+
+      const target_id = op._target_id;
+
+      if (!is_plain_object(op._props)) {
+        throw new Error(`Invalid mutation op at index ${index}: expected _props object`);
+      }
+
+      if (Object.keys(op._props).length === 0) {
+        throw new Error(`Invalid mutation op at index ${index}: expected non-empty _props`);
+      }
+
+      if (
+        op._props._id !== undefined &&
+        op._props._id !== target_id
+      ) {
+        throw new Error(`Invalid mutation op at index ${index}: _props._id must equal _target_id when present`);
+      }
+
+      const current_target =
+        this.find_view_node_by_id(input.current_view, target_id);
+      if (!current_target) {
+        throw new Error(`Invalid mutation op at index ${index}: target '${target_id}' does not exist`);
+      }
+
+      for (const protected_key of protected_props) {
+        if (
+          protected_key in op._props &&
+          !this.prompt_explicitly_requests_mutation_key(input.prompt, protected_key)
+        ) {
+          throw new Error(`Invalid mutation op at index ${index}: _props must not include ${protected_key} unless explicitly requested`);
+        }
+      }
+    }
+
+    return parsed as XVibeViewMutationArtifact;
+  }
+
+  private async try_apply_view_mutation(input: {
+    app_id: string;
+    env: string;
+    view_id: string;
+    prompt: string;
+    current_view: unknown;
+    include_artifact_type: boolean;
+    archive: XVibeRunArchiveData;
+    progress: XVibeGenerationProgressCallback;
+    archive_started_at: number;
+  }): Promise<unknown | undefined> {
+    const fallback = (reason: unknown): undefined => {
+      const details = {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _error: error_summary(reason),
+      };
+
+      _xlog.log("[xvibe] mutation fallback", details);
+      input.progress(
+        "mutation-fallback",
+        "Falling back to full refine...",
+        details as Record<string, unknown>,
+      );
+
+      return undefined;
+    };
+
+    try {
+      input.progress(
+        "planning-mutation",
+        "Planning mutation...",
+        {
+          _view_id: input.view_id,
+        },
+      );
+
+      const mutation_prompt =
+        this.build_view_mutation_prompt({
+          prompt: input.prompt,
+          current_view: input.current_view,
+        });
+      input.archive._final_prompt = mutation_prompt;
+
+      input.progress(
+        "generating-mutation",
+        "Generating mutation...",
+        {
+          _view_id: input.view_id,
+        },
+      );
+
+      const xai_result: any =
+        unwrap_command_result(
+          await _x.execute({
+            _module: "xai",
+            _op: "generate",
+            _params: {
+              _prompt: mutation_prompt,
+              response_format: {
+                type: "json_object",
+              },
+            },
+          } as any),
+        );
+      input.archive._ai_output = xai_result;
+
+      input.progress(
+        "parsing-mutation",
+        "Parsing mutation...",
+        {
+          _view_id: input.view_id,
+        },
+      );
+
+      const mutation =
+        this.parse_view_mutation_output({
+          xai_result,
+          prompt: input.prompt,
+          current_view: input.current_view,
+        });
+
+      _xlog.log("[xvibe] mutation ops parsed", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _ops_count: mutation._ops.length,
+      });
+
+      input.progress(
+        "mutating",
+        "Applying mutation...",
+        {
+          _view_id: input.view_id,
+          _ops_count: mutation._ops.length,
+        },
+      );
+
+      const raw_mutation_response =
+        await _x.execute({
+          _module: "xmutator",
+          _op: "mutate-view",
+          _params: {
+            _app_id: input.app_id,
+            _env: input.env,
+            _view_id: input.view_id,
+            _dry_run: false,
+            _ops: mutation._ops,
+          },
+        } as any);
+      const mutation_result =
+        unwrap_command_result(
+          unwrap_command_result(raw_mutation_response),
+        );
+
+      if (!is_plain_object(mutation_result)) {
+        throw new Error("Invalid xmutator mutate-view response");
+      }
+
+      _xlog.log("[xvibe] mutation applied", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _ops_count: mutation._ops.length,
+      });
+
+      input.archive._result = {
+        _artifact_type: "view",
+        _artifact_id: input.view_id,
+        _view_id: input.view_id,
+        _success: true,
+        _mutation: true,
+        _ops_count: mutation._ops.length,
+      };
+
+      _xem.fire("vibe:view-updated", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+      });
+
+      input.progress(
+        "complete",
+        "View updated",
+        {
+          _artifact_type: "view",
+          _view_id: input.view_id,
+          _mutation: true,
+          _ops_count: mutation._ops.length,
+          _duration_ms: Date.now() - input.archive_started_at,
+        },
+      );
+
+      return {
+        _ok: true,
+        _result: input.include_artifact_type
+          ? {
+            _artifact_type: "view",
+            _artifact_id: input.view_id,
+            _view_id: input.view_id,
+          }
+          : {
+            _view_id: input.view_id,
+          },
+      };
+    } catch (error) {
+      return fallback(error);
+    }
   }
 
   protected async create_intent_plan(params: {
@@ -3269,10 +4459,18 @@ export class XVibeModule extends XModule {
     _generated_artifacts?: unknown;
     _planned_flow_ids?: string[];
   }): XVibeArtifactValidationResult {
-    const registry = collect_runtime_registry(input._runtime_skills);
+    let registry = collect_runtime_registry(input._runtime_skills);
     const errors: string[] = [];
 
     if (input._artifact_type === "view") {
+      if (registry._xui_types.size === 0) {
+        _xlog.warn("[xvibe] runtime XUI registry empty; using fallback validation types");
+        registry = {
+          ...registry,
+          _xui_types: new Set(FALLBACK_XUI_VALIDATION_TYPES),
+        };
+      }
+
       this.validate_view_artifact(
         input._artifact as XVibeViewArtifact,
         input._prompt,
@@ -3412,8 +4610,13 @@ export class XVibeModule extends XModule {
     _runtime_skills: unknown;
     _generated_artifacts?: unknown;
     _planned_flow_ids?: string[];
+    _archive_validation?: XVibeRunValidationArchive;
+    _progress?: XVibeGenerationProgressCallback;
   }): Promise<XVibeGeneratedArtifact> {
     const validation = this.validate_generated_artifact(input);
+    if (input._archive_validation) {
+      input._archive_validation._validation_result = validation;
+    }
 
     if (validation._ok) {
       return input._artifact;
@@ -3427,8 +4630,25 @@ export class XVibeModule extends XModule {
     _xlog.log("[xvibe] repair attempt", {
       _artifact_type: input._artifact_type,
     });
+    input._progress?.(
+      "repairing",
+      "Repairing artifact...",
+      {
+        _artifact_type: input._artifact_type,
+        _repair_attempt: 1,
+      },
+    );
 
     let repaired: XVibeGeneratedArtifact;
+    if (input._archive_validation) {
+      input._archive_validation._repair_attempts =
+        input._archive_validation._repair_attempts ?? [];
+      input._archive_validation._repair_attempts.push({
+        _artifact_type: input._artifact_type,
+        _started_at: new Date().toISOString(),
+        _validation_errors: validation._errors,
+      });
+    }
 
     try {
       repaired = await this.repair_generated_artifact({
@@ -3442,6 +4662,20 @@ export class XVibeModule extends XModule {
         _artifact_type: input._artifact_type,
         _reason: error instanceof Error ? error.message : String(error),
       });
+      if (input._archive_validation) {
+        input._archive_validation._repair_errors =
+          input._archive_validation._repair_errors ?? [];
+        input._archive_validation._repair_errors.push(error_summary(error));
+        const last_attempt =
+          input._archive_validation._repair_attempts?.[
+            input._archive_validation._repair_attempts.length - 1
+          ];
+        if (last_attempt) {
+          last_attempt._ok = false;
+          last_attempt._error = error_summary(error);
+          last_attempt._completed_at = new Date().toISOString();
+        }
+      }
       throw error;
     }
 
@@ -3463,12 +4697,32 @@ export class XVibeModule extends XModule {
         ...input,
         _artifact: repaired,
       });
+    if (input._archive_validation) {
+      input._archive_validation._repaired_validation_result =
+        repaired_validation;
+    }
 
     if (!repaired_validation._ok) {
       _xlog.warn("[xvibe] repair failed", {
         _artifact_type: input._artifact_type,
         _errors: repaired_validation._errors,
       });
+      if (input._archive_validation) {
+        input._archive_validation._repair_errors =
+          input._archive_validation._repair_errors ?? [];
+        input._archive_validation._repair_errors.push({
+          _errors: repaired_validation._errors,
+        });
+        const last_attempt =
+          input._archive_validation._repair_attempts?.[
+            input._archive_validation._repair_attempts.length - 1
+          ];
+        if (last_attempt) {
+          last_attempt._ok = false;
+          last_attempt._errors = repaired_validation._errors;
+          last_attempt._completed_at = new Date().toISOString();
+        }
+      }
       throw new Error(
         `Invalid repaired AI output: ${this.validation_error_summary(repaired_validation._errors)}`
       );
@@ -3477,6 +4731,16 @@ export class XVibeModule extends XModule {
     _xlog.log("[xvibe] repair success", {
       _artifact_type: input._artifact_type,
     });
+    if (input._archive_validation) {
+      const last_attempt =
+        input._archive_validation._repair_attempts?.[
+          input._archive_validation._repair_attempts.length - 1
+        ];
+      if (last_attempt) {
+        last_attempt._ok = true;
+        last_attempt._completed_at = new Date().toISOString();
+      }
+    }
 
     return repaired;
   }
@@ -3719,6 +4983,12 @@ export class XVibeModule extends XModule {
   }
 
   private async generate_artifact(params: XVibeJsonObject, forced_artifact_type?: VibeArtifactType) {
+    const user_prompt =
+      typeof params._prompt === "string"
+        ? params._prompt
+        : typeof params.prompt === "string"
+          ? params.prompt
+          : undefined;
     const prompt = resolve_prompt(params);
     const mode = read_mode(params._mode);
     const app_id = read_required_string(params._app_id, "_app_id");
@@ -3728,100 +4998,204 @@ export class XVibeModule extends XModule {
     const capabilities = read_optional_string_array(params._capabilities, "_capabilities");
     const planned_flow_ids = read_optional_string_array(params._planned_flow_ids, "_planned_flow_ids");
     const generation_id = read_optional_string(params._generation_id, "_generation_id");
+    const effective_generation_id = generation_id ?? safe_short_id();
+    if (!generation_id) {
+      _xlog.warn("[xvibe] generation_id missing; generated fallback id", {
+        _generation_id: effective_generation_id,
+      });
+    }
     const supplied_intent_plan = is_plain_object(params._intent_plan) ? params._intent_plan : {};
     const artifact_type = forced_artifact_type ?? infer_artifact_type(prompt, requested_artifact_type);
-
-    if (mode === "refine" && artifact_type !== "view") {
-      throw new Error("Invalid '_mode': refine is only supported for view artifacts");
-    }
-
-    if (mode === "refine" && !requested_view_id) {
-      throw new Error("Invalid '_view_id': expected non-empty string for refine mode");
-    }
-
-    _xlog.log("[xvibe] generate", {
-      _mode: mode,
-      _artifact_type: artifact_type,
-      ...(capabilities.length > 0 ? { _capabilities: capabilities } : {}),
+    const archive_started_at = Date.now();
+    const archive_created_at = new Date().toISOString();
+    const archive_validation: XVibeRunValidationArchive = {};
+    const archive: XVibeRunArchiveData = {
+      _generation_id: effective_generation_id,
       _app_id: app_id,
       _env: env,
-      ...(generation_id ? { _generation_id: generation_id } : {}),
-    });
+      ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+      _mode: mode,
+      _artifact_type: artifact_type,
+      _created_at: archive_created_at,
+      _user_prompt: user_prompt ?? prompt,
+      _validation: archive_validation,
+    };
+    const stage: XVibeGenerationProgressCallback =
+      (stage_name, message, details = {}) => {
+        this.push_generation_archive_stage({
+          archive,
+          started_at: archive_started_at,
+          app_id,
+          env,
+          stage: stage_name,
+          message,
+          generation_id: archive._generation_id,
+          details: {
+            _artifact_type: artifact_type,
+            ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+            ...details,
+          },
+        });
+      };
+    const view_stage: XVibeGenerationProgressCallback =
+      (stage_name, message, details) => {
+        if (artifact_type !== "view") return;
+        stage(stage_name, message, details);
+      };
 
-    const runtime_mode = app_id === "vibe-system" ? "system" : "runtime";
+    try {
+      view_stage(
+        "preparing",
+        "Preparing generation...",
+      );
 
-    let runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
+      if (mode !== "refine") {
+        this.log_view_mutation_refine_decision({
+          _mode: mode,
+          _artifact_type: artifact_type,
+          ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+          _prompt: prompt,
+          _current_view: undefined,
+          _eligible: false,
+        });
+      }
 
-    let intent_plan = this.create_artifact_intent_plan({
-      prompt,
-      artifact_type,
-      supplied_intent_plan,
-      runtime_skills,
-    });
+      if (mode === "refine" && artifact_type !== "view") {
+        this.log_view_mutation_refine_decision({
+          _mode: mode,
+          _artifact_type: artifact_type,
+          ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+          _prompt: prompt,
+          _current_view: undefined,
+          _eligible: false,
+        });
+
+        throw new Error("Invalid '_mode': refine is only supported for view artifacts");
+      }
+
+      if (mode === "refine" && !requested_view_id) {
+        this.log_view_mutation_refine_decision({
+          _mode: mode,
+          _artifact_type: artifact_type,
+          _prompt: prompt,
+          _current_view: undefined,
+          _eligible: false,
+        });
+
+        throw new Error("Invalid '_view_id': expected non-empty string for refine mode");
+      }
+
+      _xlog.log("[xvibe] generate", {
+        _mode: mode,
+        _artifact_type: artifact_type,
+        ...(capabilities.length > 0 ? { _capabilities: capabilities } : {}),
+        _app_id: app_id,
+        _env: env,
+        ...(generation_id ? { _generation_id: generation_id } : {}),
+      });
+
+      const runtime_mode = app_id === "vibe-system" ? "system" : "runtime";
+
+      let runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
+
+      view_stage(
+        "planning",
+        "Planning intent...",
+      );
+      const planning_started_at = Date.now();
+      let intent_plan = this.create_artifact_intent_plan({
+        prompt,
+        artifact_type,
+        supplied_intent_plan,
+        runtime_skills,
+      });
+      archive._intent_plan = intent_plan;
 
     // View generation now discovers server modules from
     // actual xvm.call-server wiring later.
     // Prevent generic placeholder modules from being created.
 
-    if (
-      artifact_type === "view" &&
-      intent_plan._module_name === "generated-module"
-    ) {
-      _xlog.log("[xvibe] suppressing generic module inference", {
-        _artifact_type: artifact_type,
-        _module_name: intent_plan._module_name,
-      });
+      if (
+        artifact_type === "view" &&
+        intent_plan._module_name === "generated-module"
+      ) {
+        _xlog.log("[xvibe] suppressing generic module inference", {
+          _artifact_type: artifact_type,
+          _module_name: intent_plan._module_name,
+        });
 
-      intent_plan = {
-        ...intent_plan,
-        _requires_module: false,
-        _module_target: null,
-        _module_name: "",
-        _module_ops: [],
-        _module_reason: "",
-      };
-    }
+        intent_plan = {
+          ...intent_plan,
+          _requires_module: false,
+          _module_target: null,
+          _module_name: "",
+          _module_ops: [],
+          _module_reason: "",
+        };
+        archive._intent_plan = intent_plan;
+      }
 
-    const module_ensure_result =
-      await this.ensure_server_module_for_intent({
-        app_id,
-        env,
-        runtime_mode,
-        prompt,
-        intent_plan,
-      });
+      const module_ensure_result =
+        await this.ensure_server_module_for_intent({
+          app_id,
+          env,
+          runtime_mode,
+          prompt,
+          intent_plan,
+          _progress: stage,
+        });
       
-    intent_plan = module_ensure_result._intent_plan;
+      intent_plan = module_ensure_result._intent_plan;
+      archive._intent_plan = intent_plan;
 
-    if (
-      prompt_requests_module_only(prompt) &&
-      module_ensure_result._module_name
-    ) {
-      _xlog.log("[xvibe] module-only request completed", {
-        _module_name: module_ensure_result._module_name,
-        _module_ops: module_ensure_result._module_ops,
-        _created: module_ensure_result._created,
-        _available: module_ensure_result._available,
-      });
-
-      return {
-        _ok: true,
-        _result: {
-          _artifact_type: "module",
+      if (
+        prompt_requests_module_only(prompt) &&
+        module_ensure_result._module_name
+      ) {
+        _xlog.log("[xvibe] module-only request completed", {
           _module_name: module_ensure_result._module_name,
           _module_ops: module_ensure_result._module_ops,
+          _created: module_ensure_result._created,
+          _available: module_ensure_result._available,
+        });
+
+        archive._result = {
+          _artifact_type: "module",
+          _artifact_id: module_ensure_result._module_name,
+          _module_name: module_ensure_result._module_name,
+          _module_ops: module_ensure_result._module_ops,
+          _success: true,
           ...(module_ensure_result._created !== undefined
             ? { _created: module_ensure_result._created }
             : {}),
           ...(module_ensure_result._available !== undefined
             ? { _available: module_ensure_result._available }
             : {}),
-        },
-      };
-    }
+        };
+
+        return {
+          _ok: true,
+          _result: {
+            _artifact_type: "module",
+            _module_name: module_ensure_result._module_name,
+            _module_ops: module_ensure_result._module_ops,
+            ...(module_ensure_result._created !== undefined
+              ? { _created: module_ensure_result._created }
+              : {}),
+            ...(module_ensure_result._available !== undefined
+              ? { _available: module_ensure_result._available }
+              : {}),
+          },
+        };
+      }
 
     runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
 
+    const selection_started_at = Date.now();
+    view_stage(
+      "selecting-skills",
+      "Selecting skills...",
+    );
     const selection = this.selector.select(
       prompt,
       artifact_type,
@@ -3834,7 +5208,27 @@ export class XVibeModule extends XModule {
       _artifact_type: artifact_type,
       _skill_ids: selection.skill_ids,
     });
+    archive._selected_skill_ids = selection.skill_ids;
+    archive._selected_skills = selected_skills_archive_payload(selection);
+    view_stage(
+      "skills-selected",
+      "Skills selected",
+      {
+        _skill_ids: selection.skill_ids,
+        _duration_ms: Date.now() - selection_started_at,
+        _planning_duration_ms: selection_started_at - planning_started_at,
+      },
+    );
 
+    if (mode === "refine" && requested_view_id) {
+      view_stage(
+        "loading-view",
+        "Loading current view...",
+        {
+          _view_id: requested_view_id,
+        },
+      );
+    }
     const current_view =
       mode === "refine" && requested_view_id
         ? await this.load_current_view_for_refine({
@@ -3843,6 +5237,21 @@ export class XVibeModule extends XModule {
           _view_id: requested_view_id,
         })
         : undefined;
+
+    let use_view_mutation = false;
+    if (mode === "refine" && artifact_type === "view") {
+      use_view_mutation =
+        this.should_use_view_mutation(prompt, current_view);
+
+      this.log_view_mutation_refine_decision({
+        _mode: mode,
+        _artifact_type: artifact_type,
+        ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+        _prompt: prompt,
+        _current_view: current_view,
+        _eligible: use_view_mutation,
+      });
+    }
 
     const runtime_context = await this.collect_runtime_awareness_context({
       _app_id: app_id,
@@ -3860,8 +5269,34 @@ export class XVibeModule extends XModule {
         ? { _generated_artifacts: params._generated_artifacts }
         : {}),
     });
+    archive._runtime_context = {
+      ...runtime_context,
+      _selected_modules: intent_plan._modules,
+      _selected_objects: intent_plan._objects,
+      _selected_xui_objects: intent_plan._xui_objects,
+      _selected_entities: intent_plan._entities,
+    };
 
     verbose_log("[xvibe] runtime context", runtime_context);
+
+    if (use_view_mutation && requested_view_id) {
+      const mutation_response =
+        await this.try_apply_view_mutation({
+          app_id,
+          env,
+          view_id: requested_view_id,
+          prompt,
+          current_view,
+          include_artifact_type: forced_artifact_type !== "view",
+          archive,
+          progress: view_stage,
+          archive_started_at,
+        });
+
+      if (mutation_response) {
+        return mutation_response;
+      }
+    }
 
     let deterministic_skeleton: XVibeViewArtifact | undefined;
 
@@ -3910,6 +5345,11 @@ export class XVibeModule extends XModule {
       });
     }
 
+    const prompt_started_at = Date.now();
+    view_stage(
+      "building-prompt",
+      "Building prompt...",
+    );
     const final_prompt = this.prompt_builder.build({
       prompt,
       _mode: mode,
@@ -3918,6 +5358,7 @@ export class XVibeModule extends XModule {
       runtime_context,
       ...(deterministic_skeleton ? { deterministic_skeleton } : {}),
     });
+    archive._final_prompt = final_prompt;
 
     if (mode === "refine") {
       _xlog.log("[xvibe] refine prompt mode", {
@@ -3929,6 +5370,14 @@ export class XVibeModule extends XModule {
 
     verbose_log("[xvibe] FINAL PROMPT", { _prompt: final_prompt });
 
+    const generation_started_at = Date.now();
+    view_stage(
+      "generating",
+      "Generating JSON...",
+      {
+        _duration_ms: generation_started_at - prompt_started_at,
+      },
+    );
     const xai_result: any = unwrap_command_result(
       await _x.execute({
         _module: "xai",
@@ -3941,9 +5390,17 @@ export class XVibeModule extends XModule {
         },
       } as any)
     );
+    archive._ai_output = xai_result;
 
     verbose_log("[xvibe] raw ai output", { _result: xai_result });
 
+    view_stage(
+      "parsing",
+      "Parsing response...",
+      {
+        _duration_ms: Date.now() - generation_started_at,
+      },
+    );
     const parsed = this.output_parser.parse(
       read_generated_text(xai_result),
       artifact_type
@@ -3972,6 +5429,9 @@ export class XVibeModule extends XModule {
         planned_flow_ids,
         generation_id,
         include_artifact_type: forced_artifact_type !== "view",
+        archive,
+        archive_started_at,
+        progress: stage,
       });
     }
 
@@ -3993,9 +5453,14 @@ export class XVibeModule extends XModule {
         _artifact_type: "flow",
         _artifact: parsed._flow,
         _runtime_skills: runtime_skills,
+        _archive_validation: archive_validation,
       }) as XVibeFlowArtifact;
 
-      return this.persist_flow_artifact(app_id, env, flow);
+      const result = await this.persist_flow_artifact(app_id, env, flow, archive);
+      if (!archive._result) {
+        archive._result = archive_result_from_response("flow", result);
+      }
+      return result;
     }
 
     if (artifact_type === "entity") {
@@ -4008,9 +5473,14 @@ export class XVibeModule extends XModule {
         _artifact_type: "entity",
         _artifact: parsed._entity,
         _runtime_skills: runtime_skills,
+        _archive_validation: archive_validation,
       }) as XVibeEntityArtifact;
 
-      return this.persist_entity_artifact(app_id, env, entity);
+      const result = await this.persist_entity_artifact(app_id, env, entity, archive);
+      if (!archive._result) {
+        archive._result = archive_result_from_response("entity", result);
+      }
+      return result;
     }
 
     if (!parsed._command) {
@@ -4022,9 +5492,56 @@ export class XVibeModule extends XModule {
       _artifact_type: "command",
       _artifact: parsed._command,
       _runtime_skills: runtime_skills,
+      _archive_validation: archive_validation,
     }) as XVibeCommandArtifact;
 
-    return this.return_command_artifact(app_id, env, command);
+    const result = this.return_command_artifact(app_id, env, command, archive);
+    if (!archive._result) {
+      archive._result = archive_result_from_response("command", result);
+    }
+    return result;
+    } catch (error) {
+      const diagnostic = parser_diagnostic(error);
+      const diagnostics = parser_diagnostics(error);
+      const error_details: Record<string, unknown> = {
+        _artifact_type: artifact_type,
+        ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+        _error: error_summary(error),
+        ...(diagnostic ? { _diagnostic: diagnostic } : {}),
+        ...(diagnostics ? { _diagnostics: diagnostics } : {}),
+      };
+      record_archive_stage(
+        archive,
+        archive_started_at,
+        "failed",
+        "Generation failed",
+        error_details,
+      );
+      this.push_generation_stage(
+        app_id,
+        env,
+        "failed",
+        "Generation failed",
+        archive._generation_id,
+        error_details as XVibeJsonObject,
+      );
+      archive._result =
+        archive_failure_result(
+          artifact_type,
+          error,
+          requested_view_id,
+        );
+      throw error;
+    } finally {
+      archive._duration_ms = Date.now() - archive_started_at;
+      if (
+        is_plain_object(archive._validation) &&
+        Object.keys(archive._validation).length === 0
+      ) {
+        delete archive._validation;
+      }
+      archive_vibe_run(archive);
+    }
   }
 
   private async persist_view_artifact(input: {
@@ -4039,6 +5556,9 @@ export class XVibeModule extends XModule {
     planned_flow_ids?: string[];
     generation_id?: string;
     include_artifact_type: boolean;
+    archive?: XVibeRunArchiveData;
+    archive_started_at?: number;
+    progress?: XVibeGenerationProgressCallback;
   }) {
     let view_to_persist: XVibeJsonObject = input.parsed_view;
     let runtime_skills = input.runtime_skills;
@@ -4076,6 +5596,7 @@ export class XVibeModule extends XModule {
         prompt: input.prompt,
         view: view_to_persist,
         runtime_skills,
+        _progress: input.progress,
       });
     runtime_skills = view_module_result._runtime_skills;
 
@@ -4104,6 +5625,15 @@ export class XVibeModule extends XModule {
       }
     }
 
+    const validation_started_at = Date.now();
+    input.progress?.(
+      "validating",
+      "Validating artifact...",
+      {
+        _artifact_type: "view",
+        ...(input.requested_view_id ? { _view_id: input.requested_view_id } : {}),
+      },
+    );
     view_to_persist =
       await this.validate_or_repair_generated_artifact({
         _prompt: input.prompt,
@@ -4112,6 +5642,9 @@ export class XVibeModule extends XModule {
         _runtime_skills: runtime_skills,
         _generated_artifacts: input.generated_artifacts,
         _planned_flow_ids: input.planned_flow_ids,
+        _archive_validation:
+          input.archive?._validation as XVibeRunValidationArchive | undefined,
+        _progress: input.progress,
       }) as XVibeJsonObject;
 
     const normalized_repaired_commands =
@@ -4127,12 +5660,23 @@ export class XVibeModule extends XModule {
     }
 
     const view_id = read_required_string(view_to_persist._id, "_view._id");
+    const saving_started_at = Date.now();
+    input.progress?.(
+      "saving",
+      "Saving view...",
+      {
+        _artifact_type: "view",
+        _view_id: view_id,
+        _created_modules: view_module_result._created_modules,
+        _duration_ms: saving_started_at - validation_started_at,
+      },
+    );
     _xlog.log("[xvibe] persist artifact", {
       _artifact_type: "view",
       _artifact_id: view_id,
     });
 
-    await _x.execute({
+    const persist_response = await _x.execute({
       _module: "server-xvm",
       _op: "push_update",
       _params: {
@@ -4142,6 +5686,21 @@ export class XVibeModule extends XModule {
         _view: view_to_persist,
       },
     } as any);
+    const persisted_version =
+      extract_persisted_version(persist_response);
+
+    if (input.archive) {
+      input.archive._view_id = view_id;
+      input.archive._result = {
+        _artifact_type: "view",
+        _artifact_id: view_id,
+        _view_id: view_id,
+        _success: true,
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      };
+    }
 
     _xem.fire("vibe:view-updated", {
       _app_id: input.app_id,
@@ -4153,6 +5712,19 @@ export class XVibeModule extends XModule {
       _artifact_type: "view",
       _artifact_id: view_id,
     });
+    input.progress?.(
+      "complete",
+      "View updated",
+      {
+        _artifact_type: "view",
+        _view_id: view_id,
+        _duration_ms:
+          typeof input.archive_started_at === "number"
+            ? Date.now() - input.archive_started_at
+            : Date.now() - saving_started_at,
+        _save_duration_ms: Date.now() - saving_started_at,
+      },
+    );
 
     return {
       _ok: true,
@@ -4172,6 +5744,7 @@ export class XVibeModule extends XModule {
     app_id: string,
     env: string,
     flow: XVibeFlowArtifact,
+    archive?: XVibeRunArchiveData,
   ) {
     if (!server_xvm_has_op("set_flow")) {
       return explicit_error(
@@ -4187,7 +5760,7 @@ export class XVibeModule extends XModule {
       _artifact_id: flow_id,
     });
 
-    await _x.execute({
+    const persist_response = await _x.execute({
       _module: "server-xvm",
       _op: "set_flow",
       _params: {
@@ -4196,6 +5769,20 @@ export class XVibeModule extends XModule {
         _flow: flow,
       },
     } as any);
+    const persisted_version =
+      extract_persisted_version(persist_response);
+
+    if (archive) {
+      archive._result = {
+        _artifact_type: "flow",
+        _artifact_id: flow_id,
+        _flow_id: flow_id,
+        _success: true,
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      };
+    }
 
     _xem.fire("vibe:flow-updated", {
       _app_id: app_id,
@@ -4217,6 +5804,7 @@ export class XVibeModule extends XModule {
     app_id: string,
     env: string,
     entity: XVibeEntityArtifact,
+    archive?: XVibeRunArchiveData,
   ) {
     if (!server_xvm_has_op("set_entity")) {
       return explicit_error(
@@ -4232,7 +5820,7 @@ export class XVibeModule extends XModule {
       _artifact_id: entity_id,
     });
 
-    await _x.execute({
+    const persist_response = await _x.execute({
       _module: "server-xvm",
       _op: "set_entity",
       _params: {
@@ -4241,6 +5829,20 @@ export class XVibeModule extends XModule {
         _entity: entity,
       },
     } as any);
+    const persisted_version =
+      extract_persisted_version(persist_response);
+
+    if (archive) {
+      archive._result = {
+        _artifact_type: "entity",
+        _artifact_id: entity_id,
+        _entity_id: entity_id,
+        _success: true,
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      };
+    }
 
     _xem.fire("vibe:entity-updated", {
       _app_id: app_id,
@@ -4262,6 +5864,7 @@ export class XVibeModule extends XModule {
     app_id: string,
     env: string,
     command: XVibeCommandArtifact,
+    archive?: XVibeRunArchiveData,
   ) {
     const module_name = read_required_string(command._module, "_command._module");
     const op_name = read_required_string(command._op, "_command._op");
@@ -4279,6 +5882,14 @@ export class XVibeModule extends XModule {
       _op: op_name,
     });
 
+    if (archive) {
+      archive._result = {
+        _artifact_type: "command",
+        _artifact_id: command_id,
+        _success: true,
+      };
+    }
+
     return {
       _ok: true,
       _result: {
@@ -4293,23 +5904,7 @@ export class XVibeModule extends XModule {
   async _generate(xcmd: XCommand) {
     const params = is_plain_object(xcmd?._params) ? xcmd._params : {};
     try {
-      const app_id = read_optional_string(params._app_id, "_app_id");
-      const env = read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
-      const generation_id = read_optional_string(params._generation_id, "_generation_id");
-      if (app_id) {
-        this.push_generation_stage(app_id, env, "generating", "Generating...", generation_id);
-      }
       const result = await this.generate_artifact(params);
-      if (app_id && generation_result_is_ok(result)) {
-        this.push_generation_stage(
-          app_id,
-          env,
-          "complete",
-          "Generation complete",
-          generation_id,
-          generation_artifact_stage_fields(result),
-        );
-      }
       return result;
     } catch (error) {
       this.broadcast_generation_failed(params, error, "E_VIBE_AI_GENERATE");
@@ -4338,12 +5933,6 @@ export class XVibeModule extends XModule {
   async _generate_view(xcmd: XCommand) {
     const params = is_plain_object(xcmd?._params) ? xcmd._params : {};
     try {
-      const app_id = read_optional_string(params._app_id, "_app_id");
-      const env = read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
-      const generation_id = read_optional_string(params._generation_id, "_generation_id");
-      if (app_id) {
-        this.push_generation_stage(app_id, env, "generating", "Generating...", generation_id);
-      }
       return await this.generate_artifact(params, "view");
     } catch (error) {
       this.broadcast_generation_failed(params, error, "E_VIBE_AI_GENERATE_VIEW");
