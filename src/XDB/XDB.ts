@@ -3,7 +3,7 @@
 // - XDB-owned XObjects are module-managed (XDB.create)
 // - cache remains optional
 
-import { XModule, type XCommand, _xlog } from "@xpell/core";
+import { XModule, type XCommand, _xlog ,type XpellSkill} from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 
 import { XDBEngine, type IXDBEmbeddingProvider, type IXDBVectorQueryProvider } from "./XDBEngine.js";
@@ -31,9 +31,78 @@ export type XDBModuleInitOptions = {
     workFolder: string;
 };
 
+export const XDB_OPS = {
+    info: {
+        _name: "info",
+        _scope: "module",
+        _description: "Return XDB runtime information."
+    },
+
+    save_object: {
+        _name: "save_object",
+        _scope: "module",
+        _description: "Persist object to storage."
+    },
+
+    get_object: {
+        _name: "get_object",
+        _scope: "module",
+        _description: "Load object from storage."
+    },
+
+    cache_data: {
+        _name: "cache_data",
+        _scope: "module",
+        _description: "Store data in XDB cache."
+    },
+
+    get_cache_data: {
+        _name: "get_cache_data",
+        _scope: "module",
+        _description: "Read data from XDB cache."
+    }
+};
+
 export class XDBModule extends XModule {
     _engine!: XDBEngine;
     _cache?: XDBCache;
+
+    static _name = "xdb";
+
+    static _skill: XpellSkill = {
+        _id: "xdb",
+        _title: "XDB",
+        _version: VERSION,
+        _active: true,
+        _type: "server-module-api",
+        _requires: ["xmodule"],
+
+        _description:
+            "Storage, caching, vector search, files, and entity persistence.",
+
+        _exports: {
+            _modules: [
+                {
+                    _name: "xdb",
+                    _scope: "server",
+                    _description:
+                        "Core storage engine.",
+                    _ops: Object.values(XDB_OPS),
+                }
+            ],
+
+        },
+
+        _core_rules: [
+            "Use xdb for persistence.",
+            "Use xdb-entity for structured records.",
+            "Use xdb-vector for embeddings and vector search.",
+            "Use xdb-file for file storage.",
+            "Use cache operations for temporary runtime caching."
+        ]
+    };
+
+    static _ops = XDB_OPS;
 
     private _initOpts?: XDBModuleInitOptions;
     private _ready = false;
@@ -113,7 +182,7 @@ export class XDBModule extends XModule {
         await this._engine.init();
         _xlog.log("XDB Engine initialized");
         if (this._initOpts.enableCache !== false) {
-            this._cache = new XDBCache({cacheFolder: _xu.pathJoin(this._initOpts.workFolder, "cache")});
+            this._cache = new XDBCache({ cacheFolder: _xu.pathJoin(this._initOpts.workFolder, "cache") });
             await this._cache.init();
             _xlog.log("XDB Cache initialized");
         } else {

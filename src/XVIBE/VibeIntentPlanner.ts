@@ -1,5 +1,13 @@
 import { _xlog } from "@xpell/core";
 import type {
+  VibeArtifactType,
+  VibeRequestedArtifactType,
+  XVibeArtifactIntent,
+  XVibeArtifactIntentAction,
+  XVibeArtifactIntentTarget,
+  XVibeArtifactExecutionPlan,
+  XVibeInferredArtifactType,
+  XVibeInferredArtifactPlan,
   XVibeIntentIR,
   XVibeIntentIRAction,
   XVibeIntentIRBinding,
@@ -47,7 +55,28 @@ export type VibeIntentPlan = XVibeIntentIR & {
   _runtime_capabilities: VibeRuntimeCapabilityRegistry;
 };
 
+type XVibeIntentResolverResult = {
+  _matched: true;
+  _reason: string;
+  _artifact_type: XVibeInferredArtifactType;
+  _confidence: number;
+  _action?: XVibeArtifactIntentAction;
+  _artifact_id?: string;
+  _forbidden_targets?: XVibeArtifactIntentTarget[];
+};
+
+type XVibeIntentResolver = (
+  prompt: string
+) => XVibeIntentResolverResult | null;
+
+export type XVibeModuleOperationExtraction = {
+  _positive_matches: string[];
+  _negative_matches: string[];
+  _module_ops: string[];
+};
+
 const INTENT_IR_VERSION = 1 as const;
+const XVIBE_MODULE_INTENT_INVALID = "E_XVIBE_MODULE_INTENT_INVALID";
 const INTENT_REGION_IDS = [
   "sidebar",
   "toolbar",
@@ -174,6 +203,36 @@ const BUSINESS_ENTITY_WORDS = [
 ];
 const EXPLICIT_MULTI_ENTITY_PATTERN =
   /\b(?:entities|models|tables|schemas)\b[\s\S]{0,80}\b(?:and|,)\b|\b[a-z][a-z0-9_-]*s?\s*(?:,|\band\b)\s*[a-z][a-z0-9_-]*s?\s+(?:entities|models|tables|schemas|records)\b/u;
+const ARTIFACT_INTENT_TARGETS: XVibeArtifactIntentTarget[] = ["view", "flow", "entity", "module"];
+const ARTIFACT_TARGET_PLURALS: Record<string, XVibeArtifactIntentTarget> = {
+  view: "view",
+  views: "view",
+  flow: "flow",
+  flows: "flow",
+  workflow: "flow",
+  workflows: "flow",
+  entity: "entity",
+  entities: "entity",
+  module: "module",
+  modules: "module",
+};
+const ARTIFACT_INTENT_TOKEN_PATTERN = String.raw`("[^"]+"|'[^']+'|[a-z][a-z0-9_-]*)`;
+const RESERVED_EXPLICIT_MODULE_IDS = new Set([
+  "called",
+  "client",
+  "id",
+  "methods",
+  "module",
+  "named",
+  "only",
+  "op",
+  "operation",
+  "operations",
+  "ops",
+  "server",
+  "with",
+  "xmodule",
+]);
 
 type VibeInferredModuleRequirement = {
   _module_target: Exclude<VibeModuleTarget, null>;
@@ -198,6 +257,462 @@ function normalize_prompt_text(value: string): string {
   return value.trim().toLowerCase();
 }
 
+function normalize_artifact_intent_prompt(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function module_intent_prompt_reason(prompt: string): string | undefined {
+  const text = normalize_artifact_intent_prompt(prompt);
+  if (/\bmodule\s+only\b/u.test(text)) return "prompt_module_only";
+  if (/\bserver\s+module\b/u.test(text)) return "prompt_server_module";
+  if (/\bclient\s+module\b/u.test(text)) return "prompt_client_module";
+  if (/\bxmodule\b/u.test(text)) return "prompt_xmodule";
+  return undefined;
+}
+
+function normalize_artifact_identifier(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  const normalized =
+    value
+      .trim()
+      .replace(/^["'`]+|["'`.,;:]+$/g, "")
+      .trim()
+      .toLowerCase();
+
+  return /^[a-z][a-z0-9_-]*$/u.test(normalized) ? normalized : undefined;
+}
+
+function normalize_module_operation_identifier(value: string | undefined): string | undefined {
+  const normalized =
+    normalize_artifact_identifier(value?.replace(/^_+/, ""));
+
+  return normalized;
+}
+
+function normalize_explicit_module_id(value: string | undefined): string | undefined {
+  const normalized =
+    normalize_artifact_identifier(value);
+
+  return normalized && !RESERVED_EXPLICIT_MODULE_IDS.has(normalized)
+    ? normalized
+    : undefined;
+}
+
+function line_has_negative_operation_instruction(line: string): boolean {
+  return /\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,80}\boperation\b/iu
+    .test(line);
+}
+
+export function extract_module_operation_matches_from_prompt(
+  prompt: string,
+): XVibeModuleOperationExtraction {
+  const positive_matches: string[] = [];
+  const negative_matches: string[] = [];
+  const lines = prompt.split(/\r?\n/u);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const negative_line_match =
+      lines[index].match(
+        /\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,80}\boperation\s+(_?[a-z][a-z0-9_-]*)\b/iu,
+      );
+    const negative_op =
+      normalize_module_operation_identifier(negative_line_match?.[1]);
+    if (negative_op) {
+      negative_matches.push(negative_op);
+      continue;
+    }
+
+    const header_match =
+      lines[index].match(/(?:^|[\s.;])(?:operations|ops|methods|module\s+ops|expose\s+operation)\s*:\s*(.*)$/iu);
+    if (!header_match) continue;
+
+    const inline_ops =
+      header_match[1]
+        .split(/[,\s]+/u)
+        .map((value) => normalize_module_operation_identifier(value))
+        .filter((value): value is string => Boolean(value));
+    positive_matches.push(...inline_ops);
+
+    for (let next_index = index + 1; next_index < lines.length; next_index += 1) {
+      const line = lines[next_index];
+      if (line_has_negative_operation_instruction(line)) break;
+      if (/^\s*$/u.test(line)) {
+        if (positive_matches.length > 0) break;
+        continue;
+      }
+
+      const bullet_match =
+        line.match(/^\s*[-*]\s*(_?[a-z][a-z0-9_-]*)\s*$/iu);
+      if (!bullet_match) break;
+
+      const op =
+        normalize_module_operation_identifier(bullet_match[1]);
+      if (op) positive_matches.push(op);
+    }
+  }
+
+  if (positive_matches.length === 0) {
+    for (const match of prompt.matchAll(/\bop(?:eration)?\s+(?:named|called)?\s*(_?[a-z][a-z0-9_-]*)\b/giu)) {
+      const line_start = prompt.lastIndexOf("\n", match.index) + 1;
+      const line_end = prompt.indexOf("\n", match.index);
+      const line =
+        prompt.slice(
+          line_start,
+          line_end === -1 ? prompt.length : line_end,
+        );
+      const op =
+        normalize_module_operation_identifier(match[1]);
+      if (!op) continue;
+
+      if (line_has_negative_operation_instruction(line)) {
+        negative_matches.push(op);
+        continue;
+      }
+
+      positive_matches.push(op);
+    }
+  }
+
+  const final_ops =
+    positive_matches.length > 0
+      ? unique(positive_matches)
+      : [];
+
+  return {
+    _positive_matches: unique(positive_matches),
+    _negative_matches: unique(negative_matches),
+    _module_ops: final_ops,
+  };
+}
+
+export function extract_explicit_module_ops_from_prompt(prompt: string): string[] {
+  return extract_module_operation_matches_from_prompt(prompt)._module_ops;
+}
+
+export function extract_explicit_module_id_from_prompt(prompt: string): string | undefined {
+  const lines = prompt.split(/\r?\n/u);
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const inline_match =
+      line.match(/^\s*module\s+(?:id|name)\s*:\s*([a-z][a-z0-9_-]*)\s*$/iu);
+    const inline_id =
+      normalize_explicit_module_id(inline_match?.[1]);
+    if (inline_id) return inline_id;
+
+    if (!/^\s*module\s+(?:id|name)\s*:\s*$/iu.test(line)) {
+      continue;
+    }
+
+    for (let next_index = index + 1; next_index < lines.length; next_index += 1) {
+      const next_line = lines[next_index].trim();
+      if (!next_line) continue;
+
+      return normalize_explicit_module_id(next_line);
+    }
+  }
+
+  const direct_module_match =
+    prompt.match(
+      /\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:(?:server|client)\s+)?(?:xmodule|module)\s+([a-z][a-z0-9_-]*)\b/iu,
+    );
+  return normalize_explicit_module_id(direct_module_match?.[1]);
+}
+
+function unique_artifact_targets(values: XVibeArtifactIntentTarget[]): XVibeArtifactIntentTarget[] {
+  return Array.from(new Set(values));
+}
+
+function artifact_target_from_word(value: string | undefined): XVibeArtifactIntentTarget | undefined {
+  if (!value) return undefined;
+  return ARTIFACT_TARGET_PLURALS[value.toLowerCase()];
+}
+
+function detect_artifact_action(text: string): XVibeArtifactIntentAction {
+  const action_text = strip_negated_artifact_phrases(text);
+  if (/\b(?:delete|remove)\b/u.test(action_text)) return "delete";
+  if (/\bdisable\b/u.test(action_text)) return "disable";
+  if (/\barchive\b/u.test(action_text)) return "archive";
+  if (/\brename\b/u.test(action_text)) return "rename";
+  if (/\b(?:update|change|edit|modify)\b/u.test(action_text)) return "update";
+  if (
+    /\b(?:nicer|style|styling|design|visual|polish|improve|prettier|better)\b/u.test(action_text) &&
+    /\b(?:view|page|screen|form|layout|button|buttons|field|fields)\b/u.test(action_text)
+  ) {
+    return "update";
+  }
+  if (/\b(?:create|build|generate|add|make)\b/u.test(action_text)) return "create";
+  if (/\b(?:list|show|inspect|check)\b/u.test(action_text)) return "inspect";
+  return "unknown";
+}
+
+function normalize_artifact_action_word(value: string | undefined): XVibeArtifactIntentAction {
+  if (!value) return "unknown";
+  const normalized = value.toLowerCase();
+  if (normalized === "remove") return "delete";
+  if (normalized === "change" || normalized === "edit" || normalized === "modify") return "update";
+  if (normalized === "build" || normalized === "generate" || normalized === "add" || normalized === "make") return "create";
+  if (
+    normalized === "create" ||
+    normalized === "update" ||
+    normalized === "delete" ||
+    normalized === "disable" ||
+    normalized === "archive" ||
+    normalized === "rename"
+  ) {
+    return normalized;
+  }
+
+  return "unknown";
+}
+
+function detect_forbidden_artifact_targets(text: string): XVibeArtifactIntentTarget[] {
+  const forbidden: XVibeArtifactIntentTarget[] = [];
+  const negated_pattern =
+    /\bdo\s+not\s+create\s+(?:a\s+|an\s+|the\s+)?(views?|flows?|entities|entity|modules?)\b/gu;
+  const without_pattern =
+    /\bwithout\s+(views?|flows?|entities|entity|modules?)\b/gu;
+  const negated_action_pattern =
+    /\b(?:do\s+not|don't|dont)\s+(?:delete|remove|update|change|edit|modify)\s+(?:the\s+)?(?:[a-z][a-z0-9_-]*\s+)?(views?|view|pages?|page|screens?|screen|forms?|form|flows?|flow|entities|entity|modules?|module)\b/gu;
+  const negated_main_view_pattern =
+    /\b(?:do\s+not|don't|dont|preserve|keep(?:\s+existing)?)\s+(?:delete|remove|update|change|edit|modify)?\s*(?:the\s+)?main(?:\s+(?:views?|pages?|screens?|forms?))?\b/gu;
+
+  for (const match of text.matchAll(negated_pattern)) {
+    const target = artifact_target_from_word(match[1]);
+    if (target) forbidden.push(target);
+  }
+
+  for (const match of text.matchAll(without_pattern)) {
+    const target = artifact_target_from_word(match[1]);
+    if (target) forbidden.push(target);
+  }
+
+  for (const match of text.matchAll(negated_action_pattern)) {
+    const target = artifact_target_from_noun(match[1]);
+    if (target) forbidden.push(target);
+  }
+
+  if (negated_main_view_pattern.test(text)) {
+    forbidden.push("view");
+  }
+
+  return unique_artifact_targets(forbidden);
+}
+
+function strip_negated_artifact_phrases(value: string): string {
+  return value
+    .replace(/\bdo\s+not\s+create\s+(?:a\s+|an\s+|the\s+)?(?:views?|flows?|entities|entity|modules?)\b/giu, " ")
+    .replace(/\b(?:do\s+not|don't|dont)\s+(?:delete|remove|update|change|edit|modify)\s+(?:the\s+)?(?:[a-z][a-z0-9_-]*\s+)?(?:views?|view|pages?|page|screens?|screen|forms?|form|flows?|flow|entities|entity|modules?|module)\b/giu, " ")
+    .replace(/\b(?:do\s+not|don't|dont)\s+(?:delete|remove|update|change|edit|modify)\s+(?:the\s+)?main(?:\s+(?:views?|pages?|screens?|forms?))?\b/giu, " ")
+    .replace(/\b(?:preserve|keep(?:\s+existing)?)\s+(?:the\s+)?main(?:\s+(?:views?|pages?|screens?|forms?))?\b/giu, " ")
+    .replace(/\bwithout\s+(?:views?|flows?|entities|entity|modules?)\b/giu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function detect_only_artifact_target(text: string): {
+  action: XVibeArtifactIntentAction;
+  target: XVibeArtifactIntentTarget;
+} | undefined {
+  const only_action_match =
+    text.match(/\bonly\s+(create|update|delete|remove|disable|archive|rename)\s+(?:a\s+|an\s+|the\s+)?(view|flow|entity|module)\b/u);
+  if (only_action_match) {
+    return {
+      action: only_action_match[1] === "remove" ? "delete" : only_action_match[1] as XVibeArtifactIntentAction,
+      target: only_action_match[2] as XVibeArtifactIntentTarget,
+    };
+  }
+
+  const only_target_match =
+    text.match(/\b(view|flow|entity|module)\s+only\b/u) ??
+    text.match(/\bonly\s+(?:a\s+|an\s+|the\s+)?(view|flow|entity|module)\b/u);
+  if (!only_target_match) return undefined;
+
+  return {
+    action: detect_artifact_action(text),
+    target: only_target_match[1] as XVibeArtifactIntentTarget,
+  };
+}
+
+function forbidden_for_only_target(target: XVibeArtifactIntentTarget): XVibeArtifactIntentTarget[] {
+  return ARTIFACT_INTENT_TARGETS.filter((candidate) => candidate !== target);
+}
+
+function regex_escape(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function artifact_target_id_from_pattern(prompt: string, pattern: RegExp): string | undefined {
+  const match = prompt.match(pattern);
+  return normalize_artifact_identifier(match?.[1]);
+}
+
+function extract_artifact_target_id(
+  prompt: string,
+  target: XVibeArtifactIntentTarget,
+): string | undefined {
+  if (
+    target !== "view" &&
+    target !== "flow" &&
+    target !== "entity" &&
+    target !== "module"
+  ) {
+    return undefined;
+  }
+
+  const target_pattern = regex_escape(target);
+  const named_id =
+    artifact_target_id_from_pattern(
+      prompt,
+      new RegExp(String.raw`\b${target_pattern}\s+(?:named|called|id)\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
+    );
+  if (named_id) return named_id;
+
+  if (target === "view") {
+    const new_view_id = artifact_target_id_from_pattern(
+      prompt,
+      new RegExp(String.raw`\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?new\s+${target_pattern}\s+("[^"]+"|'[^']+'|[a-z][a-z0-9_-]*)(?:\s|$|[.,;:])`, "iu"),
+    );
+    if (new_view_id) return new_view_id;
+
+    const quoted_view_id = artifact_target_id_from_pattern(
+      prompt,
+      new RegExp(String.raw`\b${target_pattern}\s+("[^"]+"|'[^']+')(?:\s|$|[.,;:])`, "iu"),
+    );
+    if (quoted_view_id) return quoted_view_id;
+  }
+
+  const quoted_id =
+    artifact_target_id_from_pattern(
+      prompt,
+      new RegExp(String.raw`\b${target_pattern}\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
+    );
+  if (quoted_id) return quoted_id;
+
+  return artifact_target_id_from_pattern(
+    prompt,
+    new RegExp(
+      String.raw`\b(?:create|build|generate|add|make|delete|remove|update|change|edit|modify|rename)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?${target_pattern}\s+${ARTIFACT_INTENT_TOKEN_PATTERN}\b`,
+      "iu",
+    ),
+  );
+}
+
+function infer_explicit_artifact_target(text: string): {
+  target: XVibeArtifactIntentTarget;
+  confidence: number;
+  reason: string;
+} | undefined {
+  if (/\b(?:update|change|edit|modify)\s+(?:a\s+|an\s+|the\s+)?(?:main\s+|current\s+)?(?:view|page|screen|form)\b/u.test(text)) {
+    return { target: "view", confidence: 0.95, reason: "explicit_view_intent" };
+  }
+
+  if (/\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:login\s+)?(?:view|page|screen|form)\b/u.test(text)) {
+    return { target: "view", confidence: 0.95, reason: "explicit_view_intent" };
+  }
+
+  if (/\bflow\s+named\s+[a-z][a-z0-9_-]*\b/u.test(text)) {
+    return { target: "flow", confidence: 0.85, reason: "explicit_named_flow" };
+  }
+
+  if (/\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:flow|workflow)\b/u.test(text)) {
+    return { target: "flow", confidence: 0.95, reason: "explicit_named_flow" };
+  }
+
+  if (/\bentity\s+named\s+[a-z][a-z0-9_-]*\b/u.test(text)) {
+    return { target: "entity", confidence: 0.85, reason: "explicit_named_entity" };
+  }
+
+  if (/\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:entity|schema|database|collection|record\s+model)\b/u.test(text)) {
+    return { target: "entity", confidence: 0.95, reason: "explicit_entity_intent" };
+  }
+
+  if (/\bmodule\s+named\s+[a-z][a-z0-9_-]*\b/u.test(text)) {
+    return { target: "module", confidence: 0.85, reason: "explicit_named_module" };
+  }
+
+  if (/\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:server\s+module|client\s+module|xmodule|module)\b/u.test(text)) {
+    return { target: "module", confidence: 0.95, reason: "explicit_module_intent" };
+  }
+
+  if (/\b(?:delete|remove|rename)\s+(?:a\s+|an\s+|the\s+)?(view|flow|entity|module)\b/u.test(text)) {
+    const target = artifact_target_from_word(text.match(/\b(?:delete|remove|rename)\s+(?:a\s+|an\s+|the\s+)?(view|flow|entity|module)\b/u)?.[1]);
+    if (target) {
+      return {
+        target,
+        confidence: 0.95,
+        reason:
+          target === "flow"
+            ? "explicit_named_flow"
+            : target === "entity"
+              ? "explicit_entity_intent"
+              : target === "module"
+                ? "explicit_module_intent"
+                : "explicit_view_intent",
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function infer_vocabulary_artifact_target(text: string): {
+  target: XVibeArtifactIntentTarget;
+  confidence: number;
+  reason: string;
+} | undefined {
+  if (/\b(?:page|screen|form|button|field|layout|view|dashboard)\b/u.test(text)) {
+    return { target: "view", confidence: 0.7, reason: "explicit_view_intent" };
+  }
+
+  if (/\b(?:entity|entities|schema|schemas|database|collection|record\s+model)\b/u.test(text)) {
+    return { target: "entity", confidence: 0.7, reason: "explicit_entity_intent" };
+  }
+
+  if (/\b(?:server\s+module|client\s+module|xmodule|module)\b/u.test(text)) {
+    return { target: "module", confidence: 0.7, reason: "explicit_module_intent" };
+  }
+
+  if (/\b(?:flow|workflow)\b/u.test(text)) {
+    return { target: "flow", confidence: 0.7, reason: "explicit_named_flow" };
+  }
+
+  return undefined;
+}
+
+function is_explicit_artifact_type(value: VibeRequestedArtifactType | undefined): value is VibeArtifactType {
+  return (
+    value === "view" ||
+    value === "flow" ||
+    value === "entity" ||
+    value === "command"
+  );
+}
+
+function artifact_type_for_intent_target(target: XVibeArtifactIntentTarget): VibeArtifactType | undefined {
+  if (
+    target === "view" ||
+    target === "flow" ||
+    target === "entity"
+  ) {
+    return target;
+  }
+
+  return undefined;
+}
+
+function prompt_has_explicit_view_update(text: string): boolean {
+  return /\b(?:update|change|edit|modify)\s+(?:a\s+|an\s+|the\s+)?(?:main\s+|current\s+)?(?:view|page|screen|form)\b/u.test(text);
+}
+
+function prompt_has_view_update_request(text: string): boolean {
+  return (
+    prompt_has_explicit_view_update(text) ||
+    /\b(?:update|change|edit|modify|replace)\b[\s\S]{0,120}\b(?:view|page|screen|form|button|field|layout)\b/u.test(text)
+  );
+}
+
 function has_explicit_flow_intent(text: string): boolean {
   return (
     /\bflow-[a-z0-9][a-z0-9_-]*\b/u.test(text) ||
@@ -207,19 +722,342 @@ function has_explicit_flow_intent(text: string): boolean {
 }
 
 function extract_prompt_flow_ids(text: string): string[] {
-  const matches = text.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? [];
-  return unique(matches.map((match) => match.toLowerCase()));
+  const ids: string[] = [];
+  ids.push(...(text.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? []));
+
+  const named_flow_pattern =
+    /\b(?:run|trigger|call|execute)?\s*(?:a\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu;
+
+  for (const match of text.matchAll(named_flow_pattern)) {
+    ids.push(match[1]);
+  }
+
+  return unique(
+    ids.map((match) => match.trim().toLowerCase()).filter((match) => match.length > 0)
+  );
 }
 
+function execution_action_for_intent(
+  intent: XVibeArtifactIntent,
+  artifact_type: XVibeInferredArtifactType,
+  prompt: string,
+): XVibeArtifactExecutionPlan["_artifacts"][number]["_action"] {
+  if (
+    intent._target === artifact_target_from_artifact_type(artifact_type) &&
+    (
+      intent._action === "create" ||
+      intent._action === "update" ||
+      intent._action === "delete" ||
+      intent._action === "disable" ||
+      intent._action === "archive"
+    )
+  ) {
+    return intent._action;
+  }
+
+  if (artifact_type === "view" && prompt_has_view_update_request(prompt)) {
+    return "update";
+  }
+
+  return "create";
+}
+
+function execution_view_id(prompt: string, intent: XVibeArtifactIntent): string {
+  if (intent._target === "view" && intent._target_id === "main") {
+    return "main";
+  }
+
+  const explicit_named_view =
+    artifact_target_id_from_pattern(
+      prompt,
+      new RegExp(String.raw`\bview\s+(?:named|called|id)\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
+    );
+  if (explicit_named_view) return explicit_named_view;
+
+  return "main";
+}
+
+function execution_artifact_ids_for_type(
+  prompt: string,
+  intent: XVibeArtifactIntent,
+  plan: XVibeInferredArtifactPlan,
+  artifact_type: XVibeInferredArtifactType,
+): string[] {
+  if (artifact_type === "flow") {
+    return unique([
+      ...(plan._flow_ids ?? []),
+      ...(intent._target === "flow" && intent._target_id ? [intent._target_id] : []),
+    ]);
+  }
+
+  if (artifact_type === "entity") {
+    return unique([
+      ...(plan._entity_ids ?? []),
+      ...(intent._target === "entity" && intent._target_id ? [intent._target_id] : []),
+    ]);
+  }
+
+  if (artifact_type === "module") {
+    return unique([
+      ...(plan._module_names ?? []),
+      ...(intent._target === "module" && intent._target_id ? [intent._target_id] : []),
+    ]);
+  }
+
+  if (artifact_type === "view") {
+    return [execution_view_id(prompt, intent)];
+  }
+
+  return [];
+}
+
+function artifact_types_for_execution_plan(
+  prompt: string,
+  intent: XVibeArtifactIntent,
+  plan: XVibeInferredArtifactPlan,
+): XVibeInferredArtifactType[] {
+  const artifact_types: XVibeInferredArtifactType[] =
+    plan._primary_artifact_type === "module"
+      ? ["module"]
+      : plan._artifact_types
+        .filter((artifact_type): artifact_type is Exclude<VibeArtifactType, "command"> =>
+          artifact_type === "view" ||
+          artifact_type === "flow" ||
+          artifact_type === "entity"
+        );
+
+  if (artifact_types.length === 0 && plan._primary_artifact_type !== "command") {
+    artifact_types.push(plan._primary_artifact_type);
+  }
+
+  const normalized_prompt = normalize_artifact_intent_prompt(prompt);
+  if (
+    artifact_types.includes("flow") &&
+    !artifact_types.includes("view") &&
+    prompt_has_view_update_request(normalized_prompt) &&
+    !intent._forbidden_targets.includes("view")
+  ) {
+    artifact_types.push("view");
+  }
+
+  return artifact_types;
+}
+
+function artifact_type_from_target(target: XVibeArtifactIntentTarget): XVibeInferredArtifactType | undefined {
+  if (
+    target === "view" ||
+    target === "flow" ||
+    target === "entity" ||
+    target === "module"
+  ) {
+    return target;
+  }
+
+  return undefined;
+}
+
+function artifact_target_from_artifact_type(
+  artifact_type: XVibeInferredArtifactType,
+): XVibeArtifactIntentTarget {
+  if (
+    artifact_type === "view" ||
+    artifact_type === "flow" ||
+    artifact_type === "entity" ||
+    artifact_type === "module"
+  ) {
+    return artifact_type;
+  }
+
+  return "unknown";
+}
+
+function artifact_target_from_noun(value: string | undefined): XVibeArtifactIntentTarget | undefined {
+  if (!value) return undefined;
+  const normalized = value.toLowerCase().trim();
+  if (normalized === "page" || normalized === "screen" || normalized === "form") return "view";
+  if (normalized === "schema" || normalized === "model" || normalized === "table") return "entity";
+  if (normalized === "workflow") return "flow";
+  if (normalized === "xmodule" || normalized === "server module" || normalized === "client module") return "module";
+  return artifact_target_from_word(normalized);
+}
+
+function normalize_detected_artifact_id(value: string | undefined): string | undefined {
+  const normalized = normalize_artifact_identifier(value);
+  if (
+    !normalized ||
+    [
+      "a",
+      "an",
+      "and",
+      "for",
+      "from",
+      "named",
+      "that",
+      "the",
+      "then",
+      "to",
+      "with",
+    ].includes(normalized)
+  ) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function resolve_explicit_only_intent(prompt: string): XVibeIntentResolverResult | null {
+  const text = normalize_artifact_intent_prompt(prompt);
+  const explicit_only = detect_only_artifact_target(text);
+  if (!explicit_only) return null;
+
+  const artifact_type = artifact_type_from_target(explicit_only.target);
+  if (!artifact_type) return null;
+
+  return {
+    _matched: true,
+    _reason: "explicit_only_intent",
+    _artifact_type: artifact_type,
+    _confidence: 0.95,
+    _action: explicit_only.action,
+    _artifact_id: extract_artifact_target_id(prompt, explicit_only.target),
+    _forbidden_targets: forbidden_for_only_target(explicit_only.target),
+  };
+}
+
+function resolve_named_artifact_intent(prompt: string): XVibeIntentResolverResult | null {
+  const text = strip_negated_artifact_phrases(normalize_artifact_intent_prompt(prompt));
+  const artifact_noun_pattern = String.raw`((?:server\s+module|client\s+module|xmodule|module|workflow|flow|entity|schema|model|table|view|page|screen|form))`;
+  const create_update_action_pattern = String.raw`(create|build|generate|add|make|update|change|edit|modify)`;
+  const noun_then_id = new RegExp(
+    String.raw`\b${create_update_action_pattern}\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?${artifact_noun_pattern}(?:\s+(?:named|called|id))?\s+${ARTIFACT_INTENT_TOKEN_PATTERN}\b`,
+    "iu",
+  );
+  const id_then_view = new RegExp(
+    String.raw`\b(update|change|edit|modify)\s+${ARTIFACT_INTENT_TOKEN_PATTERN}\s+(view|page|screen|form)\b`,
+    "iu",
+  );
+
+  const noun_match = text.match(noun_then_id);
+  if (noun_match) {
+    const target = artifact_target_from_noun(noun_match[2]);
+    const artifact_type = target ? artifact_type_from_target(target) : undefined;
+    if (target && artifact_type) {
+      return {
+        _matched: true,
+        _reason: "named_artifact_intent",
+        _artifact_type: artifact_type,
+        _confidence: 0.9,
+        _action: normalize_artifact_action_word(noun_match[1]),
+        _artifact_id: normalize_detected_artifact_id(noun_match[3]),
+      };
+    }
+  }
+
+  const view_match = text.match(id_then_view);
+  if (view_match) {
+    return {
+      _matched: true,
+      _reason: "named_artifact_intent",
+      _artifact_type: "view",
+      _confidence: 0.9,
+      _action: normalize_artifact_action_word(view_match[1]),
+      _artifact_id: normalize_detected_artifact_id(view_match[2]),
+    };
+  }
+
+  return null;
+}
+
+function resolve_action_intent(prompt: string): XVibeIntentResolverResult | null {
+  const text = strip_negated_artifact_phrases(normalize_artifact_intent_prompt(prompt));
+  const action_pattern = String.raw`(create|build|generate|add|make|update|change|edit|modify|delete|remove|disable|archive|rename)`;
+  const artifact_noun_pattern = String.raw`((?:server\s+module|client\s+module|xmodule|module|workflow|flow|entity|schema|model|table|view|page|screen|form))`;
+  const action_match = text.match(
+    new RegExp(
+      String.raw`\b${action_pattern}\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?${artifact_noun_pattern}(?:\s+(?:named|called|id))?(?:\s+${ARTIFACT_INTENT_TOKEN_PATTERN})?\b`,
+      "iu",
+    ),
+  );
+  if (!action_match) return null;
+
+  const target = artifact_target_from_noun(action_match[2]);
+  const artifact_type = target ? artifact_type_from_target(target) : undefined;
+  if (!target || !artifact_type) return null;
+
+  return {
+    _matched: true,
+    _reason: "action_intent",
+    _artifact_type: artifact_type,
+    _confidence: 0.85,
+    _action: action_match[1] === "remove" ? "delete" : detect_artifact_action(action_match[1]),
+    _artifact_id: normalize_detected_artifact_id(action_match[3]),
+  };
+}
+
+function resolve_negative_constraints(prompt: string): XVibeIntentResolverResult | null {
+  const forbidden_targets = detect_forbidden_artifact_targets(
+    normalize_artifact_intent_prompt(prompt),
+  );
+  if (forbidden_targets.length === 0) return null;
+
+  return {
+    _matched: true,
+    _reason: "negative_constraints",
+    _artifact_type: "view",
+    _confidence: 0,
+    _forbidden_targets: forbidden_targets,
+  };
+}
+
+function resolve_fallback_classifier(prompt: string): XVibeIntentResolverResult | null {
+  const text = strip_negated_artifact_phrases(normalize_artifact_intent_prompt(prompt));
+  const explicit_target =
+    infer_explicit_artifact_target(text) ??
+    infer_vocabulary_artifact_target(text);
+
+  if (explicit_target) {
+    const artifact_type = artifact_type_from_target(explicit_target.target);
+    if (!artifact_type) return null;
+
+    return {
+      _matched: true,
+      _reason: explicit_target.reason,
+      _artifact_type: artifact_type,
+      _confidence: explicit_target.confidence,
+      _action: detect_artifact_action(text),
+      _artifact_id: extract_artifact_target_id(prompt, explicit_target.target),
+    };
+  }
+
+  return {
+    _matched: true,
+    _reason: "fallback_view",
+    _artifact_type: "view",
+    _confidence: 0.4,
+    _action: detect_artifact_action(text),
+  };
+}
+
+const INTENT_RESOLVERS: XVibeIntentResolver[] = [
+  resolve_explicit_only_intent,
+  resolve_named_artifact_intent,
+  resolve_action_intent,
+  resolve_negative_constraints,
+  resolve_fallback_classifier,
+];
+
 export function has_explicit_data_or_crud_intent(prompt: string): boolean {
-  const text = normalize_prompt_text(prompt);
+  const text = strip_negated_artifact_phrases(normalize_prompt_text(prompt));
   if (!text) return false;
 
   if (/\b(?:crud|records?|database|entities|entity|collections?|schemas?|persist|persistence|data records?|entity management)\b/u.test(text)) {
     return true;
   }
 
-  if (/\b(?:delete|update)\b/u.test(text)) {
+  if (
+    /\b(?:delete|update)\b/u.test(text) &&
+    !/\b(?:views?|pages?|screens?|forms?|layouts?|design|style|buttons?|fields?)\b/u.test(text)
+  ) {
     return true;
   }
 
@@ -243,7 +1081,12 @@ export function has_explicit_data_or_crud_intent(prompt: string): boolean {
   let match = action_entity_pattern.exec(text);
   while (match) {
     const noun = match[1];
-    if (BUSINESS_ENTITY_WORDS.includes(noun) && !UI_ENTITY_NAMES.has(noun)) {
+    const after_match = text.slice(match.index + match[0].length);
+    if (
+      BUSINESS_ENTITY_WORDS.includes(noun) &&
+      !UI_ENTITY_NAMES.has(noun) &&
+      !/^\s+(?:button|buttons|label|labels)\b/u.test(after_match)
+    ) {
       return true;
     }
     match = action_entity_pattern.exec(text);
@@ -316,6 +1159,291 @@ function add_module_op(
 }
 
 export class VibeIntentPlanner {
+  infer_artifact_intent(prompt: string): XVibeArtifactIntent {
+    const normalized_prompt = normalize_artifact_intent_prompt(prompt);
+    let forbidden_targets = detect_forbidden_artifact_targets(normalized_prompt);
+
+    _xlog.log("[xvibe] intent resolver start", {
+      _prompt: prompt,
+    });
+
+    for (const resolver of INTENT_RESOLVERS) {
+      const result = resolver(prompt);
+      const resolver_name = resolver.name;
+
+      if (!result) {
+        _xlog.log("[xvibe] intent resolver skipped", {
+          _resolver: resolver_name,
+          _reason: "no_match",
+        });
+        continue;
+      }
+
+      if (result._reason === "negative_constraints") {
+        forbidden_targets =
+          unique_artifact_targets([
+            ...forbidden_targets,
+            ...(result._forbidden_targets ?? []),
+          ]);
+        _xlog.log("[xvibe] intent resolver skipped", {
+          _resolver: resolver_name,
+          _reason: "negative_constraints_collected",
+          _artifact_type: result._artifact_type,
+          _confidence: result._confidence,
+        });
+        continue;
+      }
+
+      if (resolver_name === "resolve_fallback_classifier") {
+        _xlog.log("[xvibe] fallback classifier used", {
+          _resolver: resolver_name,
+          _reason: result._reason,
+          _artifact_type: result._artifact_type,
+          _confidence: result._confidence,
+        });
+      }
+
+      _xlog.log("[xvibe] intent layer resolved", {
+        _resolver: resolver_name,
+        _artifact_type: result._artifact_type,
+        _reason: result._reason,
+        _confidence: result._confidence,
+      });
+
+      const target =
+        result._reason === "fallback_view"
+          ? "unknown"
+          : artifact_target_from_artifact_type(result._artifact_type);
+      const target_id =
+        result._artifact_id ??
+        extract_artifact_target_id(prompt, target);
+      const merged_forbidden_targets =
+        unique_artifact_targets([
+          ...forbidden_targets,
+          ...(result._forbidden_targets ?? []),
+        ]);
+
+      return {
+        _action: result._action ?? detect_artifact_action(normalized_prompt),
+        _target: target,
+        ...(target_id ? { _target_id: target_id } : {}),
+        _forbidden_targets: merged_forbidden_targets,
+        _confidence: result._confidence,
+        _reason: result._reason,
+      };
+    }
+
+    return {
+      _action: detect_artifact_action(normalized_prompt),
+      _target: "unknown",
+      _forbidden_targets: forbidden_targets,
+      _confidence: 0.4,
+      _reason: "fallback_view",
+    };
+  }
+
+  build_artifact_execution_plan(
+    prompt: string,
+    intent: XVibeArtifactIntent,
+    plan: XVibeInferredArtifactPlan,
+  ): XVibeArtifactExecutionPlan {
+    const normalized_prompt = normalize_artifact_intent_prompt(prompt);
+    const artifact_types =
+      artifact_types_for_execution_plan(
+        normalized_prompt,
+        intent,
+        plan,
+      );
+    const flow_ids = unique([
+      ...(plan._flow_ids ?? []),
+      ...(intent._target === "flow" && intent._target_id ? [intent._target_id] : []),
+    ]);
+    const artifacts: XVibeArtifactExecutionPlan["_artifacts"] = [];
+
+    for (const artifact_type of artifact_types) {
+      const artifact_ids =
+        execution_artifact_ids_for_type(
+          prompt,
+          intent,
+          plan,
+          artifact_type,
+        );
+      const ids = artifact_ids.length > 0 ? artifact_ids : [undefined];
+
+      for (const artifact_id of ids) {
+        const item: XVibeArtifactExecutionPlan["_artifacts"][number] = {
+          _artifact_type: artifact_type,
+          _action: execution_action_for_intent(intent, artifact_type, normalized_prompt),
+          ...(artifact_id ? { _artifact_id: artifact_id } : {}),
+          ...(artifact_type === "view" && flow_ids.length > 0
+            ? { _depends_on: flow_ids }
+            : {}),
+        };
+
+        _xlog.log("[xvibe] execution item", item);
+        artifacts.push(item);
+      }
+    }
+
+    const primary_execution_artifact =
+      artifacts.length > 0
+        ? artifacts[artifacts.length - 1]._artifact_type
+        : plan._primary_artifact_type;
+    const execution_plan: XVibeArtifactExecutionPlan = {
+      _primary_artifact_type: primary_execution_artifact,
+      _artifacts: artifacts,
+    };
+    const dependency_graph =
+      artifacts
+        .filter((artifact) => Array.isArray(artifact._depends_on) && artifact._depends_on.length > 0)
+        .map((artifact) => ({
+          _artifact_type: artifact._artifact_type,
+          _artifact_id: artifact._artifact_id,
+          _depends_on: artifact._depends_on,
+        }));
+
+    _xlog.log("[xvibe] execution dependency graph", {
+      _dependencies: dependency_graph,
+    });
+    _xlog.log("[xvibe] execution plan", execution_plan);
+
+    return execution_plan;
+  }
+
+  private attach_artifact_execution_plan(
+    prompt: string,
+    intent: XVibeArtifactIntent,
+    plan: XVibeInferredArtifactPlan,
+  ): XVibeInferredArtifactPlan {
+    return {
+      ...plan,
+      _execution_plan: this.build_artifact_execution_plan(prompt, intent, plan),
+    };
+  }
+
+  build_artifact_plan_from_intent(
+    prompt: string,
+    intent: XVibeArtifactIntent,
+    requested_artifact_type?: VibeRequestedArtifactType,
+  ): XVibeInferredArtifactPlan {
+    const normalized_prompt = normalize_artifact_intent_prompt(prompt);
+    const forbidden_types = new Set(
+      intent._forbidden_targets
+        .map((target) => artifact_type_for_intent_target(target))
+        .filter((target): target is VibeArtifactType => typeof target === "string"),
+    );
+    const flow_ids =
+      unique([
+        ...extract_prompt_flow_ids(prompt),
+        ...(intent._target === "flow" && intent._target_id ? [intent._target_id] : []),
+      ]);
+    const entity_ids =
+      intent._target === "entity" && intent._target_id
+        ? [intent._target_id]
+        : [];
+    const has_flow_dependency = flow_ids.length > 0;
+    const has_view_flow_dependency =
+      has_flow_dependency &&
+      intent._target !== "view" &&
+      prompt_has_explicit_view_update(normalized_prompt) &&
+      !intent._forbidden_targets.includes("view");
+
+    if (
+      is_explicit_artifact_type(requested_artifact_type) &&
+      intent._action !== "delete" &&
+      intent._action !== "rename" &&
+      intent._action !== "inspect" &&
+      !forbidden_types.has(requested_artifact_type)
+    ) {
+      if (requested_artifact_type === "view" && has_flow_dependency && !forbidden_types.has("flow")) {
+        return this.attach_artifact_execution_plan(prompt, intent, {
+          _primary_artifact_type: "view",
+          _artifact_types: ["flow", "view"],
+          _flow_ids: flow_ids,
+          _intent: intent,
+          _reason: "requested_view_with_explicit_flow_dependency",
+        });
+      }
+
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: requested_artifact_type,
+        _artifact_types: [requested_artifact_type],
+        ...(requested_artifact_type === "flow" && flow_ids.length > 0 ? { _flow_ids: flow_ids } : {}),
+        ...(requested_artifact_type === "entity" && entity_ids.length > 0 ? { _entity_ids: entity_ids } : {}),
+        _intent: intent,
+        _reason: "explicit_requested_artifact_type",
+      });
+    }
+
+    if (has_view_flow_dependency && !forbidden_types.has("flow")) {
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: "view",
+        _artifact_types: ["flow", "view"],
+        _flow_ids: flow_ids,
+        _intent: intent,
+        _reason: "explicit_view_intent_with_explicit_flow_dependency",
+      });
+    }
+
+    if (intent._target === "flow" && !forbidden_types.has("flow")) {
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: "flow",
+        _artifact_types: ["flow"],
+        ...(flow_ids.length > 0 ? { _flow_ids: flow_ids } : {}),
+        _intent: intent,
+        _reason: intent._reason,
+      });
+    }
+
+    if (intent._target === "entity" && !forbidden_types.has("entity")) {
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: "entity",
+        _artifact_types: ["entity"],
+        ...(entity_ids.length > 0 ? { _entity_ids: entity_ids } : {}),
+        _intent: intent,
+        _reason: intent._reason,
+      });
+    }
+
+    if (intent._target === "module") {
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: "module",
+        _artifact_types: ["module"],
+        ...(intent._target_id ? { _module_names: [intent._target_id] } : {}),
+        _intent: intent,
+        _reason: intent._reason,
+      });
+    }
+
+    if (intent._target === "view" && !forbidden_types.has("view")) {
+      if (has_flow_dependency && !forbidden_types.has("flow")) {
+        return this.attach_artifact_execution_plan(prompt, intent, {
+          _primary_artifact_type: "view",
+          _artifact_types: ["flow", "view"],
+          _flow_ids: flow_ids,
+          _intent: intent,
+          _reason: "explicit_view_intent_with_explicit_flow_dependency",
+        });
+      }
+
+      return this.attach_artifact_execution_plan(prompt, intent, {
+        _primary_artifact_type: "view",
+        _artifact_types: ["view"],
+        _intent: intent,
+        _reason: intent._reason,
+      });
+    }
+
+    const fallback_types: VibeArtifactType[] = forbidden_types.has("view") ? [] : ["view"];
+    return this.attach_artifact_execution_plan(prompt, intent, {
+      _primary_artifact_type: "view",
+      _artifact_types: fallback_types,
+      ...(has_flow_dependency && !forbidden_types.has("flow") ? { _flow_ids: flow_ids } : {}),
+      _intent: intent,
+      _reason: "fallback_view",
+    });
+  }
+
   empty_runtime_capabilities(): VibeRuntimeCapabilityRegistry {
     return {
       _semantic_object_ids: [],
@@ -532,11 +1660,198 @@ export class VibeIntentPlanner {
     //   _ui_patterns: plan._ui_patterns,
     // });
 
-    return plan;
+    return this.enforce_module_intent_plan(plan);
   }
 
   apply_ui_only_guard(prompt: string, plan: VibeIntentPlan): VibeIntentPlan {
     return this.apply_ui_only_guard_internal(prompt, plan, true);
+  }
+
+  assert_valid_module_intent_plan(plan: VibeIntentPlan): void {
+    if (plan._intent_type !== "module") return;
+
+    if (plan._entities.length > 0 || plan._actions.length > 0) {
+      throw new Error(
+        `${XVIBE_MODULE_INTENT_INVALID}: module plans must not contain CRUD artifacts`,
+      );
+    }
+  }
+
+  enforce_module_intent_plan(plan: VibeIntentPlan): VibeIntentPlan {
+    if (plan._intent_type !== "module") return plan;
+
+    const guarded: VibeIntentPlan = {
+      ...plan,
+      _artifact_types: ["module"],
+      _entities: [],
+      _regions: [],
+      _objects: [],
+      _actions: [],
+      _bindings: [],
+      _modules: [],
+      _style: {},
+      _xui_objects: [],
+      _capabilities: [],
+      _crud_ops: [],
+      _ui_patterns: [],
+      _ui_keywords: [],
+      _flow_keywords: [],
+      _entity_keywords: [],
+    };
+
+    this.assert_valid_module_intent_plan(guarded);
+    return guarded;
+  }
+
+  build_module_intent_plan(input: {
+    prompt: string;
+    app_plan?: unknown;
+    runtime_capabilities?: VibeRuntimeCapabilityRegistry;
+    reason?: string;
+  }): VibeIntentPlan {
+    const runtime_capabilities =
+      input.runtime_capabilities ?? this.empty_runtime_capabilities();
+    const prompt_text = normalize_prompt_text(input.prompt);
+    const module_op_extraction =
+      extract_module_operation_matches_from_prompt(input.prompt);
+    const inferred_module_requirement =
+      this.infer_module_requirement(prompt_text, runtime_capabilities);
+    const module_name =
+      extract_explicit_module_id_from_prompt(input.prompt) ??
+      this.module_name_from_app_plan(input.app_plan) ??
+      inferred_module_requirement?._module_name ??
+      "generated-module";
+    const module_target =
+      this.module_target_from_prompt(prompt_text) ??
+      inferred_module_requirement?._module_target ??
+      "server";
+    const module_ops =
+      module_op_extraction._module_ops.length > 0
+        ? module_op_extraction._module_ops
+        : inferred_module_requirement?._module_ops.length
+          ? inferred_module_requirement._module_ops
+          : ["run"];
+    const plan: VibeIntentPlan = {
+      _ir_version: INTENT_IR_VERSION,
+      _intent_type: "module",
+      _artifact_types: ["module"],
+      _entities: [],
+      _regions: [],
+      _objects: [],
+      _actions: [],
+      _bindings: [],
+      _modules: [],
+      _style: {},
+      _xui_objects: [],
+      _capabilities: [],
+      _crud_ops: [],
+      _ui_patterns: [],
+      _ui_keywords: [],
+      _flow_keywords: [],
+      _entity_keywords: [],
+      _requires_module: true,
+      _module_target: module_target,
+      _module_name: module_name,
+      _module_ops: unique(module_ops),
+      _module_reason:
+        inferred_module_requirement?._module_reason ??
+        "User explicitly requested creation of a module.",
+      _runtime_capabilities: runtime_capabilities,
+    };
+    const guarded_plan = this.enforce_module_intent_plan(plan);
+
+    _xlog.log("[xvibe] module intent branch", {
+      _module_name: guarded_plan._module_name,
+      _module_ops: guarded_plan._module_ops,
+      _reason: input.reason ?? "module_intent",
+      _bypassed_crud: true,
+    });
+
+    return guarded_plan;
+  }
+
+  private resolve_module_intent_branch_reason(
+    prompt: string,
+    app_plan: unknown,
+  ): string | undefined {
+    if (this.app_plan_requests_module(app_plan)) {
+      return "artifact_type_module";
+    }
+
+    const prompt_reason = module_intent_prompt_reason(prompt);
+    if (prompt_reason) return prompt_reason;
+
+    if (!/\b(?:module|modules|xmodule)\b/iu.test(prompt)) {
+      return undefined;
+    }
+
+    const artifact_intent = this.infer_artifact_intent(prompt);
+    return artifact_intent._target === "module"
+      ? "artifact_target_module"
+      : undefined;
+  }
+
+  private app_plan_requests_module(app_plan: unknown): boolean {
+    if (!is_plain_object(app_plan)) return false;
+
+    const direct_values = [
+      app_plan._artifact_type,
+      app_plan._primary_artifact_type,
+      app_plan._target,
+      is_plain_object(app_plan._intent)
+        ? app_plan._intent._target
+        : undefined,
+    ];
+    if (direct_values.some((value) => value === "module")) {
+      return true;
+    }
+
+    if (normalize_string_array(app_plan._artifact_types).includes("module")) {
+      return true;
+    }
+
+    if (!Array.isArray(app_plan._artifacts)) {
+      return false;
+    }
+
+    return app_plan._artifacts.some((artifact) => {
+      if (artifact === "module") return true;
+      if (!is_plain_object(artifact)) return false;
+      return (
+        artifact._artifact_type === "module" ||
+        artifact._primary_artifact_type === "module"
+      );
+    });
+  }
+
+  private module_name_from_app_plan(app_plan: unknown): string | undefined {
+    if (!is_plain_object(app_plan)) return undefined;
+
+    const explicit_module_name =
+      normalize_explicit_module_id(
+        typeof app_plan._module_name === "string"
+          ? app_plan._module_name
+          : undefined,
+      );
+    if (explicit_module_name) return explicit_module_name;
+
+    return normalize_explicit_module_id(
+      normalize_string_array(app_plan._module_names)[0],
+    );
+  }
+
+  private module_target_from_prompt(
+    prompt_text: string,
+  ): Exclude<VibeModuleTarget, null> | undefined {
+    if (/\bclient\s+(?:xmodule|module)\b/u.test(prompt_text)) {
+      return "client";
+    }
+
+    if (/\bserver\s+(?:xmodule|module)\b/u.test(prompt_text)) {
+      return "server";
+    }
+
+    return undefined;
   }
 
   infer_intent_plan(
@@ -545,6 +1860,17 @@ export class VibeIntentPlanner {
     runtime_capabilities: VibeRuntimeCapabilityRegistry = this.empty_runtime_capabilities(),
   ): VibeIntentPlan {
     const prompt_text = normalize_prompt_text(prompt);
+    const module_branch_reason =
+      this.resolve_module_intent_branch_reason(prompt, app_plan);
+    if (module_branch_reason) {
+      return this.build_module_intent_plan({
+        prompt,
+        app_plan,
+        runtime_capabilities,
+        reason: module_branch_reason,
+      });
+    }
+
     const text = `${prompt} ${JSON.stringify(app_plan ?? {})}`.toLowerCase();
     const explicit_data_or_crud_intent = has_explicit_data_or_crud_intent(prompt);
     const inferred: Omit<VibeIntentPlan, "_runtime_capabilities"> = {
@@ -1546,17 +2872,13 @@ export class VibeIntentPlanner {
     }
 
     if (
-      /\b(?:create|build|generate|add|make)\s+(?:a|an\s+)?(?:server\s+)?(?:xmodule|module)\b/u
+      /\b(?:create|build|generate|add|make)\s+(?:a|an\s+)?(?:(?:server|client)\s+)?(?:xmodule|module)\b/u
         .test(prompt_text)
     ) {
+      const moduleTarget =
+        this.module_target_from_prompt(prompt_text) ?? "server";
       const opMatches =
-        [
-          ...prompt_text.matchAll(
-            /\bop(?:eration)?\s+(?:named|called)?\s*(_?[a-z][a-z0-9_-]*)\b/gu
-          )
-        ]
-          .map((match) => match[1]?.replace(/^_/, ""))
-          .filter((value): value is string => Boolean(value));
+        extract_explicit_module_ops_from_prompt(prompt_text);
 
       const namedModuleMatch =
         /\b(?:xmodule|module)\s+(?:named|called)\s+([a-z][a-z0-9_-]*)\b/u
@@ -1567,6 +2889,7 @@ export class VibeIntentPlanner {
           .exec(prompt_text);
 
       const candidateModuleName =
+        extract_explicit_module_id_from_prompt(prompt_text) ??
         namedModuleMatch?.[1] ??
         beforeModuleMatch?.[1];
 
@@ -1577,7 +2900,7 @@ export class VibeIntentPlanner {
           "generated-module";
 
       candidates.push({
-        _module_target: "server",
+        _module_target: moduleTarget,
         _module_name: moduleName,
         _module_ops:
           opMatches.length > 0

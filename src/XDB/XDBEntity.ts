@@ -19,6 +19,7 @@ import { assertXdbReady, getXdbEngine } from "./xdbReady.js";
 // ---------------- Types ----------------
 
 const BCRYPT_SALT_OR_ROUNDS = 10;
+const BCRYPT_HASH_PREFIXES = ["$2a$", "$2b$", "$2y$"];
 
 export type XDBIndexSchema = {
     _unique?: boolean;
@@ -157,6 +158,7 @@ export class XDBEntity extends XObject {
     _loaded = false;
     _need_save = false;
     _schema_need_save = true;
+    private _load_promise?: Promise<void>;
 
     // helpers
     _fields_lists: XDBEntityFieldsLists = {
@@ -204,6 +206,13 @@ export class XDBEntity extends XObject {
     // ---------------- init / load / save ----------------
 
     setScheme() {
+        this.normalizeRuntimeSchema();
+
+        // load async
+        this._load_promise = this.loadData().then(() => _xem.fire("xentity-loaded", this._name));
+    }
+
+    private normalizeRuntimeSchema() {
         if (!this._schema.hasOwnProperty("_id")) this._schema["_id"] = _scheme_id_default;
 
         this._schema["_created_at"] = { _type: "Date", _required: false, _immutable: true };
@@ -216,9 +225,43 @@ export class XDBEntity extends XObject {
         // register entity inside engine (engine decides what to do)
         const engine = getXdbEngine();
         engine.addEntity(this);
+    }
 
-        // load async
-        void this.loadData().then(() => _xem.fire("xentity-loaded", this._name));
+    private cloneSchema(schema: XDBEntitySchema): XDBEntitySchema {
+        return JSON.parse(JSON.stringify(schema ?? {}));
+    }
+
+    async waitUntilLoaded() {
+        if (this._load_promise) {
+            await this._load_promise;
+        }
+    }
+
+    async syncSchema(schema: XDBEntitySchema, meta: Partial<XDBEntityMeta> = {}) {
+        await this.waitUntilLoaded();
+
+        const safeMeta =
+            meta && typeof meta === "object" && !Array.isArray(meta)
+                ? meta
+                : {};
+
+        this._schema = this.cloneSchema(schema);
+        this._meta = {
+            ...this._meta,
+            ...safeMeta,
+            _records: this._data.length,
+            _name: this._name
+        };
+
+        this.normalizeRuntimeSchema();
+        this.indexAll();
+
+        const engine = getXdbEngine();
+        await engine.saveEntity(this, true);
+
+        this._schema_need_save = false;
+        this._need_save = false;
+        this._loaded = true;
     }
 
 
@@ -304,6 +347,88 @@ export class XDBEntity extends XObject {
 
     async compareHashField(hash: string, plainText: string) {
         return await bcrypt.compare(plainText, hash);
+    }
+
+    async verifyHashField(
+        record: any,
+        fieldName: string,
+        plainText: string
+    ): Promise<boolean> {
+        const field =
+            this._schema?.[fieldName];
+
+        if (!field) {
+            throw new Error(
+                `Field ${fieldName} not in schema`
+            );
+        }
+
+        if (field._type !== "Hash") {
+            throw new Error(
+                `Field ${fieldName} is not a Hash field`
+            );
+        }
+
+        const hash =
+            record?.[fieldName];
+
+        if (typeof hash !== "string") {
+            return false;
+        }
+
+        return await this.compareHashField(
+            hash,
+            plainText
+        );
+    }
+
+    private isBcryptHash(value: any): boolean {
+        return (
+            typeof value === "string" &&
+            BCRYPT_HASH_PREFIXES.some((prefix) => value.startsWith(prefix))
+        );
+    }
+
+    private async hashFieldValue(value: any): Promise<string> {
+        const salt =
+            await bcrypt.genSalt(
+                BCRYPT_SALT_OR_ROUNDS
+            );
+
+        return await bcrypt.hash(
+            String(value ?? ""),
+            salt
+        );
+    }
+
+    private logHashUpdate(
+        fieldName: string,
+        action: "hash-update" | "hash-skip-already-hashed"
+    ) {
+        _xlog.log("[xdb/hash]", {
+            _entity: this._name ?? this._id,
+            _field: fieldName,
+            _action: action
+        });
+    }
+
+    private async prepareHashUpdateField(
+        fieldName: string,
+        value: any
+    ): Promise<any> {
+        if (this.isBcryptHash(value)) {
+            this.logHashUpdate(
+                fieldName,
+                "hash-skip-already-hashed"
+            );
+            return value;
+        }
+
+        this.logHashUpdate(
+            fieldName,
+            "hash-update"
+        );
+        return await this.hashFieldValue(value);
     }
 
     private async prepareFields(input: Record<string, any>): Promise<Record<string, any>> {
@@ -414,16 +539,22 @@ export class XDBEntity extends XObject {
 
             if (ftype === "hash") {
 
-                const salt =
-                    await bcrypt.genSalt(
-                        BCRYPT_SALT_OR_ROUNDS
+                if (this.isBcryptHash(v)) {
+                    this.logHashUpdate(
+                        key,
+                        "hash-skip-already-hashed"
                     );
 
-                out[key] =
-                    await bcrypt.hash(
-                        String(v ?? ""),
-                        salt
+                    out[key] = v;
+                } else {
+                    this.logHashUpdate(
+                        key,
+                        "hash-update"
                     );
+
+                    out[key] =
+                        await this.hashFieldValue(v);
+                }
                 continue;
             }
             /*FILE*/
@@ -898,6 +1029,8 @@ export class XDBEntity extends XObject {
         selected = engine.filterData(selected, filter, this._schema);
         let updatedCount = 0;
         let requiredIndexRebuild = false;
+        const preparedUpdates: Record<string, any> = {};
+        const preparedUpdateFields = new Set<string>();
 
         for (const row of selected) {
             const idx = this.findDataIndex(row._id);
@@ -910,6 +1043,24 @@ export class XDBEntity extends XObject {
 
             for (const key of Object.keys(updates)) {
                 this.checkUpdateField(key, updates[key]);
+                let updateValue = updates[key];
+                const fieldType =
+                    String(this._schema[key]?._type ?? "")
+                        .toLowerCase();
+
+                if (fieldType === "hash") {
+                    if (!preparedUpdateFields.has(key)) {
+                        preparedUpdates[key] =
+                            await this.prepareHashUpdateField(
+                                key,
+                                updateValue
+                            );
+                        preparedUpdateFields.add(key);
+                    }
+
+                    updateValue =
+                        preparedUpdates[key];
+                }
 
                 // file type
                 if (
@@ -929,12 +1080,12 @@ export class XDBEntity extends XObject {
                     const newFid =
                         this._xdb_file
                             .addFile(
-                                updates[key]
+                                updateValue
                             );
                     this._data[idx][key] =
                         newFid;
                 } else {
-                    this._data[idx][key] = updates[key];
+                    this._data[idx][key] = updateValue;
                 }
 
                 if (

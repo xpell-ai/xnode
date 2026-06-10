@@ -5,7 +5,9 @@ import {
   _xd,
   _xlog,
   XResponseOK,
-  XResponseError
+  XResponseError,
+  type XpellSkillCommand,
+  type XpellSkill
 } from "@xpell/core";
 
 import { _xem } from "../XEM/XEventManager.js";
@@ -47,6 +49,102 @@ type XFlow = {
 };
 
 /* -------------------------------------------------------------------------- */
+export const XAUTH_OPS: Record<string, XpellSkillCommand> = {
+  login: {
+    _name: "login",
+    _scope: "module",
+    _description: "Authenticate user credentials and return an auth session."
+  },
+
+  verify_jwt: {
+    _name: "verify_jwt",
+    _scope: "module",
+    _description: "Verify JWT token and return auth context."
+  },
+
+  authorize_req: {
+    _name: "authorize_req",
+    _scope: "module",
+    _description: "Resolve authentication and authorization for a request."
+  },
+
+  create_api_key: {
+    _name: "create_api_key",
+    _scope: "module",
+    _description: "Create an API key and secure hash."
+  },
+
+  hash_secret: {
+    _name: "hash_secret",
+    _scope: "module",
+    _description: "Hash a secret value."
+  },
+
+  verify_secret: {
+    _name: "verify_secret",
+    _scope: "module",
+    _description: "Verify a secret against a stored hash."
+  }
+};
+export const XAUTH_SKILL: XpellSkill = {
+  _id: "xauth",
+  _title: "XAuth Runtime Module",
+  _version: "1.0.0",
+  _active: true,
+  _type: "server-module-api",
+  _requires: ["xmodule"],
+
+  _description:
+    "Authentication and authorization runtime module supporting JWT validation, API keys, request authorization, and secret hashing.",
+
+  _exports: {
+    _modules: [
+      {
+        _name: "xauth",
+        _scope: "server",
+        _description:
+          "Authentication and authorization runtime services.",
+        _ops: Object.values(XAUTH_OPS)
+      }
+    ]
+  },
+
+  _core_rules: [
+    "Use authorize_req to resolve request authentication.",
+    "Use verify_jwt to validate JWT tokens.",
+    "Use create_api_key only for issuing API keys.",
+    "Store hashes, never plaintext secrets.",
+    "Do not expose credentials, tokens, hashes, or auth secrets in generated views."
+  ],
+
+  _anti_patterns: [
+    "Returning secrets to clients.",
+    "Embedding credentials in generated artifacts.",
+    "Skipping JWT verification before authorization.",
+    "Persisting plaintext passwords or API keys."
+  ],
+
+  _canonical_examples: [
+    {
+      _module: "xauth",
+      _op: "authorize_req",
+      _params: {
+        _ctx: {
+          _meta: {
+            _token: "$token"
+          }
+        }
+      }
+    },
+    {
+      _module: "xauth",
+      _op: "verify_jwt",
+      _params: {
+        _token: "$token"
+      }
+    }
+  ]
+};
 
 export class FlowManagerModule extends XModule {
   static _name = "flow";
@@ -350,8 +448,8 @@ export class FlowManagerModule extends XModule {
         cond._type === "xdata"
           ? _xd.get(cond._key)
           : cond._type === "event"
-          ? this.get_by_path(ctx.event, cond._key)
-          : undefined;
+            ? this.get_by_path(ctx.event, cond._key)
+            : undefined;
     }
 
     if (cond._equals !== undefined) return val === cond._equals;

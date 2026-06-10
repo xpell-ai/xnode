@@ -203,6 +203,7 @@ export type WHConnMeta = {
   _wid?: string;
   _user_agent?: string;
   _ip?: string;
+  _token?: string;
 
   // 🔥 NEW (for scoped broadcast)
   _app_id?: string;

@@ -245,6 +245,22 @@ export class XDBEngine {
         }
     }
 
+    removeEntity(entityName: string, autoCommit = true) {
+        const name = String(entityName ?? "");
+        if (!name) return false;
+
+        const before = this._xdb_data._entities.length;
+        this._xdb_data._entities = this._xdb_data._entities.filter((entity) => entity !== name);
+        const removed = this._xdb_data._entities.length !== before;
+
+        if (removed) {
+            this._xdb_data._number_of_cached_entities = this._xdb_data._entities.length;
+        }
+
+        if (removed && autoCommit) void this.commit();
+        return removed;
+    }
+
     /**
      * Commit meta to storage
      */

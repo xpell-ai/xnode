@@ -12,15 +12,17 @@ import { setXEventManager, } from "@xpell/core";
 import { _xem, XEventManager } from "../XEM/XEventManager.js";
 import { XAI } from "../XAI/XAI.js";
 import FlowManagerModule from "../XFM/FlowManagerModule.js";
-import { XEntityManager } from "../EntityManager/XEntityManager.js";
+import { XEntityManager } from "../XEntityManager/XEntityManager.js";
 import {
     XDB, XDBStorageFS, XDBStorageSqlite, type IXDBStorage
 } from "../XDB/index.js";
+import { XAuthModule } from "../XAuth/index.js";
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
 import { XVibeModule } from "../XVIBE/XVibeModule.js";
 import { XModuleCreatorModule } from "../XGenerative/index.js";
 import { XMutatorModule } from "../XMutator/XMutatorModule.js";
+import { XStudioModule } from "../XStudio/index.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -161,6 +163,7 @@ export class XNode {
         });
         await _x.loadModuleAsync(XDB);
         await _x.loadModuleAsync(new PingModule());
+        await _x.loadModuleAsync(new XAuthModule());
         await _x.loadModuleAsync(XAI);
 
         await _x.loadModuleAsync(new XModuleCreatorModule({
@@ -171,6 +174,7 @@ export class XNode {
         await _x.loadModuleAsync(new XVibeModule());
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());
+        await _x.loadModuleAsync(new XStudioModule());
         const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path });
         await _x.loadModuleAsync(server_xvm);
 

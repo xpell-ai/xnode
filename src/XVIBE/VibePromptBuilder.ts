@@ -1,6 +1,7 @@
 import type { VibeKnowledgeSelection, VibeSkillDocument } from "./VibeKnowledgeSelector.js";
+import { _xlog } from "@xpell/core";
 import { _xu } from "../XNUtils/XUtils.js";
-import { VibeArtifactType, VibeRequestedArtifactType } from "./XVibeTypes.js";
+import type { VibeArtifactType, VibeRequestedArtifactType } from "./XVibeTypes.js";
 
 type XVibeJsonObject = {
   [key: string]: unknown;
@@ -103,6 +104,19 @@ function omit_current_view(value: XVibeJsonObject | undefined): XVibeJsonObject 
   return result;
 }
 
+function omit_behavior_intent(value: XVibeJsonObject | undefined): XVibeJsonObject | undefined {
+  if (!value) return undefined;
+
+  const result: XVibeJsonObject = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (key !== "_behavior_intent") {
+      result[key] = item;
+    }
+  }
+
+  return result;
+}
+
 function compact_array(value: unknown, max_items = MAX_ARRAY_ITEMS): unknown[] {
   if (!Array.isArray(value)) return [];
   return value.slice(0, max_items);
@@ -173,6 +187,255 @@ function format_json_section(title: string, value: unknown): string[] {
     `${title}:`,
     compact_json(value),
   ];
+}
+
+function normalize_id(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const id = value
+    .toLowerCase()
+    .trim()
+    .replace(/[_\s]+/gu, "-")
+    .replace(/[^a-z0-9-]+/gu, "-")
+    .replace(/-+/gu, "-")
+    .replace(/^-|-$/gu, "");
+
+  return id.length > 0 ? id : undefined;
+}
+
+function normalize_string_array(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map(normalize_id)
+    .filter((item): item is string => typeof item === "string")
+    .filter((item, index, all) => all.indexOf(item) === index);
+}
+
+function extract_behavior_intent(runtime_context: XVibeJsonObject | undefined): XVibeJsonObject | undefined {
+  const behavior = runtime_context?._behavior_intent;
+  if (!behavior || typeof behavior !== "object" || Array.isArray(behavior)) return undefined;
+
+  return behavior as XVibeJsonObject;
+}
+
+function behavior_value(behavior: XVibeJsonObject | undefined): string {
+  return normalize_id(behavior?._behavior) ?? normalize_id(behavior?._behavior_type) ?? "unknown";
+}
+
+function behavior_crud(behavior: XVibeJsonObject | undefined): string | undefined {
+  return normalize_id(behavior?._crud_intent) ?? normalize_id(behavior?._crud);
+}
+
+function behavior_entity_targets(behavior: XVibeJsonObject | undefined): string[] {
+  return normalize_string_array(behavior?._entity_targets)
+    .concat(normalize_id(behavior?._entity) ? [normalize_id(behavior?._entity)!] : [])
+    .filter((item, index, all) => all.indexOf(item) === index);
+}
+
+function behavior_flow_targets(behavior: XVibeJsonObject | undefined): string[] {
+  return normalize_string_array(behavior?._flow_targets)
+    .concat(normalize_id(behavior?._flow_goal) ? [normalize_id(behavior?._flow_goal)!] : [])
+    .filter((item, index, all) => all.indexOf(item) === index);
+}
+
+function read_object_array(value: unknown): XVibeJsonObject[] {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter((item): item is XVibeJsonObject =>
+      typeof item === "object" &&
+      item !== null &&
+      !Array.isArray(item),
+    );
+}
+
+function runtime_generated_flow_ids(runtime_context: XVibeJsonObject | undefined): string[] {
+  const generated_artifacts = runtime_context?._generated_artifacts;
+  if (
+    typeof generated_artifacts !== "object" ||
+    generated_artifacts === null ||
+    Array.isArray(generated_artifacts)
+  ) {
+    return [];
+  }
+
+  const flows = read_object_array((generated_artifacts as XVibeJsonObject)._flows);
+  return flows
+    .flatMap((flow) => [
+      normalize_id(flow._artifact_id),
+      normalize_id(flow._flow_id),
+    ])
+    .filter((id): id is string => typeof id === "string")
+    .filter((id, index, all) => all.indexOf(id) === index);
+}
+
+function prompt_explicitly_references_id(prompt: string, id: string): boolean {
+  const normalized_id = normalize_id(id);
+  if (!normalized_id) return false;
+
+  const normalized_prompt = normalize_id(prompt);
+  if (!normalized_prompt) return false;
+
+  return new RegExp(String.raw`(?:^|-)${normalized_id}(?:-|$)`, "u")
+    .test(normalized_prompt);
+}
+
+function runtime_asset_flow_ids(
+  runtime_context: XVibeJsonObject | undefined,
+  prompt: string,
+): string[] {
+  const runtime_assets = runtime_context?._runtime_assets;
+  if (
+    typeof runtime_assets !== "object" ||
+    runtime_assets === null ||
+    Array.isArray(runtime_assets)
+  ) {
+    return [];
+  }
+
+  const flows = read_object_array((runtime_assets as XVibeJsonObject)._flows);
+  return flows
+    .map((flow) => normalize_id(flow._id))
+    .filter((id): id is string => typeof id === "string")
+    .filter((id) => prompt_explicitly_references_id(prompt, id))
+    .filter((id, index, all) => all.indexOf(id) === index);
+}
+
+function available_flow_ids(
+  runtime_context: XVibeJsonObject | undefined,
+  behavior: XVibeJsonObject | undefined,
+  prompt: string,
+): string[] {
+  return [
+    ...behavior_flow_targets(behavior),
+    ...runtime_generated_flow_ids(runtime_context),
+    ...runtime_asset_flow_ids(runtime_context, prompt),
+  ]
+    .map(normalize_id)
+    .filter((id): id is string => typeof id === "string")
+    .filter((id, index, all) => all.indexOf(id) === index);
+}
+
+function behavior_target_fields(behavior: XVibeJsonObject | undefined): string[] {
+  return normalize_string_array(behavior?._target_fields)
+    .concat(normalize_string_array(behavior?._source_fields))
+    .filter((item, index, all) => all.indexOf(item) === index);
+}
+
+function behavior_has_account_user_creation(
+  behavior: XVibeJsonObject | undefined,
+  prompt: string,
+): boolean {
+  const behavior_id = behavior_value(behavior);
+  const crud = behavior_crud(behavior);
+  const tokens = [
+    behavior_id,
+    ...behavior_entity_targets(behavior),
+    ...behavior_flow_targets(behavior),
+    _xu.normalizePrompt(prompt).toLowerCase(),
+  ].join(" ");
+
+  return (
+    [
+      "account-creation",
+      "account-user-creation",
+      "user-creation",
+      "registration",
+      "register",
+      "signup",
+      "sign-up",
+      "auth-registration",
+    ].includes(behavior_id) ||
+    (
+      crud === "add" &&
+      /\b(?:account|auth|register|registration|signup|sign-up|login|user)\b/u.test(tokens) &&
+      /\b(?:account|user|auth|register|registration|signup|sign-up|login)\b/u.test(tokens)
+    )
+  );
+}
+
+function behavior_has_crud(behavior: XVibeJsonObject | undefined): boolean {
+  const crud = behavior_crud(behavior);
+  return crud === "add" || crud === "find" || crud === "get" || crud === "update" || crud === "delete";
+}
+
+function behavior_is_meaningful(
+  behavior: XVibeJsonObject | undefined,
+  artifact_type: VibeArtifactType,
+  prompt: string,
+  runtime_context: XVibeJsonObject | undefined,
+): boolean {
+  if (!behavior && available_flow_ids(runtime_context, behavior, prompt).length === 0) return false;
+  if (behavior_value(behavior) !== "unknown") return true;
+  if (behavior_has_crud(behavior)) return true;
+  if (behavior_entity_targets(behavior).length > 0) return true;
+  if (artifact_type === "view" && available_flow_ids(runtime_context, behavior, prompt).length > 0) return true;
+  if (artifact_type === "flow" && behavior_has_account_user_creation(behavior, prompt)) return true;
+
+  return false;
+}
+
+function build_behavior_instruction_lines(
+  artifact_type: VibeArtifactType,
+  prompt: string,
+  runtime_context: XVibeJsonObject | undefined,
+): string[] {
+  const behavior = extract_behavior_intent(runtime_context);
+  if (!behavior_is_meaningful(behavior, artifact_type, prompt, runtime_context)) return [];
+
+  const behavior_id = behavior_value(behavior);
+  const crud = behavior_crud(behavior);
+  const entity_targets = behavior_entity_targets(behavior);
+  const flow_targets = behavior_flow_targets(behavior);
+  const allowed_flow_ids = available_flow_ids(runtime_context, behavior, prompt);
+  const target_fields = behavior_target_fields(behavior);
+  const account_user_creation = behavior_has_account_user_creation(behavior, prompt);
+  const lines: string[] = [
+    "BEHAVIOR INTENT INSTRUCTIONS:",
+    `- Behavior: ${behavior_id}.`,
+  ];
+
+  if (crud) lines.push(`- CRUD intent: ${crud}.`);
+  if (entity_targets.length > 0) lines.push(`- Entity targets: ${entity_targets.join(", ")}.`);
+  if (flow_targets.length > 0) lines.push(`- Flow targets: ${flow_targets.join(", ")}.`);
+
+  if (artifact_type === "flow") {
+    if (account_user_creation || behavior_has_crud(behavior)) {
+      lines.push("- Generate at least one concrete step; do not leave _flow._steps empty.");
+      lines.push('- Use only top-level flow step commands: { "_id": "...", "_module": "...", "_op": "...", "_params": {} }.');
+      lines.push('- Do not use nested _command inside flow steps.');
+      lines.push('- Prefer module "entity-manager" for server-side flow CRUD; entity-client is acceptable only when explicitly required by selected skills.');
+      lines.push('- For add/create operations, put submitted record values in _params._data.');
+      lines.push('- For find/get operations, put query criteria in _params._filter.');
+      lines.push('- For update operations, put match criteria in _params._filter and changed values in _params._updates.');
+      lines.push("- For delete operations, put match criteria in _params._filter.");
+    }
+  } else if (artifact_type === "view") {
+    if (allowed_flow_ids.length > 0) {
+      lines.push('- Buttons may wire only these available flow ids with _flow: { "_id": "<flow-id>" }.');
+      lines.push(`- Allowed flow ids for _flow wiring: ${allowed_flow_ids.join(", ")}.`);
+      lines.push("- Never invent flow ids.");
+    } else {
+      lines.push("- Do not add _flow from behavior intent; no explicit or planned flow id is available.");
+    }
+    lines.push("- Use behavior nouns to guide labels, fields, and button text without changing artifact type.");
+  } else if (artifact_type === "entity") {
+    lines.push("- Use behavior nouns to choose schema fields while preserving the valid XDB entity schema shape.");
+    if (account_user_creation) {
+      lines.push("- For account/user creation schemas, prefer fields such as account_name, name, email, and password when consistent with the user prompt.");
+    }
+    if (target_fields.length > 0) {
+      lines.push(`- Candidate schema fields from behavior: ${target_fields.join(", ")}.`);
+    }
+  }
+
+  _xlog.log("[xvibe] prompt behavior context", {
+    _artifact_type: artifact_type,
+    _behavior: behavior_id,
+    _instructions_count: Math.max(0, lines.length - 1),
+  });
+
+  return lines;
 }
 
 function format_skill(skill: VibeSkillDocument, max_chars: number): string {
@@ -905,7 +1168,8 @@ export class VibePromptBuilder {
       throw new Error("XVibe refine prompt requires runtime_context._current_view");
     }
 
-    const runtime_context_without_current_view = omit_current_view(input.runtime_context);
+    const runtime_context_without_current_view =
+      omit_behavior_intent(omit_current_view(input.runtime_context));
     const runtime_context = has_value(runtime_context_without_current_view)
       ? compact_json(runtime_context_without_current_view, MAX_JSON_CHARS)
       : "No runtime context injected.";
@@ -916,6 +1180,12 @@ export class VibePromptBuilder {
       input.prompt,
       input.runtime_context,
     );
+    const behavior_instructions =
+      build_behavior_instruction_lines(
+        input._artifact_type,
+        input.prompt,
+        input.runtime_context,
+      );
 
     const allowed_xui_objects =
       Array.from(new Set([
@@ -963,6 +1233,12 @@ export class VibePromptBuilder {
       ...this.build_artifact_specific_rules(
         input._artifact_type
       ),
+      ...(behavior_instructions.length > 0
+        ? [
+          "",
+          ...behavior_instructions,
+        ]
+        : []),
 
       "",
       "Refine Skill Guidance:",
@@ -1002,13 +1278,20 @@ export class VibePromptBuilder {
     );
     const output_contract = output_contract_for_artifact(input._artifact_type);
     const normalized_user_task = truncate_text(_xu.normalizePrompt(input.prompt), this.max_user_task_chars);
-    const runtime_context = has_value(input.runtime_context)
-      ? compact_json(input.runtime_context, MAX_JSON_CHARS)
+    const runtime_context_without_behavior = omit_behavior_intent(input.runtime_context);
+    const runtime_context = has_value(runtime_context_without_behavior)
+      ? compact_json(runtime_context_without_behavior, MAX_JSON_CHARS)
       : "No runtime context injected.";
     const deterministic_skeleton =
       input._artifact_type === "view" && has_value(input.deterministic_skeleton)
         ? compact_json(input.deterministic_skeleton, MAX_SKELETON_JSON_CHARS)
         : "";
+    const behavior_instructions =
+      build_behavior_instruction_lines(
+        input._artifact_type,
+        input.prompt,
+        input.runtime_context,
+      );
 
     const allowed_xui_objects =
       Array.from(new Set([
@@ -1062,6 +1345,12 @@ export class VibePromptBuilder {
       ...this.build_artifact_specific_rules(
         input._artifact_type
       ),
+      ...(behavior_instructions.length > 0
+        ? [
+          "",
+          ...behavior_instructions,
+        ]
+        : []),
 
       "",
       "Selected Skills:",

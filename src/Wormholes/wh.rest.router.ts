@@ -64,6 +64,7 @@ function mkCtx(req: Request, opts: WHGatewayOptions): WHContext {
                 (req.headers["x-correlation-id"] as string | undefined),
             _user_agent: req.headers["user-agent"] as string | undefined,
             _ip: req.ip,
+            ...(token ? { _token: token } : {}),
         },
 
         _route: {

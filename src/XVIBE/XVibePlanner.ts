@@ -189,8 +189,19 @@ function unique_artifacts(artifacts: XVibeArtifactPlanType[]): XVibeArtifactPlan
 }
 
 function extract_flow_ids(prompt: string): string[] {
-  const matches = prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? [];
-  return Array.from(new Set(matches.map((match) => match.toLowerCase())));
+  const ids: string[] = [];
+  ids.push(...(prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? []));
+
+  const named_flow_pattern =
+    /\b(?:run|trigger|call|execute)?\s*(?:a\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu;
+
+  for (const match of prompt.matchAll(named_flow_pattern)) {
+    ids.push(match[1]);
+  }
+
+  return Array.from(
+    new Set(ids.map((match) => match.trim().toLowerCase()).filter(Boolean))
+  );
 }
 
 function prompt_requests_flow_artifact(prompt: string): boolean {

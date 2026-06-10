@@ -26,6 +26,10 @@ type XVibeViewNode = XVibeJsonObject & {
   _children?: XVibeViewNode[];
 };
 
+export type VibeEnsureViewIdsResult = {
+  _count: number;
+};
+
 const SELECT_FIELD_NAMES = new Set([
   "status",
   "type",
@@ -101,8 +105,111 @@ function read_generated_flow_ids(runtime_context: XVibeJsonObject): string[] {
 }
 
 function extract_prompt_flow_ids(prompt: string): string[] {
-  const matches = prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? [];
-  return unique_strings(matches.map((match) => match.toLowerCase()));
+  const ids: string[] = [];
+  ids.push(...(prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? []));
+
+  const named_flow_pattern =
+    /\b(?:run|trigger|call|execute)?\s*(?:a\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu;
+
+  for (const match of prompt.matchAll(named_flow_pattern)) {
+    ids.push(match[1]);
+  }
+
+  return unique_strings(
+    ids.map((match) => match.trim().toLowerCase()).filter((match) => match.length > 0)
+  );
+}
+
+function view_node_type(value: XVibeJsonObject): string | undefined {
+  return typeof value._type === "string" && value._type.trim().length > 0
+    ? value._type.trim()
+    : undefined;
+}
+
+function view_node_id(value: XVibeJsonObject): string | undefined {
+  return typeof value._id === "string" && value._id.trim().length > 0
+    ? value._id.trim()
+    : undefined;
+}
+
+function stable_id_prefix(type: string): string {
+  const prefix =
+    type
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+  return prefix.length > 0 ? prefix : "node";
+}
+
+function escape_regexp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function visit_view_objects(
+  value: unknown,
+  visitor: (node: XVibeJsonObject, type: string | undefined) => void,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      visit_view_objects(item, visitor);
+    }
+    return;
+  }
+
+  if (!is_plain_object(value)) return;
+
+  const type = view_node_type(value);
+  visitor(value, type);
+
+  for (const child of Object.values(value)) {
+    if (is_plain_object(child) || Array.isArray(child)) {
+      visit_view_objects(child, visitor);
+    }
+  }
+}
+
+export function ensure_view_ids(view: unknown): VibeEnsureViewIdsResult {
+  const used_ids = new Set<string>();
+  const counters = new Map<string, number>();
+
+  visit_view_objects(view, (node, type) => {
+    const id = view_node_id(node);
+    if (!id) return;
+
+    used_ids.add(id);
+    if (!type) return;
+
+    const prefix = stable_id_prefix(type);
+    const match = new RegExp(`^${escape_regexp(prefix)}-(\\d+)$`).exec(id);
+    if (match) {
+      counters.set(prefix, Math.max(counters.get(prefix) ?? 0, Number(match[1])));
+    }
+  });
+
+  let count = 0;
+
+  visit_view_objects(view, (node, type) => {
+    if (!type) return;
+    if (view_node_id(node)) return;
+
+    const prefix = stable_id_prefix(type);
+    let next_counter = (counters.get(prefix) ?? 0) + 1;
+    let next_id = `${prefix}-${next_counter}`;
+
+    while (used_ids.has(next_id)) {
+      next_counter += 1;
+      next_id = `${prefix}-${next_counter}`;
+    }
+
+    counters.set(prefix, next_counter);
+    used_ids.add(next_id);
+    node._id = next_id;
+    count += 1;
+  });
+
+  return { _count: count };
 }
 
 export class VibeViewBuilder {
@@ -126,6 +233,7 @@ export class VibeViewBuilder {
     }
 
     view._children = children;
+    ensure_view_ids(view);
 
     return view;
   }

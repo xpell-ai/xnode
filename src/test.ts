@@ -1,10 +1,17 @@
 import assert from "assert";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
-import { _x } from "@xpell/core";
+import { _x, _xlog } from "@xpell/core";
 import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
+import { XDB, XDBStorageFS } from "./XDB/index.js";
+import { XEntityManager } from "./XEntityManager/XEntityManager.js";
+import { ServerXVMModule } from "./XVM/ServerXVMModule.js";
 import {
   build_generated_module_implementation_prompt,
+  infer_xvibe_artifact_action_plan,
+  infer_xvibe_artifact_plan,
+  infer_xvibe_artifact_type,
   XVibeModule,
   prompt_allows_view_flow_triggers,
   strip_unrequested_flow_triggers,
@@ -15,8 +22,13 @@ import {
   rankSkillsForPrompt,
   VibePromptBuilder,
 } from "./XVIBE/VibePromptBuilder.js";
+import { ensure_view_ids } from "./XVIBE/VibeViewBuilder.js";
 import type { XVibeViewArtifact } from "./XVIBE/VibeOutputParser.js";
-import { VibeIntentPlanner } from "./XVIBE/VibeIntentPlanner.js";
+import {
+  extract_module_operation_matches_from_prompt,
+  VibeIntentPlanner,
+} from "./XVIBE/VibeIntentPlanner.js";
+import { VibeBehaviorPlanner } from "./XVIBE/VibeBehaviorPlanner.js";
 import { XMutator } from "./XMutator/XMutator.js";
 
 type ValidateGeneratedArtifact = (input: {
@@ -36,7 +48,210 @@ function strip_when_prompt_disallows_flow(prompt: string, view: XVibeViewArtifac
   return strip_unrequested_flow_triggers(view);
 }
 
+function collect_missing_xui_node_ids(value: unknown, path = "_view", missing: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      collect_missing_xui_node_ids(item, `${path}[${index}]`, missing);
+    });
+    return missing;
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return missing;
+  }
+
+  const node = value as Record<string, unknown>;
+  if (typeof node._type === "string" && node._type.trim().length > 0) {
+    if (typeof node._id !== "string" || node._id.trim().length === 0) {
+      missing.push(path);
+    }
+  }
+
+  for (const [key, child] of Object.entries(node)) {
+    if (child && typeof child === "object") {
+      collect_missing_xui_node_ids(child, `${path}.${key}`, missing);
+    }
+  }
+
+  return missing;
+}
+
 const xmutator = new XMutator();
+const behavior_planner = new VibeBehaviorPlanner();
+const behavior_runtime_assets = {
+  _views: [],
+  _flows: [],
+  _entities: [
+    { _id: "aime-user" },
+    { _id: "xai-routing-rule" },
+    { _id: "xai-api-key" },
+  ],
+  _modules: [],
+};
+
+const create_user_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: "Create flow named create-aime-account-user",
+  _artifact_intent: {
+    _action: "create",
+    _target: "flow",
+    _target_id: "create-aime-account-user",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: behavior_runtime_assets,
+});
+assert.equal(create_user_behavior._flow_goal, "create-user");
+assert.equal(create_user_behavior._entity, "aime-user");
+assert.equal(create_user_behavior._crud, "add");
+assert.equal(create_user_behavior._confidence, 0.9);
+
+const get_rules_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: "Create flow named get-routing-rules",
+  _artifact_intent: {
+    _action: "create",
+    _target: "flow",
+    _target_id: "get-routing-rules",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: behavior_runtime_assets,
+});
+assert.equal(get_rules_behavior._flow_goal, "load-routing-rules");
+assert.equal(get_rules_behavior._entity, "xai-routing-rule");
+assert.equal(get_rules_behavior._crud, "find");
+
+const update_key_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: "Create flow named update-api-key",
+  _artifact_intent: {
+    _action: "create",
+    _target: "flow",
+    _target_id: "update-api-key",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: behavior_runtime_assets,
+});
+assert.equal(update_key_behavior._flow_goal, "update-api-key");
+assert.equal(update_key_behavior._entity, "xai-api-key");
+assert.equal(update_key_behavior._crud, "update");
+
+const view_update_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: 'Update view "main"\nChange only design',
+  _artifact_type: "view",
+  _artifact_action_plan: {
+    _artifact_type: "view",
+    _action: "update",
+    _target_id: "main",
+  },
+  _artifact_intent: {
+    _action: "update",
+    _target: "view",
+    _target_id: "main",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _intent_plan: {
+    _artifact_types: ["view"],
+    _entities: [{ _id: "accounts", _fields: [] }],
+    _actions: [
+      {
+        _id: "refresh-ccounts",
+        _type: "flow",
+        _label: "Refresh",
+        _entity: "ccounts",
+      },
+    ],
+    _crud_ops: ["update"],
+    _flow_keywords: ["refresh-ccounts", "add-ccount", "update-ccount"],
+    _entity_keywords: ["accounts", "ccounts"],
+  } as any,
+  _runtime_assets: {
+    _views: [{ _id: "main" }],
+    _flows: [{ _id: "refresh-accounts" }],
+    _entities: [{ _id: "accounts" }, { _id: "ccounts" }],
+    _modules: [],
+  },
+});
+assert.equal(view_update_behavior._behavior_type, "ui");
+assert.equal(view_update_behavior._crud, undefined);
+assert.deepEqual(view_update_behavior._entity_targets, []);
+assert.deepEqual(view_update_behavior._flow_targets, []);
+assert.deepEqual(view_update_behavior._steps, []);
+
+const create_account_button_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: "Create Account button",
+  _artifact_type: "view",
+  _artifact_intent: {
+    _action: "update",
+    _target: "view",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: {
+    _views: [{ _id: "main" }],
+    _flows: [],
+    _entities: [{ _id: "account" }, { _id: "accounts" }, { _id: "ccounts" }],
+    _modules: [],
+  },
+});
+assert.equal(create_account_button_behavior._crud, undefined);
+assert.deepEqual(create_account_button_behavior._entity_targets, []);
+assert.equal(create_account_button_behavior._entity, undefined);
+
+const create_entity_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: "Create entity named customer",
+  _artifact_type: "entity",
+  _artifact_intent: {
+    _action: "create",
+    _target: "entity",
+    _target_id: "customer",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: {
+    _views: [],
+    _flows: [],
+    _entities: [],
+    _modules: [],
+  },
+});
+assert.equal(create_entity_behavior._crud, "add");
+assert.equal(create_entity_behavior._entity, "customer");
+assert.deepEqual(create_entity_behavior._entity_targets, ["customer"]);
+
+const new_view_behavior = behavior_planner.infer_behavior_intent({
+  _prompt: 'Create new view "ai-key"',
+  _artifact_type: "view",
+  _artifact_action_plan: {
+    _artifact_type: "view",
+    _action: "create",
+    _target_id: "ai-key",
+  },
+  _artifact_intent: {
+    _action: "create",
+    _target: "view",
+    _target_id: "ai-key",
+    _forbidden_targets: [],
+    _confidence: 0.9,
+    _reason: "test",
+  },
+  _runtime_assets: {
+    _views: [{ _id: "main" }],
+    _flows: [],
+    _entities: [{ _id: "accounts" }],
+    _modules: [],
+  },
+});
+assert.equal(new_view_behavior._behavior_type, "ui");
+assert.equal(new_view_behavior._crud, undefined);
+assert.deepEqual(new_view_behavior._entity_targets, []);
+assert.deepEqual(new_view_behavior._flow_targets, []);
 
 const label_replace_view = {
   _id: "view",
@@ -299,10 +514,322 @@ const explicit_flow_view: XVibeViewArtifact = {
 };
 
 assert.equal(prompt_allows_view_flow_triggers(explicit_flow_prompt), true);
+assert.equal(
+  prompt_allows_view_flow_triggers("On click, run a flow named create-aime-account-user"),
+  true,
+);
 assert.equal(strip_when_prompt_disallows_flow(explicit_flow_prompt, explicit_flow_view), 0);
 assert.deepEqual((explicit_flow_view._children?.[0] as any)._flow, {
   _id: "flow-save-customer",
 });
+
+assert.equal(infer_xvibe_artifact_type("Update main view"), "view");
+assert.equal(infer_xvibe_artifact_type("Replace login button with create account"), "view");
+assert.equal(infer_xvibe_artifact_type("Add email field to login screen"), "view");
+assert.equal(infer_xvibe_artifact_type("Modify current page"), "view");
+assert.equal(infer_xvibe_artifact_type("Keep current layout and add password field"), "view");
+assert.equal(infer_xvibe_artifact_type("Change the button text"), "view");
+assert.equal(
+  infer_xvibe_artifact_type(`Update main view.
+Keep it as a simple onboarding/login screen.
+Add fields:
+- account_name
+- name
+- email
+- password
+Replace the Login button with a Create Account button.
+On click, run a flow named create-aime-account-user.
+Do not add API key creation yet.`),
+  "view",
+);
+assert.equal(infer_xvibe_artifact_type("Create entity users"), "entity");
+assert.equal(infer_xvibe_artifact_type("Create schema for accounts"), "entity");
+assert.equal(infer_xvibe_artifact_type("Add fields to entity user"), "entity");
+assert.equal(infer_xvibe_artifact_type("Generate database schema"), "entity");
+assert.equal(infer_xvibe_artifact_type("Add fields: name, email, password"), "view");
+assert.equal(infer_xvibe_artifact_type("add fields account_name email to entity users"), "entity");
+assert.equal(infer_xvibe_artifact_type("update main view add fields account_name email"), "view");
+const entity_fields_plan = infer_xvibe_artifact_plan("add fields account_name email to entity users");
+assert.equal(entity_fields_plan._primary_artifact_type, "entity");
+assert.deepEqual(entity_fields_plan._artifact_types, ["entity"]);
+assert.deepEqual(entity_fields_plan._entity_ids, ["users"]);
+assert.equal(entity_fields_plan._intent?._target, "entity");
+
+const main_view_fields_plan = infer_xvibe_artifact_plan("update main view add fields account_name email");
+assert.equal(main_view_fields_plan._primary_artifact_type, "view");
+assert.deepEqual(main_view_fields_plan._artifact_types, ["view"]);
+assert.equal(main_view_fields_plan._intent?._target, "view");
+
+const view_with_flow_plan = infer_xvibe_artifact_plan(
+  "update main view add fields account_name email on click run a flow named create-aime-account-user"
+);
+assert.equal(view_with_flow_plan._primary_artifact_type, "view");
+assert.deepEqual(view_with_flow_plan._artifact_types, ["flow", "view"]);
+assert.deepEqual(view_with_flow_plan._flow_ids, ["create-aime-account-user"]);
+
+const artifact_intent_planner = new VibeIntentPlanner();
+const flow_only_prompt = `Create a flow named create-aime-account-user.
+
+Only create the flow.
+Do not create entities.
+Do not create views.`;
+const flow_only_intent = artifact_intent_planner.infer_artifact_intent(flow_only_prompt);
+assert.equal(flow_only_intent._action, "create");
+assert.equal(flow_only_intent._target, "flow");
+assert.equal(flow_only_intent._target_id, "create-aime-account-user");
+assert.ok(flow_only_intent._forbidden_targets.includes("entity"));
+assert.ok(flow_only_intent._forbidden_targets.includes("view"));
+const flow_only_plan = artifact_intent_planner.build_artifact_plan_from_intent(
+  flow_only_prompt,
+  flow_only_intent,
+);
+assert.equal(flow_only_plan._primary_artifact_type, "flow");
+assert.deepEqual(flow_only_plan._artifact_types, ["flow"]);
+assert.deepEqual(flow_only_plan._flow_ids, ["create-aime-account-user"]);
+
+const create_entity_user_intent = artifact_intent_planner.infer_artifact_intent("Create entity user");
+assert.equal(create_entity_user_intent._action, "create");
+assert.equal(create_entity_user_intent._target, "entity");
+assert.equal(create_entity_user_intent._target_id, "user");
+
+const update_main_view_intent = artifact_intent_planner.infer_artifact_intent("Update main view");
+assert.equal(update_main_view_intent._action, "update");
+assert.equal(update_main_view_intent._target, "view");
+assert.equal(update_main_view_intent._target_id, "main");
+
+const delete_entity_user_intent = artifact_intent_planner.infer_artifact_intent("Delete entity user");
+assert.equal(delete_entity_user_intent._action, "delete");
+assert.equal(delete_entity_user_intent._target, "entity");
+assert.equal(delete_entity_user_intent._target_id, "user");
+
+const create_module_calc_intent = artifact_intent_planner.infer_artifact_intent("Create module calc");
+assert.equal(create_module_calc_intent._action, "create");
+assert.equal(create_module_calc_intent._target, "module");
+assert.equal(create_module_calc_intent._target_id, "calc");
+
+const create_flow_execution_intent =
+  artifact_intent_planner.infer_artifact_intent("Create flow named create-user");
+const create_flow_execution_plan =
+  artifact_intent_planner.build_artifact_plan_from_intent(
+    "Create flow named create-user",
+    create_flow_execution_intent,
+  );
+assert.deepEqual(create_flow_execution_plan._execution_plan, {
+  _primary_artifact_type: "flow",
+  _artifacts: [
+    {
+      _artifact_type: "flow",
+      _action: "create",
+      _artifact_id: "create-user",
+    },
+  ],
+});
+
+const view_flow_execution_prompt = "Update login page and create flow create-user";
+const view_flow_execution_intent =
+  artifact_intent_planner.infer_artifact_intent(view_flow_execution_prompt);
+const view_flow_execution_plan =
+  artifact_intent_planner.build_artifact_plan_from_intent(
+    view_flow_execution_prompt,
+    view_flow_execution_intent,
+  );
+assert.deepEqual(view_flow_execution_plan._execution_plan, {
+  _primary_artifact_type: "view",
+  _artifacts: [
+    {
+      _artifact_type: "flow",
+      _action: "create",
+      _artifact_id: "create-user",
+    },
+    {
+      _artifact_type: "view",
+      _action: "update",
+      _artifact_id: "main",
+      _depends_on: ["create-user"],
+    },
+  ],
+});
+
+const delete_customer_execution_intent =
+  artifact_intent_planner.infer_artifact_intent("Delete entity customer");
+const delete_customer_execution_plan =
+  artifact_intent_planner.build_artifact_plan_from_intent(
+    "Delete entity customer",
+    delete_customer_execution_intent,
+  );
+assert.deepEqual(delete_customer_execution_plan._execution_plan, {
+  _primary_artifact_type: "entity",
+  _artifacts: [
+    {
+      _artifact_type: "entity",
+      _action: "delete",
+      _artifact_id: "customer",
+    },
+  ],
+});
+
+const flow_only_trace_logs: string[] = [];
+const original_trace_log = _xlog.log;
+(_xlog as any).log = (message: string) => {
+  flow_only_trace_logs.push(message);
+};
+try {
+  const flow_only_wrapper_plan = infer_xvibe_artifact_plan(flow_only_prompt);
+  assert.equal(flow_only_wrapper_plan._primary_artifact_type, "flow");
+  assert.equal(flow_only_wrapper_plan._reason, "explicit_only_intent");
+  assert.deepEqual(flow_only_wrapper_plan._artifact_types, ["flow"]);
+  assert.deepEqual(flow_only_wrapper_plan._flow_ids, ["create-aime-account-user"]);
+  assert.ok(flow_only_trace_logs.includes("[xvibe] artifact inference branch"));
+} finally {
+  (_xlog as any).log = original_trace_log;
+}
+
+const named_entity_plan = infer_xvibe_artifact_plan("Create entity named users");
+assert.equal(named_entity_plan._primary_artifact_type, "entity");
+assert.deepEqual(named_entity_plan._artifact_types, ["entity"]);
+assert.deepEqual(named_entity_plan._entity_ids, ["users"]);
+assert.equal(named_entity_plan._reason, "named_artifact_intent");
+
+const delete_entity_plan = infer_xvibe_artifact_plan("Delete entity users") as any;
+assert.equal(delete_entity_plan._primary_artifact_type, "entity");
+assert.deepEqual(delete_entity_plan._artifact_types, ["entity"]);
+assert.deepEqual(delete_entity_plan._entity_ids, ["users"]);
+assert.deepEqual(delete_entity_plan._action_intent, {
+  _action: "delete",
+  _artifact_type: "entity",
+  _artifact_id: "users",
+});
+
+const named_module_plan = infer_xvibe_artifact_plan("Create server module named calc");
+assert.equal(named_module_plan._primary_artifact_type, "module");
+assert.deepEqual(named_module_plan._artifact_types, ["module"]);
+assert.deepEqual(named_module_plan._module_names, ["calc"]);
+assert.equal(named_module_plan._reason, "named_artifact_intent");
+
+const positive_module_ops =
+  extract_module_operation_matches_from_prompt([
+    "Create server module aime-auth.",
+    "Module only.",
+    "Operations:",
+    "- _login",
+    "- _logout",
+  ].join("\n"));
+assert.deepEqual(positive_module_ops._positive_matches, ["login", "logout"]);
+assert.deepEqual(positive_module_ops._negative_matches, []);
+assert.deepEqual(positive_module_ops._module_ops, ["login", "logout"]);
+
+const negative_module_ops =
+  extract_module_operation_matches_from_prompt([
+    "Create server module aime-auth.",
+    "Module only.",
+    "Do not create operation run.",
+    "Do not use operation delete.",
+  ].join("\n"));
+assert.deepEqual(negative_module_ops._positive_matches, []);
+assert.deepEqual(negative_module_ops._negative_matches, ["run", "delete"]);
+assert.deepEqual(negative_module_ops._module_ops, []);
+
+const mixed_module_ops =
+  extract_module_operation_matches_from_prompt([
+    "Create server module aime-auth.",
+    "Module only.",
+    "Operations:",
+    "- _login",
+    "",
+    "Do not create operation run.",
+    "Do not create operation execute.",
+    "Do not create operation process.",
+  ].join("\n"));
+assert.deepEqual(mixed_module_ops._positive_matches, ["login"]);
+assert.deepEqual(mixed_module_ops._negative_matches, ["run", "execute", "process"]);
+assert.deepEqual(mixed_module_ops._module_ops, ["login"]);
+
+const update_login_view_plan = infer_xvibe_artifact_plan(`Update main view.
+Replace Login button.`);
+assert.equal(update_login_view_plan._primary_artifact_type, "view");
+
+const update_view_plan = infer_xvibe_artifact_plan(
+  "Update main view. Add fields account_name, name, email, password."
+);
+assert.equal(update_view_plan._primary_artifact_type, "view");
+assert.equal(update_view_plan._intent?._target, "view");
+
+const create_entity_plan = infer_xvibe_artifact_plan(
+  "Create entity aime-user with fields name email password."
+);
+assert.equal(create_entity_plan._primary_artifact_type, "entity");
+assert.deepEqual(create_entity_plan._entity_ids, ["aime-user"]);
+
+const delete_entity_intent =
+  artifact_intent_planner.infer_artifact_intent('Delete entity "test-entity"');
+assert.equal(delete_entity_intent._action, "delete");
+assert.equal(delete_entity_intent._target, "entity");
+assert.equal(delete_entity_intent._target_id, "test-entity");
+
+const login_page_plan = infer_xvibe_artifact_plan(
+  "Create login page with account_name, name, email, password."
+);
+assert.equal(login_page_plan._primary_artifact_type, "view");
+
+const flow_and_view_plan = infer_xvibe_artifact_plan(
+  "Create a flow named create-aime-account-user and then update main view to run it on click."
+);
+assert.notEqual(flow_and_view_plan._primary_artifact_type, "entity");
+assert.equal(flow_and_view_plan._primary_artifact_type, "flow");
+assert.ok(flow_and_view_plan._artifact_types.includes("flow"));
+assert.deepEqual(flow_and_view_plan._flow_ids, ["create-aime-account-user"]);
+assert.deepEqual(
+  infer_xvibe_artifact_action_plan("delete entity onboarding_login"),
+  {
+    _artifact_type: "entity",
+    _action: "delete",
+    _target_id: "onboarding_login",
+    _requires_confirmation: true,
+  },
+);
+assert.deepEqual(infer_xvibe_artifact_action_plan('delete entity "test-entity"'), {
+  _artifact_type: "entity",
+  _action: "delete",
+  _target_id: "test-entity",
+  _requires_confirmation: true,
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("remove flow create-user"), {
+  _artifact_type: "flow",
+  _action: "delete",
+  _target_id: "create-user",
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("disable module calc"), {
+  _artifact_type: "module",
+  _action: "disable",
+  _target_id: "calc",
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("archive entity users"), {
+  _artifact_type: "entity",
+  _action: "archive",
+  _target_id: "users",
+  _requires_confirmation: true,
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("rename flow create-user to create-account-user"), {
+  _artifact_type: "flow",
+  _action: "rename",
+  _target_id: "create-user",
+  _new_id: "create-account-user",
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("rename entity users to accounts"), {
+  _artifact_type: "entity",
+  _action: "rename",
+  _target_id: "users",
+  _new_id: "accounts",
+  _requires_confirmation: true,
+});
+assert.deepEqual(infer_xvibe_artifact_action_plan("Delete the entity named test-sync."), {
+  _artifact_type: "entity",
+  _action: "delete",
+  _target_id: "test-sync",
+  _requires_confirmation: true,
+});
+assert.equal(infer_xvibe_artifact_action_plan("Create entity users"), undefined);
+assert.equal(infer_xvibe_artifact_action_plan("Update main view"), undefined);
 
 const runtime_skills = {
   _modules: [
@@ -317,6 +844,267 @@ const runtime_skills = {
 };
 
 const xvibe = new XVibeModule();
+const generated_id_view: any = {
+  _type: "view",
+  _children: [
+    {
+      _type: "label",
+      _text: "Hello",
+    },
+    {
+      _type: "button",
+      _text: "Click",
+    },
+  ],
+};
+const generated_id_result = ensure_view_ids(generated_id_view);
+assert.equal(generated_id_result._count, 3);
+assert.equal(generated_id_view._id, "view-1");
+assert.equal(generated_id_view._children[0]._id, "label-1");
+assert.equal(generated_id_view._children[1]._id, "button-1");
+const generated_id_targets = (xvibe as any).collect_view_target_ids(generated_id_view);
+assert.ok(generated_id_targets.includes("label-1"));
+
+const artifact_action_generate_result = await xvibe._generate({
+  _params: {
+    _prompt: "delete entity onboarding_login",
+  },
+} as any);
+assert.deepEqual(artifact_action_generate_result, {
+  _ok: true,
+  _artifact_action: {
+    _artifact_type: "entity",
+    _action: "delete",
+    _target_id: "onboarding_login",
+    _requires_confirmation: true,
+  },
+});
+
+const unsupported_action_execute_calls: any[] = [];
+const original_execute_for_unsupported_action = (_x as any).execute;
+try {
+  (_x as any).execute = async (command: any) => {
+    unsupported_action_execute_calls.push(command);
+    throw new Error(`Unsupported action test should not execute commands: ${JSON.stringify(command)}`);
+  };
+
+  const unsupported_artifact_action_generate_result = await xvibe._generate({
+    _params: {
+      _prompt: "Delete the entity named test-sync.",
+      _app_id: "test-app",
+    },
+  } as any);
+  assert.deepEqual(unsupported_artifact_action_generate_result, {
+    _ok: false,
+    _error: {
+      _code: "E_XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED",
+      _message: "Artifact action 'delete' is not supported from Vibe prompts yet.",
+      _action: "delete",
+      _artifact_type: "entity",
+      _artifact_id: "test-sync",
+    },
+  });
+} finally {
+  (_x as any).execute = original_execute_for_unsupported_action;
+}
+assert.equal(
+  unsupported_action_execute_calls.some(
+    (command) => command?._module === "server-xvm" && command?._op === "delete_entity",
+  ),
+  false,
+);
+assert.equal(
+  unsupported_action_execute_calls.some(
+    (command) => command?._module === "entity-manager" && command?._op === "unregister",
+  ),
+  false,
+);
+
+const view_design_lock_prompt = 'Update view "main". Change only the design. Keep existing behavior.';
+const view_design_intent = (xvibe as any).intent_planner.infer_artifact_intent(view_design_lock_prompt);
+assert.equal(view_design_intent._action, "update");
+assert.equal(view_design_intent._target, "view");
+assert.equal(view_design_intent._target_id, "main");
+const view_design_lock = (xvibe as any).create_artifact_scope_lock(view_design_intent);
+let view_design_plan = (xvibe as any).create_artifact_intent_plan({
+  prompt: view_design_lock_prompt,
+  artifact_type: "view",
+  supplied_intent_plan: {},
+  runtime_skills,
+});
+view_design_plan = (xvibe as any).apply_artifact_scope_lock_to_intent_plan(
+  view_design_lock,
+  view_design_plan,
+);
+assert.equal(view_design_lock._artifact_type, "view");
+assert.equal(view_design_lock._action, "update");
+assert.equal(view_design_lock._target_id, "main");
+assert.deepEqual(view_design_plan._artifact_types, ["view"]);
+assert.equal(view_design_plan._intent_type, "view-design");
+assert.deepEqual(view_design_plan._entities, []);
+assert.deepEqual(view_design_plan._actions, []);
+assert.deepEqual(view_design_plan._bindings, []);
+assert.deepEqual(view_design_plan._crud_ops, []);
+assert.deepEqual(view_design_plan._flow_keywords, []);
+assert.deepEqual(view_design_plan._entity_keywords, []);
+assert.equal(view_design_plan._requires_module, false);
+assert.equal(view_design_plan._module_target, null);
+assert.equal(view_design_plan._module_name, "");
+assert.deepEqual(view_design_plan._module_ops, []);
+
+const button_design_prompt = "Make the Create Account button nicer.";
+const button_design_intent = (xvibe as any).intent_planner.infer_artifact_intent(button_design_prompt);
+assert.equal(button_design_intent._target, "view");
+assert.equal(button_design_intent._action, "update");
+const button_design_lock = (xvibe as any).create_artifact_scope_lock(button_design_intent);
+let button_design_plan = (xvibe as any).create_artifact_intent_plan({
+  prompt: button_design_prompt,
+  artifact_type: "view",
+  supplied_intent_plan: {},
+  runtime_skills,
+});
+button_design_plan = (xvibe as any).apply_artifact_scope_lock_to_intent_plan(
+  button_design_lock,
+  button_design_plan,
+);
+assert.equal(button_design_plan._intent_type, "view-design");
+assert.deepEqual(button_design_plan._entities, []);
+assert.equal(
+  button_design_plan._entity_keywords.some((keyword: string) =>
+    keyword === "account" ||
+    keyword === "accounts" ||
+    keyword === "ccounts"
+  ),
+  false,
+);
+
+async function run_locked_new_view_prompt(prompt: string) {
+  const calls: any[] = [];
+  const pushed_views: any[] = [];
+  const original_execute_for_scope_lock = (_x as any).execute;
+  const original_get_skills_for_scope_lock = (_x as any).getSkills;
+  try {
+    (xvibe as any).latest_runtime_skills = runtime_skills;
+    (_x as any).getSkills = () => runtime_skills;
+    (_x as any).execute = async (command: any) => {
+      calls.push(command);
+
+      if (command?._module === "server-xvm" && command?._op === "get_app") {
+        return {
+          _ok: true,
+          _result: {
+            _app: {
+              _app_id: command._params?._app_id,
+              _env: command._params?._env ?? "default",
+              _meta: {
+                _entry_view_id: "main",
+              },
+            },
+            _view_ids: ["main"],
+            _flow_ids: [],
+            _entity_ids: [],
+            _entities: {},
+          },
+        };
+      }
+
+      if (command?._module === "xai" && command?._op === "generate") {
+        return {
+          _ok: true,
+          _result: {
+            _text: JSON.stringify({
+              _artifact_type: "view",
+              _contract_version: 1,
+              _view: {
+                _id: "main",
+                _type: "view",
+                _children: [
+                  {
+                    _id: "back",
+                    _type: "button",
+                    _text: "Back",
+                  },
+                ],
+              },
+            }),
+          },
+        };
+      }
+
+      if (command?._module === "server-xvm" && command?._op === "push_update") {
+        pushed_views.push(command._params?._view);
+        return {
+          _ok: true,
+          _result: {
+            _version: 2,
+          },
+        };
+      }
+
+      throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+    };
+
+    const result = await xvibe._generate({
+      _params: {
+        _prompt: prompt,
+        _app_id: "scope-lock-app",
+        _env: "test",
+      },
+    } as any) as any;
+
+    return { result, calls, pushed_views };
+  } finally {
+    (_x as any).execute = original_execute_for_scope_lock;
+    (_x as any).getSkills = original_get_skills_for_scope_lock;
+  }
+}
+
+const new_view_scope_result = await run_locked_new_view_prompt(
+  'Create new view "ai-key" with title "Xpell AI Key" and back button.',
+);
+assert.equal(new_view_scope_result.result._ok, true);
+assert.equal(new_view_scope_result.result._result._view_id, "ai-key");
+assert.equal(new_view_scope_result.pushed_views.length, 1);
+assert.equal(new_view_scope_result.pushed_views[0]._id, "ai-key");
+assert.equal(
+  new_view_scope_result.pushed_views.some((view) => view?._id === "main"),
+  false,
+);
+assert.equal(
+  new_view_scope_result.calls.some(
+    (command) => command?._module === "server-xvm" && command?._op === "set_entity",
+  ),
+  false,
+);
+
+const new_view_negative_constraint_result = await run_locked_new_view_prompt(
+  'Create new view "ai-key" with title "Xpell AI Key" and back button. Do not delete main view.',
+);
+assert.equal(new_view_negative_constraint_result.result._ok, true);
+assert.notEqual(
+  new_view_negative_constraint_result.result._error?._code,
+  "E_XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED",
+);
+assert.equal(new_view_negative_constraint_result.result._result._view_id, "ai-key");
+assert.equal(new_view_negative_constraint_result.pushed_views.length, 1);
+assert.equal(new_view_negative_constraint_result.pushed_views[0]._id, "ai-key");
+assert.equal(
+  new_view_negative_constraint_result.pushed_views.some((view) => view?._id === "main"),
+  false,
+);
+assert.equal(
+  new_view_negative_constraint_result.calls.some(
+    (command) => command?._module === "server-xvm" && command?._op === "delete_entity",
+  ),
+  false,
+);
+assert.equal(
+  new_view_negative_constraint_result.calls.some(
+    (command) => command?._module === "entity-manager" && command?._op === "unregister",
+  ),
+  false,
+);
+
 const validate_generated_artifact =
   (xvibe as unknown as { validate_generated_artifact: ValidateGeneratedArtifact })
     .validate_generated_artifact
@@ -456,6 +1244,99 @@ for (const invalid_view of invalid_event_handler_views) {
   });
   assert.equal(invalid_validation._ok, false);
 }
+
+const prompt_builder_empty_selection = {
+  skill_ids: [],
+  skills: [],
+  diagnostics: [],
+};
+
+const account_creation_flow_prompt = new VibePromptBuilder().build({
+  prompt: "Create a flow named create-aime-account-user",
+  _mode: "full",
+  _artifact_type: "flow",
+  selection: prompt_builder_empty_selection,
+  runtime_context: {
+    _behavior_intent: {
+      _behavior: "account_creation",
+      _crud_intent: "add",
+      _entity_targets: ["aime-user"],
+      _flow_targets: ["create-aime-account-user"],
+    },
+  },
+});
+assert.ok(account_creation_flow_prompt.includes("BEHAVIOR INTENT INSTRUCTIONS:"));
+assert.ok(account_creation_flow_prompt.includes("Generate at least one concrete step"));
+assert.ok(account_creation_flow_prompt.includes('Prefer module "entity-manager" for server-side flow CRUD'));
+assert.ok(account_creation_flow_prompt.includes("For add/create operations, put submitted record values in _params._data."));
+assert.ok(account_creation_flow_prompt.includes("For find/get operations, put query criteria in _params._filter."));
+assert.ok(account_creation_flow_prompt.includes("For update operations, put match criteria in _params._filter and changed values in _params._updates."));
+assert.ok(account_creation_flow_prompt.includes("Do not use nested _command inside flow steps."));
+assert.equal(account_creation_flow_prompt.includes("_behavior_intent"), false);
+
+const account_user_creation_flow_prompt = new VibePromptBuilder().build({
+  prompt: "Create a flow named create-aime-account-user",
+  _mode: "full",
+  _artifact_type: "flow",
+  selection: prompt_builder_empty_selection,
+  runtime_context: {
+    _behavior_intent: {
+      _behavior: "account-user-creation",
+    },
+  },
+});
+assert.ok(account_user_creation_flow_prompt.includes("Generate at least one concrete step"));
+
+const generated_flow_view_prompt = new VibePromptBuilder().build({
+  prompt: "Update main view and wire the create account button",
+  _mode: "full",
+  _artifact_type: "view",
+  selection: prompt_builder_empty_selection,
+  runtime_context: {
+    _behavior_intent: {
+      _behavior: "account_creation",
+    },
+    _generated_artifacts: {
+      _flows: [
+        {
+          _artifact_id: "create-aime-account-user",
+        },
+      ],
+    },
+  },
+});
+assert.ok(generated_flow_view_prompt.includes('Buttons may wire only these available flow ids with _flow: { "_id": "<flow-id>" }.'));
+assert.ok(generated_flow_view_prompt.includes("Allowed flow ids for _flow wiring: create-aime-account-user."));
+assert.ok(generated_flow_view_prompt.includes("Never invent flow ids."));
+
+const no_flow_view_prompt = new VibePromptBuilder().build({
+  prompt: "Update main view and keep the button visual",
+  _mode: "full",
+  _artifact_type: "view",
+  selection: prompt_builder_empty_selection,
+  runtime_context: {
+    _behavior_intent: {
+      _behavior: "account_creation",
+    },
+  },
+});
+assert.ok(no_flow_view_prompt.includes("Do not add _flow from behavior intent; no explicit or planned flow id is available."));
+
+const unknown_behavior_flow_prompt = new VibePromptBuilder().build({
+  prompt: "Create a flow named ping-status",
+  _mode: "full",
+  _artifact_type: "flow",
+  selection: prompt_builder_empty_selection,
+  runtime_context: {
+    _behavior_intent: {
+      _behavior: "unknown",
+    },
+  },
+});
+assert.equal(unknown_behavior_flow_prompt.includes("BEHAVIOR INTENT INSTRUCTIONS:"), false);
+assert.equal(unknown_behavior_flow_prompt.includes("Generate at least one concrete step"), false);
+assert.equal(unknown_behavior_flow_prompt.includes("Prefer module \"entity-manager\" for server-side flow CRUD"), false);
+assert.equal(unknown_behavior_flow_prompt.includes("account/user creation schemas"), false);
 
 const refine_prompt = new VibePromptBuilder().build({
   prompt: plain_buttons_prompt,
@@ -809,6 +1690,57 @@ assert.ok(exact_context_rank[0].reasons.includes("current-view-type"));
 
 const intent_planner = new VibeIntentPlanner();
 const empty_capabilities = intent_planner.empty_runtime_capabilities();
+
+const server_module_intent = intent_planner.infer_intent_plan(
+  "Create server module aime-auth",
+  {},
+  empty_capabilities,
+);
+assert.equal(server_module_intent._intent_type, "module");
+assert.deepEqual(server_module_intent._artifact_types, ["module"]);
+assert.deepEqual(server_module_intent._entities, []);
+assert.deepEqual(server_module_intent._actions, []);
+assert.deepEqual(server_module_intent._bindings, []);
+assert.deepEqual(server_module_intent._crud_ops, []);
+assert.deepEqual(server_module_intent._flow_keywords, []);
+assert.deepEqual(server_module_intent._entity_keywords, []);
+assert.equal(server_module_intent._requires_module, true);
+assert.equal(server_module_intent._module_target, "server");
+assert.equal(server_module_intent._module_name, "aime-auth");
+
+const server_module_login_intent = intent_planner.infer_intent_plan(
+  "Create server module aime-auth. Operations: - _login",
+  {},
+  empty_capabilities,
+);
+assert.equal(server_module_login_intent._intent_type, "module");
+assert.deepEqual(server_module_login_intent._entities, []);
+assert.deepEqual(server_module_login_intent._actions, []);
+assert.deepEqual(server_module_login_intent._module_ops, ["login"]);
+
+const server_module_evaluate_intent = intent_planner.infer_intent_plan(
+  "Create server module calc. Operations: - evaluate",
+  {},
+  empty_capabilities,
+);
+assert.equal(server_module_evaluate_intent._intent_type, "module");
+assert.equal(server_module_evaluate_intent._module_name, "calc");
+assert.deepEqual(server_module_evaluate_intent._entities, []);
+assert.deepEqual(server_module_evaluate_intent._actions, []);
+assert.deepEqual(server_module_evaluate_intent._module_ops, ["evaluate"]);
+
+const module_only_intent = intent_planner.infer_intent_plan(
+  "Module only",
+  {},
+  empty_capabilities,
+);
+assert.equal(module_only_intent._intent_type, "module");
+assert.notEqual(module_only_intent._intent_type, "crud-app");
+assert.deepEqual(module_only_intent._entities, []);
+assert.deepEqual(module_only_intent._actions, []);
+assert.deepEqual(module_only_intent._crud_ops, []);
+assert.deepEqual(module_only_intent._flow_keywords, []);
+assert.deepEqual(module_only_intent._entity_keywords, []);
 
 const calculator_intent_missing = intent_planner.infer_intent_plan(
   "Create a calculator where equals calculates the math result",
@@ -1450,6 +2382,64 @@ assert.deepEqual(
 
 const original_execute = (_x as any).execute;
 const original_get_skills = (_x as any).getSkills;
+const original_get_module = (_x as any).getModule;
+
+const missing_id_persist_view = {
+  _type: "view",
+  _children: [
+    {
+      _type: "label",
+      _text: "Hello",
+    },
+    {
+      _type: "button",
+      _text: "Click",
+    },
+  ],
+} as XVibeViewArtifact;
+let persisted_missing_id_view: any;
+try {
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm" && command?._op === "push_update") {
+      persisted_missing_id_view = command._params._view;
+      return {
+        _ok: true,
+        _result: {},
+      };
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const missing_id_persist_result = await (xvibe as any).persist_view_artifact({
+    app_id: "missing-id-app",
+    env: "default",
+    mode: "full",
+    prompt: "Create a simple view",
+    runtime_skills: {
+      _modules: [
+        {
+          _objects: [
+            { _id: "view" },
+            { _id: "label" },
+            { _id: "button" },
+          ],
+        },
+      ],
+    },
+    parsed_view: missing_id_persist_view,
+    include_artifact_type: false,
+  });
+
+  assert.equal(missing_id_persist_result._ok, true);
+  assert.deepEqual(collect_missing_xui_node_ids(persisted_missing_id_view), []);
+  assert.equal(persisted_missing_id_view._id, "view-main");
+  assert.equal(persisted_missing_id_view._children[0]._id, "label-1");
+  assert.equal(persisted_missing_id_view._children[1]._id, "button-1");
+  assert.ok((xvibe as any).collect_view_target_ids(persisted_missing_id_view).includes("label-1"));
+} finally {
+  (_x as any).execute = original_execute;
+}
 
 const generated_module_view: XVibeViewArtifact = {
   _id: "main",
@@ -1730,6 +2720,190 @@ try {
   (_x as any).getSkills = original_get_skills;
 }
 
+async function latest_vibe_run_dir(work_folder: string, app_id: string, env = "test") {
+  const runs_dir =
+    path.join(work_folder, "xvm", "apps", env, app_id, "vibe-runs");
+  const entries = await readdir(runs_dir);
+  assert.ok(entries.length > 0);
+  entries.sort();
+  return path.join(runs_dir, entries[entries.length - 1]);
+}
+
+const module_archive_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-module-archive-"));
+try {
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? { _work_folder: module_archive_work_folder }
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).getSkills = () => ({ _modules: [] });
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "module-creator" && command?._op === "create-module-spec") {
+      return {
+        _ok: true,
+        _result: {
+          _ok: true,
+          _saved: true,
+          _id: command._params._spec._id,
+          _name: command._params._spec._name,
+        },
+      };
+    }
+
+    if (command?._module === "xai" && command?._op === "generate") {
+      return {
+        _ok: true,
+        _text: JSON.stringify({
+          _methods: {
+            _login: "_login(xcmd) { return { _ok: true, _result: { authenticated: true } }; }",
+          },
+        }),
+      };
+    }
+
+    if (command?._module === "module-creator" && command?._op === "implement-generated-module") {
+      return {
+        _ok: true,
+        _implemented_methods: Object.keys(command._params._context._methods),
+        _validation: {
+          _ok: true,
+          _valid: true,
+        },
+      };
+    }
+
+    if (command?._module === "module-creator" && command?._op === "load-generated-module") {
+      return {
+        _ok: true,
+        _result: {
+          _ok: true,
+          _loaded: true,
+          _id: command._params._id,
+        },
+      };
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const module_archive_prompt = [
+    "Create server module aime-auth.",
+    "",
+    "Module only.",
+    "",
+    "Operations:",
+    "- _login",
+    "",
+    "Do not create operation run.",
+    "Do not create operation execute.",
+    "Do not create operation process.",
+  ].join("\n");
+  const module_archive_result = await (xvibe as any).generate_artifact({
+    _prompt: module_archive_prompt,
+    _app_id: "module-archive-app",
+    _env: "test",
+    _generation_id: "module-archive-success",
+  });
+  assert.equal(module_archive_result._ok, true);
+  assert.equal(module_archive_result._result._module_name, "aime-auth");
+  assert.deepEqual(module_archive_result._result._module_ops, ["login"]);
+
+  const run_dir =
+    await latest_vibe_run_dir(module_archive_work_folder, "module-archive-app");
+  const result_json = JSON.parse(
+    await readFile(path.join(run_dir, "result.json"), "utf-8"),
+  );
+  assert.equal(result_json._success, true);
+  assert.equal(result_json._artifact_type, "module");
+  assert.equal(result_json._module_name, "aime-auth");
+  assert.deepEqual(result_json._module_ops, ["login"]);
+  const validation_json = JSON.parse(
+    await readFile(path.join(run_dir, "validation.json"), "utf-8"),
+  );
+  assert.equal(validation_json._implementation_attempts.length, 1);
+  assert.equal(validation_json._implementation_attempts[0]._module_name, "aime-auth");
+  assert.deepEqual(validation_json._implementation_attempts[0]._module_ops, ["login"]);
+  assert.ok(validation_json._implementation_attempts[0]._implementation_prompt.includes("aime-auth"));
+  assert.deepEqual(
+    Object.keys(validation_json._implementation_attempts[0]._parsed_method_sources),
+    ["_login"],
+  );
+  assert.ok((await readFile(path.join(run_dir, "final-prompt.txt"), "utf-8")).includes("aime-auth"));
+  assert.ok((await readFile(path.join(run_dir, "ai-output.json"), "utf-8")).includes("_login"));
+  assert.ok((await readFile(path.join(run_dir, "summary.json"), "utf-8")).includes("module-archive-success"));
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getSkills = original_get_skills;
+  (_x as any).getModule = original_get_module;
+  await rm(module_archive_work_folder, { recursive: true, force: true });
+}
+
+const module_archive_failure_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-module-archive-fail-"));
+try {
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? { _work_folder: module_archive_failure_work_folder }
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).getSkills = () => ({ _modules: [] });
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "module-creator" && command?._op === "create-module-spec") {
+      return {
+        _ok: true,
+        _result: {
+          _ok: true,
+          _saved: true,
+          _id: command._params._spec._id,
+          _name: command._params._spec._name,
+        },
+      };
+    }
+
+    if (command?._module === "xai" && command?._op === "generate") {
+      throw new Error("implementation unavailable");
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const failure_result = await (xvibe as any).generate_artifact({
+    _prompt: [
+      "Create server module aime-auth.",
+      "Module only.",
+      "Operations:",
+      "- _login",
+    ].join("\n"),
+    _app_id: "module-archive-failure-app",
+    _env: "test",
+    _generation_id: "module-archive-failure",
+  });
+  assert.equal(failure_result._ok, false);
+  assert.equal(failure_result._error._module_name, "aime-auth");
+  assert.deepEqual(failure_result._error._module_ops, ["login"]);
+
+  const failure_run_dir =
+    await latest_vibe_run_dir(module_archive_failure_work_folder, "module-archive-failure-app");
+  const failure_result_json = JSON.parse(
+    await readFile(path.join(failure_run_dir, "result.json"), "utf-8"),
+  );
+  assert.equal(failure_result_json._success, false);
+  assert.equal(failure_result_json._artifact_type, "module");
+  assert.equal(failure_result_json._module_name, "aime-auth");
+  assert.deepEqual(failure_result_json._module_ops, ["login"]);
+  assert.equal(failure_result_json._attempts.length, 3);
+  assert.equal(failure_result_json._attempts[0]._rejection_category, "syntax_or_shape_error");
+  assert.ok((await readFile(path.join(failure_run_dir, "timeline.json"), "utf-8")).includes("Module generation failed"));
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getSkills = original_get_skills;
+  (_x as any).getModule = original_get_module;
+  await rm(module_archive_failure_work_folder, { recursive: true, force: true });
+}
+
 const module_creator_calls: string[] = [];
 try {
   (_x as any).execute = async (command: any) => {
@@ -1773,6 +2947,380 @@ try {
 } finally {
   (_x as any).execute = original_execute;
   (_x as any).getSkills = original_get_skills;
+}
+
+const entity_sync_work_folder = await mkdtemp(path.join(tmpdir(), "xvm-entity-sync-"));
+try {
+  XDB.init({
+    storage: new XDBStorageFS({ xdbFolder: path.join(entity_sync_work_folder, "xdb") }),
+    enableCache: false,
+    workFolder: entity_sync_work_folder,
+  });
+
+  await _x.loadModuleAsync(XDB);
+  await _x.loadModuleAsync(new XEntityManager());
+
+  const hash_entity = XDB.create({
+    _type: "xdb-entity",
+    _id: "hash-users",
+    _name: "hash-users",
+    _schema: {
+      _password_hash: {
+        _type: "Hash",
+      },
+      _display_name: {
+        _type: "String",
+      },
+    },
+  }) as any;
+  await hash_entity.waitUntilLoaded();
+
+  const original_password = "initial-secret";
+  const hash_record = await hash_entity.add({
+    _password_hash: original_password,
+    _display_name: "Ada",
+  });
+  assert.notEqual(hash_record._password_hash, original_password);
+  assert.equal(
+    await hash_entity.compareHashField(hash_record._password_hash, original_password),
+    true,
+  );
+
+  const pre_hashed_password = hash_record._password_hash;
+  const pre_hashed_record = await hash_entity.add({
+    _password_hash: pre_hashed_password,
+    _display_name: "Imported",
+  });
+  assert.equal(pre_hashed_record._password_hash, pre_hashed_password);
+
+  const original_hash = hash_record._password_hash;
+  const updated_password = "updated-secret";
+  const hash_update_res = await hash_entity.update(
+    { _id: hash_record._id },
+    { _password_hash: updated_password },
+  );
+  assert.equal(hash_update_res._updated, 1);
+
+  const password_updated_record = hash_entity.findById(hash_record._id);
+  assert.notEqual(password_updated_record._password_hash, original_hash);
+  assert.notEqual(password_updated_record._password_hash, updated_password);
+  assert.equal(
+    await hash_entity.compareHashField(password_updated_record._password_hash, updated_password),
+    true,
+  );
+
+  const existing_bcrypt_hash = password_updated_record._password_hash;
+  await hash_entity.update(
+    { _id: hash_record._id },
+    { _password_hash: existing_bcrypt_hash },
+  );
+
+  const skipped_hash_record = hash_entity.findById(hash_record._id);
+  assert.equal(skipped_hash_record._password_hash, existing_bcrypt_hash);
+
+  await hash_entity.update(
+    { _id: hash_record._id },
+    { _display_name: "Grace" },
+  );
+
+  const non_hash_updated_record = hash_entity.findById(hash_record._id);
+  assert.equal(non_hash_updated_record._display_name, "Grace");
+  assert.equal(non_hash_updated_record._password_hash, existing_bcrypt_hash);
+
+  const contact_entity_v1 = {
+    _id: "contacts",
+    _schema: {
+      _name: {
+        _type: "String",
+        _required: true,
+      },
+    },
+  };
+
+  const contact_register_v1 = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: contact_entity_v1,
+    },
+  });
+  assert.equal(contact_register_v1._ok, true);
+
+  const contact_record = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "contacts",
+      _data: {
+        _name: "Ada",
+      },
+    },
+  });
+  assert.equal(contact_record._ok, true);
+
+  const contact_entity_v2 = {
+    _id: "contacts",
+    _schema: {
+      _name: {
+        _type: "String",
+        _required: true,
+      },
+      _email: {
+        _type: "String",
+      },
+    },
+  };
+
+  const contact_register_v2 = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: contact_entity_v2,
+    },
+  });
+  assert.equal(contact_register_v2._ok, true);
+  assert.equal(contact_register_v2._result._action, "update");
+
+  const contact_schema_after_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "contacts",
+    },
+  });
+  assert.equal(contact_schema_after_update._ok, true);
+  assert.equal(contact_schema_after_update._result.entity._schema._name._type, "String");
+  assert.equal(contact_schema_after_update._result.entity._schema._email._type, "String");
+
+  const contact_records_after_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "contacts",
+      _filter: {},
+    },
+  });
+  assert.equal(contact_records_after_update._result._records._data.length, 1);
+  assert.equal(contact_records_after_update._result._records._data[0]._name, "Ada");
+
+  const contact_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "contacts",
+    },
+  });
+  assert.equal(contact_unregister._ok, true);
+  assert.equal(contact_unregister._result._runtime_unregistered, true);
+
+  const contact_has_after_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "has",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "contacts",
+    },
+  });
+  assert.equal(contact_has_after_unregister._result._exists, false);
+
+  const persisted_contact_records = JSON.parse(
+    await readFile(
+      path.join(entity_sync_work_folder, "xdb", "entities", "contacts", "_data.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(persisted_contact_records.length, 1);
+  assert.equal(persisted_contact_records[0]._name, "Ada");
+
+  const server_xvm = new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+  await _x.loadModuleAsync(server_xvm);
+
+  await _x.execute({
+    _module: "server-xvm",
+    _op: "create_app",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+    },
+  });
+
+  const users_entity_v1 = {
+    _id: "users",
+    _schema: {
+      name: {
+        _type: "String",
+        _required: true,
+      },
+    },
+  };
+
+  const create_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: users_entity_v1,
+    },
+  });
+  assert.equal(create_entity_res._ok, true);
+
+  const has_created_entity = await _x.execute({
+    _module: "entity-manager",
+    _op: "has",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(has_created_entity._result._exists, true);
+
+  const add_record_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "users",
+      _data: {
+        name: "Ada",
+      },
+    },
+  });
+  assert.equal(add_record_res._ok, true);
+  assert.equal(add_record_res._result._record.name, "Ada");
+
+  const users_entity_v2 = {
+    _id: "users",
+    _schema: {
+      name: {
+        _type: "String",
+        _required: true,
+      },
+      email: {
+        _type: "String",
+        _index: {
+          _unique: true,
+        },
+      },
+    },
+  };
+
+  const update_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: users_entity_v2,
+    },
+  });
+  assert.equal(update_entity_res._ok, true);
+
+  const updated_schema_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(updated_schema_res._result.entity._schema.email._type, "String");
+
+  const records_after_schema_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(records_after_schema_update._result._records._data.length, 1);
+  assert.equal(records_after_schema_update._result._records._data[0].name, "Ada");
+
+  await server_xvm.init_on_boot();
+  await server_xvm.init_on_boot();
+
+  const boot_schema_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(boot_schema_res._result.entity._schema.email._type, "String");
+  assert.equal(
+    XDB._engine._xdb_data._entities.filter((entity_name: string) => entity_name === "users").length,
+    1,
+  );
+
+  const delete_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "delete_entity",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "users",
+    },
+  });
+  assert.deepEqual(delete_entity_res._result, {
+    _artifact_type: "entity",
+    _action: "delete",
+    _entity_id: "users",
+    _runtime_unregistered: true,
+  });
+
+  const app_after_delete = await _x.execute({
+    _module: "server-xvm",
+    _op: "get_app",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+    },
+  });
+  assert.deepEqual(app_after_delete._result._entity_ids, []);
+
+  const has_deleted_entity = await _x.execute({
+    _module: "entity-manager",
+    _op: "has",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(has_deleted_entity._result._exists, false);
+  assert.equal(XDB._engine._xdb_data._entities.includes("users"), false);
+
+  const persisted_records = JSON.parse(
+    await readFile(
+      path.join(entity_sync_work_folder, "xdb", "entities", "users", "_data.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(persisted_records.length, 1);
+  assert.equal(persisted_records[0].name, "Ada");
+} finally {
+  await rm(entity_sync_work_folder, { recursive: true, force: true });
 }
 
 console.log("XVibe tests passed");

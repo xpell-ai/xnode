@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { XModule, type XCommand, _xlog, _x, XError } from "@xpell/core";
+import { XModule, type XCommand, _xlog, _x, XError ,type XpellSkill,type XpellSkillCommand} from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 import { _xu } from "../XNUtils/XUtils.js";
 import { wsBroadcastScoped, wsSetScope } from "../Wormholes/wh.index.js";
@@ -82,8 +82,105 @@ function registry_entry_ops(entry: Record<string, any>): string[] {
 
 /* -------------------------------------------------------------------------- */
 
+export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
+  create_app: {
+    _name: "create_app",
+    _scope: "module",
+    _description: "Create application container."
+  },
+
+  get_app: {
+    _name: "get_app",
+    _scope: "module",
+    _description: "Load application bundle."
+  },
+
+  get_view: {
+    _name: "get_view",
+    _scope: "module",
+    _description: "Load view artifact."
+  },
+
+  push_update: {
+    _name: "push_update",
+    _scope: "module",
+    _description: "Persist and broadcast view updates."
+  },
+
+  subscribe: {
+    _name: "subscribe",
+    _scope: "module",
+    _description: "Subscribe runtime client to updates."
+  },
+
+  set_flow: {
+    _name: "set_flow",
+    _scope: "module",
+    _description: "Persist flow artifact."
+  },
+
+  set_entity: {
+    _name: "set_entity",
+    _scope: "module",
+    _description: "Persist entity artifact."
+  },
+
+  delete_entity: {
+    _name: "delete_entity",
+    _scope: "module",
+    _description: "Delete entity artifact and unregister runtime schema."
+  },
+
+  set_active_app: {
+    _name: "set_active_app",
+    _scope: "module",
+    _description: "Set active application."
+  },
+
+  get_active_app: {
+    _name: "get_active_app",
+    _scope: "module",
+    _description: "Get active application."
+  }
+};
+
+export const SERVER_XVM_SKILL: XpellSkill = {
+  _id: "server-xvm",
+  _title: "Server XVM",
+  _version: "1.0.0",
+  _active: true,
+  _type: "server-module-api",
+  _requires: ["xmodule"],
+
+  _description:
+    "Application runtime persistence, view storage, flow storage, entity storage, versioning, subscriptions, and live update broadcasting.",
+
+  _exports: {
+    _modules: [
+      {
+        _name: "server-xvm",
+        _scope: "server",
+        _description:
+          "Runtime application manager.",
+        _ops: Object.values(SERVER_XVM_OPS)
+      }
+    ]
+  },
+
+  _core_rules: [
+    "Views are persisted through push_update.",
+    "Flows are persisted through set_flow.",
+    "Entities are persisted through set_entity.",
+    "Version changes broadcast runtime updates.",
+    "server-xvm is the source of truth for runtime artifacts."
+  ]
+};
+
+
 export class ServerXVMModule extends XModule {
   static _name = "server-xvm";
+  static _skill = SERVER_XVM_SKILL;
+  static _ops = SERVER_XVM_OPS;
 
   private _work_folder: string;
   private _apps_root: string;
@@ -427,6 +524,7 @@ export class ServerXVMModule extends XModule {
 
     const bundle = this.get_bundle(app_id, env);
     this.assert_mutable_bundle(bundle);
+    const action = bundle._entities[entity_id] ? "update" : "create";
 
     const normalized: any = {
       ...entity,
@@ -439,7 +537,7 @@ export class ServerXVMModule extends XModule {
 
     this.persist_bundle(bundle);
 
-    await _x.execute({
+    const sync_response = await _x.execute({
       _module: "entity-manager",
       _op: "register",
       _params: {
@@ -447,6 +545,25 @@ export class ServerXVMModule extends XModule {
         _env: env,
         _entity: normalized
       }
+    });
+
+    if (!sync_response?._ok) {
+      throw new XError("E_XVM_ENTITY_SYNC_FAILED", "Failed to sync entity runtime schema", {
+        _meta: {
+          _app_id: app_id,
+          _env: env,
+          _entity_id: entity_id,
+          _error: sync_response?._result
+        }
+      });
+    }
+
+    _xlog.warn("[xvm/entity-sync] entity schema synced", {
+      _app_id: app_id,
+      _env: env,
+      _entity_id: entity_id,
+      _action: action,
+      _records_migrated: false
     });
 
     return { _ok: true, _result: { _entity_id: entity_id } };
@@ -478,7 +595,7 @@ export class ServerXVMModule extends XModule {
       _xu.to_iso_now();
 
     this.persist_bundle(bundle);
-    await _x.execute({
+    const sync_response = await _x.execute({
       _module: "entity-manager",
       _op: "unregister",
       _params: {
@@ -487,10 +604,37 @@ export class ServerXVMModule extends XModule {
         _entity_id: entity_id
       }
     });
+
+    if (!sync_response?._ok) {
+      throw new XError("E_XVM_ENTITY_SYNC_FAILED", "Failed to unregister entity runtime schema", {
+        _meta: {
+          _app_id: app_id,
+          _env: env,
+          _entity_id: entity_id,
+          _error: sync_response?._result
+        }
+      });
+    }
+
+    _xlog.warn("[xvm/entity-sync] entity runtime unregistered", {
+      _app_id: app_id,
+      _env: env,
+      _entity_id: entity_id
+    });
+
+    _xlog.warn("[xvm/entity-sync] entity schema removed from runtime; records were not deleted", {
+      _app_id: app_id,
+      _env: env,
+      _entity_id: entity_id
+    });
+
     return {
       _ok: true,
       _result: {
-        _entity_id: entity_id
+        _artifact_type: "entity",
+        _action: "delete",
+        _entity_id: entity_id,
+        _runtime_unregistered: true
       }
     };
   }

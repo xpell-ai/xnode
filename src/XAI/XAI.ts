@@ -1,4 +1,4 @@
-import { XModule, type XCommand } from "@xpell/core";
+import { XModule, type XpellSkill, type XpellSkillCommand,type XCommand } from "@xpell/core";
 import { XAIRegistry } from "./XAIRegistry.js";
 import { XAIProvider, type XAIInput } from "./XAIProvider.js";
 
@@ -61,6 +61,103 @@ function as_response_format(
 
   return fallback;
 }
+
+export const XAI_OPS: Record<string, XpellSkillCommand> = {
+  generate: {
+    _name: "generate",
+    _scope: "module",
+    _description:
+      "Generate text or structured output using the configured AI provider.",
+    _params: {
+      _prompt: "Primary user prompt.",
+      system: "Optional system prompt.",
+      context: "Optional contextual data.",
+      _provider: "Optional provider override.",
+      response_format: "Optional response format definition."
+    }
+  },
+
+  generate_object: {
+    _name: "generate_object",
+    _scope: "module",
+    _description:
+      "Generate a structured JSON object.",
+    _params: {
+      _prompt: "Generation prompt.",
+      schema: "Target schema.",
+      _provider: "Optional provider override."
+    }
+  },
+
+  list_providers: {
+    _name: "list_providers",
+    _scope: "module",
+    _description:
+      "Return available AI providers."
+  },
+
+  set_default_provider: {
+    _name: "set_default_provider",
+    _scope: "module",
+    _description:
+      "Set the default AI provider.",
+    _params: {
+      _provider: "Provider id."
+    }
+  }
+};
+
+export const XAI_SKILL: XpellSkill = {
+  _id: "xai",
+  _title: "XAI Runtime Module",
+  _version: "1.0.0",
+  _active: true,
+  _type: "server-module-api",
+  _requires: ["xmodule"],
+
+  _description:
+    "Unified AI provider gateway for text generation, JSON generation, and structured AI workflows.",
+
+  _exports: {
+    _modules: [
+      {
+        _name: "xai",
+        _scope: "server",
+        _description:
+          "AI generation runtime module.",
+        _ops: Object.values(XAI_OPS)
+      }
+    ]
+  },
+
+  _core_rules: [
+    "Use xai.generate for text generation.",
+    "Use response_format for structured outputs.",
+    "Providers may be selected explicitly using _provider.",
+    "Do not expose provider secrets.",
+    "Generated results should be JSON-safe when structured output is requested."
+  ],
+
+  _canonical_examples: [
+    {
+      _module: "xai",
+      _op: "generate",
+      _params: {
+        _prompt: "Create a todo app"
+      }
+    },
+    {
+      _module: "xai",
+      _op: "generate",
+      _params: {
+        _prompt: "Return a JSON object with name and age",
+        response_format: {
+          type: "json_object"
+        }
+      }
+    }
+  ]
+};
 
 export class XAIModule extends XModule {
 

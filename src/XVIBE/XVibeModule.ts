@@ -21,14 +21,20 @@ import {
   type XVibeViewArtifact,
 } from "./VibeOutputParser.js";
 import { _xu } from "../XNUtils/XUtils.js";
-import {
-  infer_artifact_type,
-  VibePromptBuilder,
-} from "./VibePromptBuilder.js";
-import { VibeViewBuilder } from "./VibeViewBuilder.js";
+import { VibePromptBuilder } from "./VibePromptBuilder.js";
+import { ensure_view_ids, VibeViewBuilder } from "./VibeViewBuilder.js";
 import type { VibeArtifactFactoryDiagnostic } from "./VibeArtifactFactory.js";
 
-import type { VibeArtifactType, VibeRequestedArtifactType } from "./XVibeTypes.js";
+import type {
+  XVibeArtifactAction,
+  XVibeArtifactActionPlan,
+  XVibeArtifactExecutionPlan,
+  XVibeArtifactIntent,
+  VibeArtifactType,
+  VibeRequestedArtifactType,
+  XVibeInferredArtifactPlan,
+  XVibeInferredArtifactType,
+} from "./XVibeTypes.js";
 import {
   XVibePlanner,
   type XVibeAppPlan,
@@ -36,9 +42,15 @@ import {
   type XVibeArtifactPlanType,
 } from "./XVibePlanner.js";
 import {
+  extract_explicit_module_id_from_prompt,
+  extract_module_operation_matches_from_prompt,
   VibeIntentPlanner,
   type VibeIntentPlan,
 } from "./VibeIntentPlanner.js";
+import {
+  VibeBehaviorPlanner,
+  type VibeBehaviorIntent,
+} from "./VibeBehaviorPlanner.js";
 
 type VibeAIMode = "full" | "refine";
 const DEFAULT_ENV = "default";
@@ -47,6 +59,7 @@ const DEFAULT_SCAFFOLD_ROOT_TYPE = "view";
 const MAX_VALIDATION_ERRORS = 50;
 const MAX_REPAIR_ERRORS = 20;
 const GENERATED_MODULE_IMPLEMENTATION_MAX_ATTEMPTS = 3;
+const XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED = "E_XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED";
 const BUILTIN_SERVER_MODULES = new Set([
   "xvm",
   "xd",
@@ -129,6 +142,7 @@ type XVibeRunValidationArchive = {
   _repair_attempts?: XVibeJsonObject[];
   _repair_errors?: unknown[];
   _repaired_validation_result?: XVibeArtifactValidationResult;
+  _implementation_attempts?: XVibeJsonObject[];
 };
 
 type XVibeRunArchiveTimelineItem = {
@@ -150,6 +164,7 @@ type XVibeRunArchiveData = {
   _user_prompt?: string;
   _final_prompt?: string;
   _intent_plan?: unknown;
+  _behavior_intent?: unknown;
   _selected_skill_ids?: string[];
   _selected_skills?: unknown;
   _runtime_context?: unknown;
@@ -241,6 +256,15 @@ type XVibeGenerationProgressCallback = (
   message: string,
   details?: Record<string, unknown>,
 ) => void;
+
+type XVibeArtifactScopeLock = {
+  _locked: true;
+  _action: "create" | "update";
+  _artifact_type: "view" | "flow" | "entity" | "module";
+  _target_id?: string;
+  _forbidden_targets?: string[];
+  _reason: "resolver_lock";
+};
 
 class XVibeStructuredError extends Error {
   readonly _payload: XVibeJsonObject;
@@ -362,6 +386,19 @@ function read_optional_string(value: unknown, field_name: string): string | unde
   return value.trim();
 }
 
+function read_optional_generation_id(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value !== "string") {
+    throw new Error("Invalid '_generation_id': expected string");
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
 function read_optional_string_array(value: unknown, field_name: string): string[] {
   if (value === undefined || value === null) return [];
   if (!Array.isArray(value)) {
@@ -399,6 +436,512 @@ function read_artifact_type(value: unknown): VibeRequestedArtifactType | undefin
   }
 
   throw new Error("Invalid '_artifact_type': expected view, flow, entity, command, or auto");
+}
+
+function unique_normalized_ids(ids: string[]): string[] {
+  return Array.from(new Set(
+    ids
+      .map((id) => id.trim().toLowerCase())
+      .filter((id) => id.length > 0),
+  ));
+}
+
+function extract_named_flow_ids(prompt: string): string[] {
+  const ids: string[] = [];
+  ids.push(...(prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? []));
+
+  const named_flow_pattern =
+    /\b(?:run|trigger|call|execute)?\s*(?:a\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu;
+
+  for (const match of prompt.matchAll(named_flow_pattern)) {
+    ids.push(match[1]);
+  }
+
+  return unique_normalized_ids(ids);
+}
+
+function prompt_has_explicit_flow_only_language(prompt: string): boolean {
+  const text = _xu.normalizePrompt(prompt).toLowerCase();
+
+  return (
+    /\bonly\s+create\s+(?:a\s+|the\s+)?flow\b/u.test(text) &&
+    /\bdo\s+not\s+create\s+(?:a\s+|the\s+)?entities\b/u.test(text) &&
+    /\bdo\s+not\s+create\s+(?:a\s+|the\s+)?views\b/u.test(text) &&
+    /\bflow\s+named\s+[a-z][a-z0-9_-]*\b/u.test(text)
+  );
+}
+
+function artifact_inference_branch_for_plan(
+  plan: XVibeInferredArtifactPlan,
+): string {
+  const reason = plan._reason ?? "";
+
+  if (reason === "explicit_requested_artifact_type") return "explicit_requested_artifact_type";
+  if (reason === "requested_view_with_explicit_flow_dependency") return "requested_view_with_explicit_flow_dependency";
+  if (reason.includes("flow_dependency") && plan._primary_artifact_type === "view") return "strong_view_intent_with_explicit_flow_dependency";
+  if (
+    plan._primary_artifact_type === "view" &&
+    (
+      reason === "explicit_view_intent" ||
+      reason === "strong_view_intent"
+    )
+  ) {
+    return "strong_view_intent";
+  }
+  if (plan._primary_artifact_type === "entity") return "explicit_entity_or_persistence_intent";
+  if (plan._primary_artifact_type === "flow") return "flow_intent";
+  if (plan._primary_artifact_type === "module") return "module_intent";
+  if (plan._flow_ids?.length) return "default_view_with_explicit_flow_dependency";
+
+  return "default_view";
+}
+
+function log_artifact_inference_branch(
+  plan: XVibeInferredArtifactPlan,
+): void {
+  _xlog.log("[xvibe] artifact inference branch", {
+    _branch: artifact_inference_branch_for_plan(plan),
+    _reason: plan._reason,
+    _primary_artifact_type: plan._primary_artifact_type,
+    _artifact_types: plan._artifact_types,
+    _flow_ids: plan._flow_ids,
+    _entity_ids: plan._entity_ids,
+  });
+}
+
+function warn_suspicious_entity_override(
+  prompt: string,
+  plan: XVibeInferredArtifactPlan,
+): void {
+  if (
+    plan._primary_artifact_type !== "entity" ||
+    !prompt_has_explicit_flow_only_language(prompt)
+  ) {
+    return;
+  }
+
+  _xlog.warn("[xvibe] artifact inference suspicious entity override", {
+    _prompt: prompt,
+    _flow_ids: plan._flow_ids ?? extract_named_flow_ids(prompt),
+    _reason: plan._reason,
+    _primary_artifact_type: plan._primary_artifact_type,
+    _artifact_types: plan._artifact_types,
+  });
+}
+
+type XVibeArtifactResolverLayer =
+  | "explicit_requested_artifact_type"
+  | "explicit_only_intent"
+  | "named_artifact_intent"
+  | "action_intent"
+  | "fallback_classifier";
+
+type XVibeNamedArtifactIntent = {
+  _artifact_type: XVibeInferredArtifactType;
+  _artifact_id: string;
+};
+
+type XVibeActionArtifactIntent = {
+  _action: XVibeArtifactAction;
+  _artifact_type: XVibeInferredArtifactType;
+  _artifact_id: string;
+};
+
+type XVibeResolvedArtifactPlan = XVibeInferredArtifactPlan & {
+  _action_intent?: XVibeActionArtifactIntent;
+};
+
+function log_intent_layer_resolved(
+  layer: XVibeArtifactResolverLayer,
+  artifact_type: XVibeInferredArtifactType,
+): void {
+  _xlog.log("[xvibe] intent layer resolved", {
+    _layer: layer,
+    _artifact_type: artifact_type,
+  });
+}
+
+function artifact_types_for_primary_artifact(
+  artifact_type: XVibeInferredArtifactType,
+): XVibeInferredArtifactType[] {
+  return [artifact_type];
+}
+
+function create_resolved_artifact_plan(input: {
+  _layer: XVibeArtifactResolverLayer;
+  _primary_artifact_type: XVibeInferredArtifactType;
+  _artifact_id?: string;
+  _flow_ids?: string[];
+  _entity_ids?: string[];
+  _module_names?: string[];
+  _action_intent?: XVibeActionArtifactIntent;
+}): XVibeResolvedArtifactPlan {
+  const plan: XVibeResolvedArtifactPlan = {
+    _primary_artifact_type: input._primary_artifact_type,
+    _artifact_types: artifact_types_for_primary_artifact(input._primary_artifact_type),
+    ...(input._flow_ids?.length ? { _flow_ids: input._flow_ids } : {}),
+    ...(input._entity_ids?.length ? { _entity_ids: input._entity_ids } : {}),
+    ...(input._module_names?.length ? { _module_names: input._module_names } : {}),
+    ...(input._action_intent ? { _action_intent: input._action_intent } : {}),
+    _reason: input._layer,
+  };
+
+  log_intent_layer_resolved(
+    input._layer,
+    input._primary_artifact_type,
+  );
+  log_artifact_inference_branch(plan);
+
+  return plan;
+}
+
+function explicit_requested_artifact_plan(
+  prompt: string,
+  requested_artifact_type?: VibeRequestedArtifactType,
+): XVibeResolvedArtifactPlan | undefined {
+  if (
+    requested_artifact_type !== "view" &&
+    requested_artifact_type !== "flow" &&
+    requested_artifact_type !== "entity" &&
+    requested_artifact_type !== "command"
+  ) {
+    return undefined;
+  }
+
+  const flow_ids = extract_named_flow_ids(prompt);
+  if (requested_artifact_type === "view" && flow_ids.length > 0) {
+    const plan: XVibeResolvedArtifactPlan = {
+      _primary_artifact_type: "view",
+      _artifact_types: ["flow", "view"],
+      _flow_ids: flow_ids,
+      _reason: "requested_view_with_explicit_flow_dependency",
+    };
+    log_intent_layer_resolved("explicit_requested_artifact_type", "view");
+    log_artifact_inference_branch(plan);
+    return plan;
+  }
+
+  return create_resolved_artifact_plan({
+    _layer: "explicit_requested_artifact_type",
+    _primary_artifact_type: requested_artifact_type,
+    ...(requested_artifact_type === "flow" && flow_ids.length > 0
+      ? { _flow_ids: flow_ids }
+      : {}),
+  });
+}
+
+function explicit_only_artifact_type(prompt: string): XVibeInferredArtifactType | undefined {
+  const text = _xu.normalizePrompt(prompt).toLowerCase();
+  const target_words: Array<{
+    _artifact_type: XVibeInferredArtifactType;
+    _words: string[];
+  }> = [
+    { _artifact_type: "flow", _words: ["flow", "flows"] },
+    { _artifact_type: "entity", _words: ["entity", "entities"] },
+    { _artifact_type: "view", _words: ["view", "views"] },
+    { _artifact_type: "module", _words: ["module", "modules"] },
+  ];
+
+  for (const target of target_words) {
+    const word_pattern = target._words.join("|");
+    if (
+      new RegExp(String.raw`\b(?:${word_pattern})\s+only\b`, "u").test(text) ||
+      new RegExp(String.raw`\bonly\s+create\s+(?:a\s+|an\s+|the\s+)?(?:${word_pattern})\b`, "u").test(text)
+    ) {
+      return target._artifact_type;
+    }
+  }
+
+  return undefined;
+}
+
+function explicit_only_artifact_plan(prompt: string): XVibeResolvedArtifactPlan | undefined {
+  const artifact_type = explicit_only_artifact_type(prompt);
+  if (!artifact_type) return undefined;
+
+  const flow_ids = artifact_type === "flow" ? extract_named_flow_ids(prompt) : [];
+  return create_resolved_artifact_plan({
+    _layer: "explicit_only_intent",
+    _primary_artifact_type: artifact_type,
+    ...(flow_ids.length > 0 ? { _flow_ids: flow_ids } : {}),
+  });
+}
+
+function extract_named_artifact_intent(prompt: string): XVibeNamedArtifactIntent | undefined {
+  const named_patterns: Array<{
+    _artifact_type: XVibeInferredArtifactType;
+    _pattern: RegExp;
+  }> = [
+    {
+      _artifact_type: "flow",
+      _pattern: /\bflow\s+(?:named|called|id)\s+["']?([a-z][a-z0-9_-]*)["']?\b/iu,
+    },
+    {
+      _artifact_type: "entity",
+      _pattern: /\bentity\s+(?:named|called|id)\s+["']?([a-z][a-z0-9_-]*)["']?\b/iu,
+    },
+    {
+      _artifact_type: "module",
+      _pattern: /\b(?:server\s+module|client\s+module|xmodule|module)\s+(?:named|called|id)\s+["']?([a-z][a-z0-9_-]*)["']?\b/iu,
+    },
+    {
+      _artifact_type: "view",
+      _pattern: /\bview\s+(?:named|called|id)\s+["']?([a-z][a-z0-9_-]*)["']?\b/iu,
+    },
+  ];
+
+  for (const item of named_patterns) {
+    const match = prompt.match(item._pattern);
+    const artifact_id = normalize_artifact_action_id(match?.[1]);
+    if (!artifact_id) continue;
+    if (item._artifact_type === "flow" && match?.index !== undefined) {
+      const prefix = prompt.slice(0, match.index).toLowerCase();
+      if (/\b(?:run|trigger|call|execute)\s+(?:a\s+|the\s+)?$/u.test(prefix)) {
+        continue;
+      }
+    }
+
+    const named_intent = {
+      _artifact_type: item._artifact_type,
+      _artifact_id: artifact_id,
+    };
+    _xlog.log("[xvibe] named artifact intent", named_intent);
+
+    return named_intent;
+  }
+
+  return undefined;
+}
+
+function named_artifact_plan(prompt: string): XVibeResolvedArtifactPlan | undefined {
+  const named_intent = extract_named_artifact_intent(prompt);
+  if (!named_intent) return undefined;
+
+  return create_resolved_artifact_plan({
+    _layer: "named_artifact_intent",
+    _primary_artifact_type: named_intent._artifact_type,
+    ...(named_intent._artifact_type === "flow"
+      ? { _flow_ids: [named_intent._artifact_id] }
+      : {}),
+    ...(named_intent._artifact_type === "entity"
+      ? { _entity_ids: [named_intent._artifact_id] }
+      : {}),
+    ...(named_intent._artifact_type === "module"
+      ? { _module_names: [named_intent._artifact_id] }
+      : {}),
+  });
+}
+
+function extract_action_artifact_intent(prompt: string): XVibeActionArtifactIntent | undefined {
+  const normalized_prompt =
+    _xu.normalizePrompt(prompt)
+      .replace(/\s+/g, " ")
+      .trim();
+  const action_match =
+    normalized_prompt.match(
+      /\b(delete|remove|rename|archive|disable)\s+(?:the\s+)?(view|flow|entity|module)\s+(?:named\s+|called\s+|id\s+)?["']?([a-z][a-z0-9_-]*)["']?\b/iu,
+    );
+
+  if (!action_match) return undefined;
+
+  const raw_action = action_match[1].toLowerCase();
+  const artifact_id = normalize_artifact_action_id(action_match[3]);
+  if (!artifact_id) return undefined;
+
+  return {
+    _action: raw_action === "remove" ? "delete" : raw_action as XVibeArtifactAction,
+    _artifact_type: action_match[2].toLowerCase() as XVibeInferredArtifactType,
+    _artifact_id: artifact_id,
+  };
+}
+
+function action_artifact_plan(prompt: string): XVibeResolvedArtifactPlan | undefined {
+  const action_intent = extract_action_artifact_intent(prompt);
+  if (!action_intent) return undefined;
+
+  _xlog.log("[xvibe] action intent detected", action_intent);
+
+  return create_resolved_artifact_plan({
+    _layer: "action_intent",
+    _primary_artifact_type: action_intent._artifact_type,
+    ...(action_intent._artifact_type === "flow"
+      ? { _flow_ids: [action_intent._artifact_id] }
+      : {}),
+    ...(action_intent._artifact_type === "entity"
+      ? { _entity_ids: [action_intent._artifact_id] }
+      : {}),
+    ...(action_intent._artifact_type === "module"
+      ? { _module_names: [action_intent._artifact_id] }
+      : {}),
+    _action_intent: action_intent,
+  });
+}
+
+function fallback_artifact_plan(
+  prompt: string,
+  requested_artifact_type?: VibeRequestedArtifactType,
+): XVibeResolvedArtifactPlan {
+  const planner = new VibeIntentPlanner();
+  const intent = planner.infer_artifact_intent(prompt);
+  const plan =
+    planner.build_artifact_plan_from_intent(
+      prompt,
+      intent,
+      requested_artifact_type,
+    ) as XVibeResolvedArtifactPlan;
+
+  _xlog.log("[xvibe] fallback classifier used", {
+    _primary_artifact_type: plan._primary_artifact_type,
+    _artifact_types: plan._artifact_types,
+    _flow_ids: plan._flow_ids,
+    _entity_ids: plan._entity_ids,
+    _reason: plan._reason,
+  });
+
+  log_intent_layer_resolved(
+    "fallback_classifier",
+    plan._primary_artifact_type,
+  );
+  log_artifact_inference_branch(plan);
+  warn_suspicious_entity_override(prompt, plan);
+
+  return plan;
+}
+
+const ARTIFACT_ACTION_PREFIX =
+  String.raw`^\s*(?:(?:please|kindly)\s+|(?:can|could|would)\s+you\s+|(?:i|we)\s+(?:want|need)\s+to\s+)?`;
+const ARTIFACT_ACTION_ID_PATTERN = String.raw`["']?([a-z][a-z0-9_-]*)["']?`;
+const ARTIFACT_ACTION_TRAILING_PATTERN = String.raw`(?:[\s.,;:!?]|$)`;
+
+function normalize_artifact_action_id(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+
+  const normalized = value.trim().replace(/^["'`]+|["'`.,;:]+$/g, "");
+  return /^[a-z][a-z0-9_-]*$/iu.test(normalized) ? normalized : undefined;
+}
+
+function artifact_entity_action_requires_confirmation(
+  artifact_type: XVibeArtifactActionPlan["_artifact_type"],
+  action: XVibeArtifactAction,
+): boolean {
+  return (
+    artifact_type === "entity" &&
+    (action === "delete" || action === "archive" || action === "rename")
+  );
+}
+
+function with_artifact_action_safety(plan: XVibeArtifactActionPlan): XVibeArtifactActionPlan {
+  if (artifact_entity_action_requires_confirmation(plan._artifact_type, plan._action)) {
+    return {
+      ...plan,
+      _requires_confirmation: true,
+    };
+  }
+
+  return plan;
+}
+
+export function infer_xvibe_artifact_action_plan(
+  prompt: string,
+): XVibeArtifactActionPlan | undefined {
+  const normalized_prompt =
+    _xu.normalizePrompt(prompt)
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const rename_pattern = new RegExp(
+    ARTIFACT_ACTION_PREFIX +
+    String.raw`rename\s+(?:the\s+)?(view|flow|entity|module)\s+(?:named\s+|called\s+|id\s+)?` +
+    ARTIFACT_ACTION_ID_PATTERN +
+    String.raw`\s+(?:to|as)\s+` +
+    ARTIFACT_ACTION_ID_PATTERN +
+    ARTIFACT_ACTION_TRAILING_PATTERN,
+    "iu",
+  );
+  const rename_match = normalized_prompt.match(rename_pattern);
+  if (rename_match) {
+    const target_id = normalize_artifact_action_id(rename_match[2]);
+    const new_id = normalize_artifact_action_id(rename_match[3]);
+    if (target_id && new_id) {
+      return with_artifact_action_safety({
+        _artifact_type: rename_match[1].toLowerCase() as XVibeArtifactActionPlan["_artifact_type"],
+        _action: "rename",
+        _target_id: target_id,
+        _new_id: new_id,
+      });
+    }
+  }
+
+  const action_pattern = new RegExp(
+    ARTIFACT_ACTION_PREFIX +
+    String.raw`(delete|remove|disable|archive)\s+(?:the\s+)?(view|flow|entity|module)\s+(?:named\s+|called\s+|id\s+)?` +
+    ARTIFACT_ACTION_ID_PATTERN +
+    ARTIFACT_ACTION_TRAILING_PATTERN,
+    "iu",
+  );
+  const action_match = normalized_prompt.match(action_pattern);
+  if (!action_match) {
+    return undefined;
+  }
+
+  const target_id = normalize_artifact_action_id(action_match[3]);
+  if (!target_id) {
+    return undefined;
+  }
+
+  const raw_action = action_match[1].toLowerCase();
+  const action: XVibeArtifactAction = raw_action === "remove" ? "delete" : raw_action as XVibeArtifactAction;
+
+  return with_artifact_action_safety({
+    _artifact_type: action_match[2].toLowerCase() as XVibeArtifactActionPlan["_artifact_type"],
+    _action: action,
+    _target_id: target_id,
+  });
+}
+
+export function infer_xvibe_artifact_plan(
+  prompt: string,
+  requested_artifact_type?: VibeRequestedArtifactType,
+): XVibeInferredArtifactPlan {
+  const explicit_requested_plan =
+    explicit_requested_artifact_plan(prompt, requested_artifact_type);
+  if (explicit_requested_plan) {
+    warn_suspicious_entity_override(prompt, explicit_requested_plan);
+    return explicit_requested_plan;
+  }
+
+  const explicit_only_plan =
+    explicit_only_artifact_plan(prompt);
+  if (explicit_only_plan) {
+    warn_suspicious_entity_override(prompt, explicit_only_plan);
+    return explicit_only_plan;
+  }
+
+  const named_plan =
+    named_artifact_plan(prompt);
+  if (named_plan) {
+    warn_suspicious_entity_override(prompt, named_plan);
+    return named_plan;
+  }
+
+  const action_plan =
+    action_artifact_plan(prompt);
+  if (action_plan) {
+    warn_suspicious_entity_override(prompt, action_plan);
+    return action_plan;
+  }
+
+  return fallback_artifact_plan(prompt, requested_artifact_type);
+}
+
+export function infer_xvibe_artifact_type(
+  prompt: string,
+  requested_artifact_type?: VibeRequestedArtifactType,
+): XVibeInferredArtifactType {
+  return infer_xvibe_artifact_plan(
+    prompt,
+    requested_artifact_type,
+  )._primary_artifact_type;
 }
 
 function read_generated_text(value: unknown): string {
@@ -789,6 +1332,23 @@ function structured_error_payload(
   return error instanceof XVibeStructuredError
     ? error._payload
     : undefined;
+}
+
+function unsupported_artifact_action_result(input: {
+  _action: string;
+  _artifact_type: string;
+  _artifact_id?: string;
+}): XVibeJsonObject {
+  return {
+    _ok: false,
+    _error: {
+      _code: XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED,
+      _message: `Artifact action '${input._action}' is not supported from Vibe prompts yet.`,
+      _action: input._action,
+      _artifact_type: input._artifact_type,
+      ...(input._artifact_id ? { _artifact_id: input._artifact_id } : {}),
+    },
+  };
 }
 
 function error_summary(error: unknown): XVibeJsonObject | string {
@@ -1785,6 +2345,13 @@ export function prompt_allows_view_flow_triggers(
     return true;
   }
 
+  if (
+    /\bflow\s+named\s+[a-z][a-z0-9_-]*\b/i
+      .test(text)
+  ) {
+    return true;
+  }
+
   // Generic flow trigger language.
   if (
     /\b(?:trigger|triggers|triggering|run|runs|execute|call)\s+(?:(?:a|an|the)\s+)?flow\b/i
@@ -1934,8 +2501,90 @@ function collect_generated_flow_ids(value: unknown): string[] {
 }
 
 function extract_prompt_flow_ids(prompt: string): string[] {
-  const matches = prompt.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? [];
-  return Array.from(new Set(matches.map((match) => match.toLowerCase())));
+  return extract_named_flow_ids(prompt);
+}
+
+function normalize_runtime_asset_ids(value: unknown): XVibeRuntimeAssetRef[] {
+  const source =
+    Array.isArray(value)
+      ? value
+      : [];
+
+  return Array.from(
+    new Set(
+      source
+        .map((item) => {
+          if (typeof item === "string") return item.trim();
+          if (is_plain_object(item) && typeof item._id === "string") {
+            return item._id.trim();
+          }
+          if (is_plain_object(item) && typeof item._name === "string") {
+            return item._name.trim();
+          }
+          return "";
+        })
+        .filter((id) => id.length > 0)
+    )
+  )
+    .sort()
+    .map((id) => ({ _id: id }));
+}
+
+function collect_generated_module_asset_ids(runtime_skills: unknown): XVibeRuntimeAssetRef[] {
+  const payload = unwrap_runtime_skills_payload(runtime_skills);
+  const ids: string[] = [];
+
+  if (!is_plain_object(payload)) {
+    return [];
+  }
+
+  const collect_module_id = (module_item: unknown): void => {
+    if (!is_plain_object(module_item)) return;
+
+    let is_generated = skill_marks_generated_module(module_item);
+    if (Array.isArray(module_item._skills)) {
+      is_generated =
+        is_generated ||
+        module_item._skills.some((skill) => skill_marks_generated_module(skill));
+    }
+
+    if (!is_generated) return;
+
+    if (typeof module_item._id === "string" && module_item._id.trim()) {
+      ids.push(module_item._id.trim());
+    } else if (typeof module_item._name === "string" && module_item._name.trim()) {
+      ids.push(module_item._name.trim());
+    }
+  };
+
+  if (Array.isArray(payload._modules)) {
+    for (const module_item of payload._modules) {
+      collect_module_id(module_item);
+    }
+  }
+
+  if (Array.isArray(payload._skills)) {
+    for (const skill of payload._skills) {
+      if (
+        !skill_marks_generated_module(skill) ||
+        !is_plain_object(skill) ||
+        !is_plain_object(skill._exports)
+      ) {
+        continue;
+      }
+      const exported_modules = Array.isArray(skill._exports._modules)
+        ? skill._exports._modules
+        : [];
+      for (const module_item of exported_modules) {
+        collect_module_id({
+          ...(is_plain_object(module_item) ? module_item : {}),
+          _skills: [skill],
+        });
+      }
+    }
+  }
+
+  return normalize_runtime_asset_ids(ids);
 }
 
 function field_control_requires_name(control_type: string): boolean {
@@ -1953,6 +2602,18 @@ type XVibeRuntimeContextInput = {
   _view_id?: string;
   _current_view?: unknown;
   _generated_artifacts?: unknown;
+  _runtime_skills?: unknown;
+};
+
+type XVibeRuntimeAssetRef = {
+  _id: string;
+};
+
+type XVibeRuntimeAssets = {
+  _views: XVibeRuntimeAssetRef[];
+  _flows: XVibeRuntimeAssetRef[];
+  _entities: XVibeRuntimeAssetRef[];
+  _modules: XVibeRuntimeAssetRef[];
 };
 
 type XVibeGenerateModuleSpecResult = {
@@ -2015,6 +2676,17 @@ type XVibePlannedArtifactInput = {
   _entry_view_id: string;
   _item: XVibeArtifactExecutionItem;
   _context: XVibeArtifactGenerationContext;
+};
+
+type XVibeArtifactExecutionPlanInput = {
+  _prompt: string;
+  _params: XVibeJsonObject;
+  _execution_plan: XVibeArtifactExecutionPlan;
+  _app_id: string;
+  _env: string;
+  _mode: VibeAIMode;
+  _entry_view_id?: string;
+  _generation_id?: string;
 };
 
 export class XVibeModule extends XModule {
@@ -2129,6 +2801,7 @@ export class XVibeModule extends XModule {
   private readonly output_parser: VibeOutputParser;
   private readonly planner: XVibePlanner;
   private readonly intent_planner: VibeIntentPlanner;
+  private readonly behavior_planner: VibeBehaviorPlanner;
   private readonly runtime_skills_by_scope = new Map<string, any>();
   private latest_runtime_skills: any = null;
 
@@ -2140,6 +2813,7 @@ export class XVibeModule extends XModule {
     this.output_parser = new VibeOutputParser();
     this.planner = new XVibePlanner();
     this.intent_planner = new VibeIntentPlanner();
+    this.behavior_planner = new VibeBehaviorPlanner();
   }
 
   override async onLoad() {
@@ -2333,6 +3007,7 @@ export class XVibeModule extends XModule {
     server_module_call_graph?: XVibeServerModuleCallGraph;
     _allow_skeleton_fallback?: boolean;
     _progress?: XVibeGenerationProgressCallback;
+    _archive?: XVibeRunArchiveData;
   }): Promise<unknown> {
     const module_ops =
       input.spec._ops.map((op) => op._name);
@@ -2401,6 +3076,25 @@ export class XVibeModule extends XModule {
             ? { rejected_attempts }
             : {}),
         });
+      const attempt_archive: XVibeJsonObject = {
+        _attempt: attempt,
+        _module_name: input.spec._name,
+        _module_ops: module_ops,
+        _implementation_prompt: implementation_prompt,
+      };
+      const archive = input._archive;
+      const archive_validation =
+        archive && is_plain_object(archive._validation)
+          ? archive._validation as XVibeRunValidationArchive
+          : undefined;
+      if (archive_validation) {
+        archive_validation._implementation_attempts =
+          archive_validation._implementation_attempts ?? [];
+        archive_validation._implementation_attempts.push(attempt_archive);
+      }
+      if (archive) {
+        archive._final_prompt = implementation_prompt;
+      }
 
       if (attempt > 1) {
         _xlog.log("[module-creator] implementation retry prompt prepared", {
@@ -2415,22 +3109,32 @@ export class XVibeModule extends XModule {
       let implementation_sources: XVibeGeneratedModuleImplementationSources | undefined;
 
       try {
+        const xai_response =
+          await _x.execute({
+            _module: "xai",
+            _op: "generate",
+            _params: {
+              _prompt: implementation_prompt,
+              response_format: {
+                type: "json_object",
+              },
+            },
+          } as any);
+        attempt_archive._raw_ai_response = xai_response;
+        if (archive) {
+          archive._ai_output = xai_response;
+        }
         const xai_result =
           unwrap_command_result(
-            await _x.execute({
-              _module: "xai",
-              _op: "generate",
-              _params: {
-                _prompt: implementation_prompt,
-                response_format: {
-                  type: "json_object",
-                },
-              },
-            } as any),
+            xai_response,
           );
 
         implementation_sources =
           parse_generated_module_implementation_methods(xai_result);
+        attempt_archive._parsed_method_sources =
+          implementation_sources._method_sources;
+        attempt_archive._parsed_helper_sources =
+          implementation_sources._helper_sources;
       } catch (error) {
         validation_errors = {
           _ok: false,
@@ -2440,6 +3144,8 @@ export class XVibeModule extends XModule {
             _category: "syntax_or_shape_error",
           },
         };
+        attempt_archive._validation_result = validation_errors;
+        attempt_archive._rejection_category = "syntax_or_shape_error";
 
         rejected_attempts.push({
           _attempt: attempt,
@@ -2490,6 +3196,8 @@ export class XVibeModule extends XModule {
               },
             },
           } as any);
+        attempt_archive._implementation_response =
+          implementation_response;
       } catch (error) {
         validation_errors = {
           _ok: false,
@@ -2499,6 +3207,8 @@ export class XVibeModule extends XModule {
             _category: "unknown",
           },
         };
+        attempt_archive._validation_result = validation_errors;
+        attempt_archive._rejection_category = "unknown";
 
         rejected_attempts.push({
           _attempt: attempt,
@@ -2532,6 +3242,8 @@ export class XVibeModule extends XModule {
         validation_errors = implementation_result;
         const category =
           classify_implementation_validation_failure(implementation_result);
+        attempt_archive._validation_result = implementation_result;
+        attempt_archive._rejection_category = category;
 
         rejected_attempts.push({
           _attempt: attempt,
@@ -2560,6 +3272,7 @@ export class XVibeModule extends XModule {
         _attempt: attempt,
         _result: implementation_result,
       });
+      attempt_archive._validation_result = implementation_result;
 
       _xlog.log("[xvibe] generated module implementation applied", {
         _module_name: input.spec._name,
@@ -2606,6 +3319,7 @@ export class XVibeModule extends XModule {
     prompt: string;
     intent_plan: VibeIntentPlan;
     _progress?: XVibeGenerationProgressCallback;
+    _archive?: XVibeRunArchiveData;
   }): Promise<XVibeServerModuleEnsureResult> {
     if (
       input.intent_plan._requires_module === true &&
@@ -2688,6 +3402,7 @@ export class XVibeModule extends XModule {
         user_request: input.prompt,
         server_module_call_graph: {},
         _progress: input._progress,
+        _archive: input._archive,
       });
 
     input._progress?.(
@@ -2758,6 +3473,239 @@ export class XVibeModule extends XModule {
           ? load_result._ok === true || load_result._loaded === true
           : true,
     };
+  }
+
+  private async execute_module_generation_route(input: {
+    app_id: string;
+    env: string;
+    runtime_mode: string;
+    prompt: string;
+    supplied_intent_plan: unknown;
+    runtime_skills: unknown;
+    inferred_artifact_plan: XVibeInferredArtifactPlan;
+    generation_id: string;
+    _progress?: XVibeGenerationProgressCallback;
+  }): Promise<unknown> {
+    let intent_plan =
+      this.create_artifact_intent_plan({
+        prompt: input.prompt,
+        artifact_type: "module",
+        supplied_intent_plan: input.supplied_intent_plan,
+        runtime_skills: input.runtime_skills,
+      });
+
+    const module_op_extraction =
+      extract_module_operation_matches_from_prompt(input.prompt);
+    const explicit_module_ops =
+      module_op_extraction._module_ops;
+    const explicit_module_name =
+      extract_explicit_module_id_from_prompt(input.prompt);
+    const planned_module_name =
+      explicit_module_name ??
+      input.inferred_artifact_plan._module_names?.[0];
+
+    _xlog.log("[xvibe] extracted module ops", {
+      _module_name:
+        planned_module_name ??
+        intent_plan._module_name,
+      _positive_matches: module_op_extraction._positive_matches,
+      _negative_matches: module_op_extraction._negative_matches,
+      _module_ops: explicit_module_ops,
+    });
+    const planned_module_target =
+      intent_plan._module_target === "client"
+        ? "client"
+        : "server";
+
+    if (
+      planned_module_name &&
+      (
+        typeof intent_plan._module_name !== "string" ||
+        intent_plan._module_name.trim().length === 0 ||
+        intent_plan._module_name === "generated-module"
+      )
+    ) {
+      intent_plan = {
+        ...intent_plan,
+        _requires_module: true,
+        _module_target: planned_module_target,
+        _module_name: planned_module_name,
+        _module_ops:
+          explicit_module_ops.length > 0
+            ? explicit_module_ops
+            : intent_plan._module_ops.length > 0
+            ? intent_plan._module_ops
+            : ["run"],
+        _module_reason: "User explicitly requested creation of a server module.",
+      };
+    }
+
+    if (explicit_module_ops.length > 0) {
+      intent_plan = {
+        ...intent_plan,
+        _requires_module: true,
+        _module_target: planned_module_target,
+        ...(planned_module_name ? { _module_name: planned_module_name } : {}),
+        _module_ops: explicit_module_ops,
+        _module_reason:
+          intent_plan._module_reason ??
+          "User explicitly requested creation of a server module.",
+      };
+    }
+
+    intent_plan =
+      this.intent_planner.enforce_module_intent_plan(intent_plan);
+
+    _xlog.log("[xvibe] module execution route", {
+      _module_name: intent_plan._module_name,
+      _module_ops: intent_plan._module_ops,
+    });
+    _xlog.log("[xvibe] module generation bypassed artifact planner");
+
+    const archive_started_at = Date.now();
+    const archive_validation: XVibeRunValidationArchive = {
+      _implementation_attempts: [],
+    };
+    const archive: XVibeRunArchiveData = {
+      _generation_id: input.generation_id,
+      _app_id: input.app_id,
+      _env: input.env,
+      _mode: "full",
+      _artifact_type: "module",
+      _created_at: new Date().toISOString(),
+      _user_prompt: input.prompt,
+      _intent_plan: intent_plan,
+      _runtime_context: {
+        _runtime_mode: input.runtime_mode,
+        _runtime_skills: input.runtime_skills,
+        _artifact_plan: input.inferred_artifact_plan,
+      },
+      _validation: archive_validation,
+    };
+    const module_progress: XVibeGenerationProgressCallback =
+      (stage_name, message, details = {}) => {
+        record_archive_stage(
+          archive,
+          archive_started_at,
+          stage_name,
+          message,
+          {
+            _artifact_type: "module",
+            ...details,
+          },
+        );
+        input._progress?.(stage_name, message, details);
+      };
+
+    try {
+      const module_ensure_result =
+        await this.ensure_server_module_for_intent({
+          app_id: input.app_id,
+          env: input.env,
+          runtime_mode: input.runtime_mode,
+          prompt: input.prompt,
+          intent_plan,
+          _progress: module_progress,
+          _archive: archive,
+        });
+
+      if (!module_ensure_result._module_name) {
+        throw new Error("Unable to infer module requirement from prompt");
+      }
+
+      _xlog.log("[xvibe] module-only request completed", {
+        _module_name: module_ensure_result._module_name,
+        _module_ops: module_ensure_result._module_ops,
+        _created: module_ensure_result._created,
+        _available: module_ensure_result._available,
+      });
+
+      archive._intent_plan = module_ensure_result._intent_plan;
+      archive._result = {
+        _success: true,
+        _artifact_type: "module",
+        _module_name: module_ensure_result._module_name,
+        _module_ops: module_ensure_result._module_ops,
+        ...(module_ensure_result._created !== undefined
+          ? { _created: module_ensure_result._created }
+          : {}),
+        ...(module_ensure_result._available !== undefined
+          ? { _available: module_ensure_result._available }
+          : {}),
+      };
+
+      return {
+        _ok: true,
+        _result: {
+          _artifact_type: "module",
+          _module_name: module_ensure_result._module_name,
+          _module_ops: module_ensure_result._module_ops,
+          ...(module_ensure_result._created !== undefined
+            ? { _created: module_ensure_result._created }
+            : {}),
+          ...(module_ensure_result._available !== undefined
+            ? { _available: module_ensure_result._available }
+            : {}),
+        },
+      };
+    } catch (error) {
+      const module_name =
+        typeof intent_plan._module_name === "string" && intent_plan._module_name.trim()
+          ? intent_plan._module_name.trim()
+          : planned_module_name;
+      const module_ops = intent_plan._module_ops;
+      archive._result = {
+        _success: false,
+        _artifact_type: "module",
+        ...(module_name ? { _module_name: module_name } : {}),
+        _module_ops: module_ops,
+        _error: error_summary(error),
+        _attempts: archive_validation._implementation_attempts ?? [],
+      };
+      record_archive_stage(
+        archive,
+        archive_started_at,
+        "failed",
+        "Module generation failed",
+        {
+          _artifact_type: "module",
+          ...(module_name ? { _module_name: module_name } : {}),
+          _module_ops: module_ops,
+          _error: error_summary(error),
+        },
+      );
+      input._progress?.(
+        "failed",
+        "Module generation failed",
+        {
+          ...(module_name ? { _module_name: module_name } : {}),
+          _module_ops: module_ops,
+          _error: error_summary(error),
+        },
+      );
+      this.broadcast_generation_failed(
+        {
+          _app_id: input.app_id,
+          _env: input.env,
+          _generation_id: input.generation_id,
+        },
+        error,
+        "E_VIBE_AI_GENERATE_MODULE",
+      );
+
+      return {
+        _ok: false,
+        _error: {
+          _code: "E_VIBE_AI_GENERATE_MODULE",
+          _message: error instanceof Error ? error.message : String(error),
+          ...(module_name ? { _module_name: module_name } : {}),
+          _module_ops: module_ops,
+        },
+      };
+    } finally {
+      archive._duration_ms = Date.now() - archive_started_at;
+      archive_vibe_run(archive);
+    }
   }
 
   private async ensure_missing_server_modules_from_view(input: {
@@ -2927,6 +3875,15 @@ export class XVibeModule extends XModule {
           ...(generation_id ? { _generation_id: generation_id } : {}),
         }],
       });
+
+      _xlog.log("[xvibe] generation event emitted", {
+        ...(generation_id ? { _generation_id: generation_id } : {}),
+        _artifact_type:
+          typeof details._artifact_type === "string"
+            ? details._artifact_type
+            : undefined,
+        _stage: stage,
+      });
     } catch (error) {
       _xlog.error("[xvibe] generation stage broadcast failed", {
         _app_id: app_id,
@@ -2964,6 +3921,48 @@ export class XVibeModule extends XModule {
       input.generation_id,
       input.details as XVibeJsonObject | undefined,
     );
+  }
+
+  private push_generation_complete(input: {
+    app_id: string;
+    env: string;
+    artifact_type: string;
+    artifact_id: string;
+    message: string;
+    generation_id?: string;
+    details?: XVibeJsonObject;
+  }): void {
+    const payload = {
+      ...(input.details ?? {}),
+      _app_id: input.app_id,
+      _env: input.env,
+      _artifact_type: input.artifact_type,
+      _artifact_id: input.artifact_id,
+      _message: input.message,
+      ...(input.generation_id ? { _generation_id: input.generation_id } : {}),
+    };
+
+    try {
+      wsBroadcastScoped(input.app_id, input.env, {
+        _name: "vibe:generation-complete",
+        _args: [payload],
+      });
+
+      _xlog.log("[xvibe] generation event emitted", {
+        ...(input.generation_id ? { _generation_id: input.generation_id } : {}),
+        _artifact_type: input.artifact_type,
+        _stage: "complete",
+      });
+    } catch (error) {
+      _xlog.error("[xvibe] generation complete broadcast failed", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _artifact_type: input.artifact_type,
+        _artifact_id: input.artifact_id,
+        ...(input.generation_id ? { _generation_id: input.generation_id } : {}),
+        _error: error_summary(error),
+      });
+    }
   }
 
   private broadcast_generation_failed(
@@ -3037,10 +4036,24 @@ export class XVibeModule extends XModule {
   private async collect_runtime_awareness_context(
     _input: XVibeRuntimeContextInput,
   ): Promise<XVibeJsonObject> {
+    const runtime_assets =
+      await this.collect_runtime_assets({
+        _app_id: _input._app_id,
+        _env: _input._env,
+        _runtime_skills: _input._runtime_skills,
+      });
+
+    _xlog.log("[xvibe] runtime asset awareness", {
+      _views_count: runtime_assets._views.length,
+      _flows_count: runtime_assets._flows.length,
+      _entities_count: runtime_assets._entities.length,
+      _modules_count: runtime_assets._modules.length,
+    });
 
     return {
       _app_id: _input._app_id,
       _env: _input._env,
+      _runtime_assets: runtime_assets,
 
       ...(_input._view_id
         ? {
@@ -3061,6 +4074,52 @@ export class XVibeModule extends XModule {
         }
         : {})
     };
+  }
+
+  private async collect_runtime_assets(input: {
+    _app_id: string;
+    _env: string;
+    _runtime_skills?: unknown;
+  }): Promise<XVibeRuntimeAssets> {
+    let views: XVibeRuntimeAssetRef[] = [];
+    let flows: XVibeRuntimeAssetRef[] = [];
+    let entities: XVibeRuntimeAssetRef[] = [];
+
+    try {
+      const app_result = unwrap_command_result(
+        await _x.execute({
+          _module: "server-xvm",
+          _op: "get_app",
+          _params: {
+            _app_id: input._app_id,
+            _env: input._env,
+            _include_views: false,
+            _include_flows: false,
+          },
+        } as any),
+      );
+
+      if (is_plain_object(app_result)) {
+        views = normalize_runtime_asset_ids(app_result._view_ids);
+        flows = normalize_runtime_asset_ids(app_result._flow_ids);
+        entities = normalize_runtime_asset_ids(app_result._entity_ids);
+      }
+    } catch (error) {
+      _xlog.warn("[xvibe] runtime asset collection failed", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _error: error_summary(error),
+      });
+    }
+
+    const assets: XVibeRuntimeAssets = {
+      _views: views,
+      _flows: flows,
+      _entities: entities,
+      _modules: collect_generated_module_asset_ids(input._runtime_skills),
+    };
+
+    return assets;
   }
 
   private async load_current_view_for_refine(input: {
@@ -3249,6 +4308,21 @@ export class XVibeModule extends XModule {
     const decision = this.build_view_mutation_refine_decision(input);
     _xlog.log("[xvibe] mutation refine decision", decision);
     return decision;
+  }
+
+  private assign_view_ids(view: unknown): number {
+    const result = ensure_view_ids(view);
+    const view_id =
+      is_plain_object(view) && typeof view._id === "string" && view._id.trim().length > 0
+        ? view._id.trim()
+        : null;
+
+    _xlog.log("[xvibe] assigned view ids", {
+      _count: result._count,
+      _view_id: view_id,
+    });
+
+    return result._count;
   }
 
   private collect_view_target_ids(
@@ -3707,6 +4781,13 @@ export class XVibeModule extends XModule {
       _runtime_mode: runtime_mode,
     });
 
+    if (inferred_intent._intent_type === "module") {
+      const module_intent =
+        this.intent_planner.enforce_module_intent_plan(inferred_intent);
+      this.log_intent_plan("app", module_intent);
+      return module_intent;
+    }
+
     const intent_prompt = [
       "You are an Xpell runtime intent planner.",
       "Return strict JSON only.",
@@ -3858,7 +4939,7 @@ export class XVibeModule extends XModule {
 
   private create_artifact_intent_plan(params: {
     prompt: string;
-    artifact_type: VibeArtifactType;
+    artifact_type: XVibeInferredArtifactType;
     supplied_intent_plan: unknown;
     runtime_skills: unknown;
   }): VibeIntentPlan {
@@ -3878,7 +4959,7 @@ export class XVibeModule extends XModule {
       );
 
     if (this.has_supplied_intent_plan(params.supplied_intent_plan)) {
-      return this.intent_planner.apply_ui_only_guard(
+      const supplied_artifact_intent = this.intent_planner.apply_ui_only_guard(
         params.prompt,
         this.intent_planner.normalize_intent_plan(
           params.supplied_intent_plan,
@@ -3886,9 +4967,130 @@ export class XVibeModule extends XModule {
           artifact_intent,
         ),
       );
+
+      _xlog.log("[xvibe] artifact intent plan", {
+        _prompt: params.prompt,
+        _artifact_type: params.artifact_type,
+        _intent_type: supplied_artifact_intent._intent_type,
+        _artifact_types: supplied_artifact_intent._artifact_types,
+        _entities: supplied_artifact_intent._entities,
+        _actions: supplied_artifact_intent._actions,
+        _modules: supplied_artifact_intent._modules,
+        _requires_module: supplied_artifact_intent._requires_module,
+        _module_name: supplied_artifact_intent._module_name,
+        _module_ops: supplied_artifact_intent._module_ops,
+      });
+
+      return supplied_artifact_intent;
     }
 
-    return this.intent_planner.apply_ui_only_guard(params.prompt, artifact_intent);
+    const guarded_artifact_intent =
+      this.intent_planner.apply_ui_only_guard(params.prompt, artifact_intent);
+
+    _xlog.log("[xvibe] artifact intent plan", {
+      _prompt: params.prompt,
+      _artifact_type: params.artifact_type,
+      _intent_type: guarded_artifact_intent._intent_type,
+      _artifact_types: guarded_artifact_intent._artifact_types,
+      _entities: guarded_artifact_intent._entities,
+      _actions: guarded_artifact_intent._actions,
+      _modules: guarded_artifact_intent._modules,
+      _requires_module: guarded_artifact_intent._requires_module,
+      _module_name: guarded_artifact_intent._module_name,
+      _module_ops: guarded_artifact_intent._module_ops,
+    });
+
+    return guarded_artifact_intent;
+  }
+
+  private create_artifact_scope_lock(intent: XVibeArtifactIntent): XVibeArtifactScopeLock | undefined {
+    if (intent._action !== "create" && intent._action !== "update") {
+      return undefined;
+    }
+
+    if (
+      intent._target !== "view" &&
+      intent._target !== "flow" &&
+      intent._target !== "entity" &&
+      intent._target !== "module"
+    ) {
+      return undefined;
+    }
+
+    return {
+      _locked: true,
+      _action: intent._action,
+      _artifact_type: intent._target,
+      ...(intent._target_id ? { _target_id: intent._target_id } : {}),
+      ...(intent._forbidden_targets.length > 0
+        ? { _forbidden_targets: intent._forbidden_targets }
+        : {}),
+      _reason: "resolver_lock",
+    };
+  }
+
+  private apply_artifact_scope_lock_to_plan(
+    lock: XVibeArtifactScopeLock | undefined,
+    plan: XVibeInferredArtifactPlan,
+  ): XVibeInferredArtifactPlan {
+    if (!lock || lock._artifact_type !== "view") {
+      return plan;
+    }
+
+    return {
+      ...plan,
+      _primary_artifact_type: "view",
+      _artifact_types: ["view"],
+      _flow_ids: undefined,
+      _entity_ids: undefined,
+      _module_names: undefined,
+      _reason: lock._reason,
+      _execution_plan: {
+        _primary_artifact_type: "view",
+        _artifacts: [
+          {
+            _artifact_type: "view",
+            _action: lock._action,
+            ...(lock._target_id ? { _artifact_id: lock._target_id } : {}),
+          },
+        ],
+      },
+    };
+  }
+
+  private apply_artifact_scope_lock_to_intent_plan(
+    lock: XVibeArtifactScopeLock | undefined,
+    plan: VibeIntentPlan,
+  ): VibeIntentPlan {
+    if (!lock || lock._artifact_type !== "view") {
+      return plan;
+    }
+
+    const locked_plan: VibeIntentPlan = {
+      ...plan,
+      _intent_type: "view-design",
+      _artifact_types: ["view"],
+      _entities: [],
+      _actions: [],
+      _bindings: [],
+      _modules: [],
+      _capabilities: plan._capabilities.filter(
+        (capability) =>
+          capability !== "entity" &&
+          capability !== "crud" &&
+          capability !== "storage",
+      ),
+      _crud_ops: [],
+      _flow_keywords: [],
+      _entity_keywords: [],
+      _requires_module: false,
+      _module_target: null,
+      _module_name: "",
+      _module_ops: [],
+      _module_reason: undefined,
+    };
+
+    return locked_plan;
   }
 
   private artifact_envelope(
@@ -4052,6 +5254,16 @@ export class XVibeModule extends XModule {
       this.push_validation_error(errors, `${path} requires non-empty _type`);
     } else if (!registry._xui_types.has(node_type)) {
       this.push_validation_error(errors, `${path} has unknown runtime _type '${node_type}'`);
+    }
+
+    if (
+      node_type &&
+      (typeof node._id !== "string" || node._id.trim().length === 0)
+    ) {
+      _xlog.warn("[xvibe] view node missing id", {
+        _type: node_type,
+        _path: path,
+      });
     }
 
     if (Object.prototype.hasOwnProperty.call(node, "_style")) {
@@ -4668,7 +5880,7 @@ export class XVibeModule extends XModule {
         input._archive_validation._repair_errors.push(error_summary(error));
         const last_attempt =
           input._archive_validation._repair_attempts?.[
-            input._archive_validation._repair_attempts.length - 1
+          input._archive_validation._repair_attempts.length - 1
           ];
         if (last_attempt) {
           last_attempt._ok = false;
@@ -4690,6 +5902,10 @@ export class XVibeModule extends XModule {
           _artifact_type: "view"
         });
       }
+    }
+
+    if (input._artifact_type === "view") {
+      this.assign_view_ids(repaired);
     }
 
     const repaired_validation =
@@ -4715,7 +5931,7 @@ export class XVibeModule extends XModule {
         });
         const last_attempt =
           input._archive_validation._repair_attempts?.[
-            input._archive_validation._repair_attempts.length - 1
+          input._archive_validation._repair_attempts.length - 1
           ];
         if (last_attempt) {
           last_attempt._ok = false;
@@ -4734,7 +5950,7 @@ export class XVibeModule extends XModule {
     if (input._archive_validation) {
       const last_attempt =
         input._archive_validation._repair_attempts?.[
-          input._archive_validation._repair_attempts.length - 1
+        input._archive_validation._repair_attempts.length - 1
         ];
       if (last_attempt) {
         last_attempt._ok = true;
@@ -4946,6 +6162,207 @@ export class XVibeModule extends XModule {
     return generated_artifacts;
   }
 
+  private execution_artifact_type(
+    artifact_type: string,
+  ): VibeArtifactType | undefined {
+    if (
+      artifact_type === "view" ||
+      artifact_type === "flow" ||
+      artifact_type === "entity" ||
+      artifact_type === "command"
+    ) {
+      return artifact_type;
+    }
+
+    return undefined;
+  }
+
+  private generated_artifacts_payload(
+    params: XVibeJsonObject,
+    generated_artifacts: XVibeGeneratedArtifactSummary[],
+  ): XVibeJsonObject {
+    const existing =
+      is_plain_object(params._generated_artifacts)
+        ? params._generated_artifacts
+        : {};
+    const existing_items = (key: string): unknown[] =>
+      Array.isArray(existing[key]) ? existing[key] as unknown[] : [];
+
+    return {
+      ...existing,
+      _views: [
+        ...existing_items("_views"),
+        ...generated_artifacts.filter((item) => item._artifact_type === "view"),
+      ],
+      _flows: [
+        ...existing_items("_flows"),
+        ...generated_artifacts.filter((item) => item._artifact_type === "flow"),
+      ],
+      _entities: [
+        ...existing_items("_entities"),
+        ...generated_artifacts.filter((item) => item._artifact_type === "entity"),
+      ],
+      _module_specs: [
+        ...existing_items("_module_specs"),
+        ...generated_artifacts.filter((item) => item._artifact_type === "module-spec"),
+      ],
+    };
+  }
+
+  private async execute_artifact_execution_plan(
+    input: XVibeArtifactExecutionPlanInput,
+  ): Promise<unknown> {
+    const pending = [...input._execution_plan._artifacts];
+    const completed_ids = new Set<string>();
+    const generated_artifacts: XVibeGeneratedArtifactSummary[] = [];
+    const skipped_artifacts: XVibeArtifactExecutionPlan["_artifacts"] = [];
+    let last_result: unknown;
+
+    _xlog.log("[xvibe] execution start", {
+      _app_id: input._app_id,
+      _env: input._env,
+      _primary_artifact_type: input._execution_plan._primary_artifact_type,
+      _artifacts_count: pending.length,
+    });
+
+    while (pending.length > 0) {
+      let progressed = false;
+
+      for (let index = 0; index < pending.length; index += 1) {
+        const item = pending[index];
+        const dependencies = item._depends_on ?? [];
+        const unresolved_dependencies =
+          dependencies.filter((dependency) => !completed_ids.has(dependency));
+
+        if (unresolved_dependencies.length > 0) {
+          continue;
+        }
+
+        pending.splice(index, 1);
+        index -= 1;
+        progressed = true;
+
+        _xlog.log("[xvibe] execution artifact", {
+          _artifact_type: item._artifact_type,
+          _action: item._action,
+          ...(item._artifact_id ? { _artifact_id: item._artifact_id } : {}),
+          ...(dependencies.length > 0 ? { _depends_on: dependencies } : {}),
+        });
+
+        if (item._action !== "create" && item._action !== "update") {
+          _xlog.warn("[xvibe] artifact action not supported", {
+            _artifact_type: item._artifact_type,
+            _action: item._action,
+            ...(item._artifact_id ? { _artifact_id: item._artifact_id } : {}),
+          });
+
+          const unsupported_result =
+            unsupported_artifact_action_result({
+              _artifact_type: item._artifact_type,
+              _action: item._action,
+              ...(item._artifact_id ? { _artifact_id: item._artifact_id } : {}),
+            });
+
+          this.broadcast_generation_failed(
+            {
+              ...input._params,
+              _app_id: input._app_id,
+              _env: input._env,
+              ...(input._generation_id ? { _generation_id: input._generation_id } : {}),
+            },
+            new XVibeStructuredError(unsupported_result),
+            XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED,
+          );
+
+          return unsupported_result;
+        }
+
+        const artifact_type = this.execution_artifact_type(item._artifact_type);
+        if (!artifact_type || artifact_type === "command") {
+          _xlog.log("[xvibe] execution artifact skipped", {
+            _artifact_type: item._artifact_type,
+            _action: item._action,
+            ...(item._artifact_id ? { _artifact_id: item._artifact_id } : {}),
+            _reason: "unsupported_artifact_type",
+          });
+          skipped_artifacts.push(item);
+          continue;
+        }
+
+        const generated_artifacts_payload =
+          this.generated_artifacts_payload(input._params, generated_artifacts);
+        const execution_params: XVibeJsonObject = {
+          ...input._params,
+          _prompt: input._prompt,
+          _app_id: input._app_id,
+          _env: input._env,
+          _mode: input._mode,
+          _artifact_type: artifact_type,
+          _skip_artifact_plan: true,
+          _generated_artifacts: generated_artifacts_payload,
+          ...(input._generation_id ? { _generation_id: input._generation_id } : {}),
+        };
+
+        if (artifact_type === "flow" && item._artifact_id) {
+          execution_params._planned_flow_ids = [item._artifact_id];
+        }
+
+        if (artifact_type === "view") {
+          execution_params._view_id =
+            item._artifact_id ??
+            input._entry_view_id ??
+            input._params._view_id;
+          if (dependencies.length > 0) {
+            execution_params._planned_flow_ids = dependencies;
+          }
+        }
+
+        last_result =
+          await this.generate_artifact(
+            execution_params,
+            artifact_type,
+          );
+
+        const summary =
+          this.summarize_generated_artifact(artifact_type, last_result);
+        generated_artifacts.push(summary);
+        completed_ids.add(summary._artifact_id);
+        if (item._artifact_id) {
+          completed_ids.add(item._artifact_id);
+        }
+      }
+
+      if (!progressed) {
+        for (const item of pending.splice(0)) {
+          _xlog.log("[xvibe] execution artifact skipped", {
+            _artifact_type: item._artifact_type,
+            _action: item._action,
+            ...(item._artifact_id ? { _artifact_id: item._artifact_id } : {}),
+            ...(item._depends_on ? { _depends_on: item._depends_on } : {}),
+            _reason: "unresolved_dependencies",
+          });
+          skipped_artifacts.push(item);
+        }
+      }
+    }
+
+    _xlog.log("[xvibe] execution completed", {
+      _app_id: input._app_id,
+      _env: input._env,
+      _generated_artifacts: generated_artifacts,
+      _skipped_artifacts: skipped_artifacts,
+    });
+
+    return last_result ?? {
+      _ok: true,
+      _result: {
+        _execution_plan: input._execution_plan,
+        _generated_artifacts: generated_artifacts,
+        _skipped_artifacts: skipped_artifacts,
+      },
+    };
+  }
+
   private build_execution_plan_for_intent(
     plan: XVibeAppPlan,
     intent_plan: VibeIntentPlan,
@@ -4953,7 +6370,10 @@ export class XVibeModule extends XModule {
     const base_plan =
       this.planner.build_execution_plan(plan);
 
-    if (intent_plan._requires_module !== true) {
+    if (
+      intent_plan._requires_module !== true &&
+      intent_plan._module_ops.length === 0
+    ) {
       return base_plan;
     }
 
@@ -4990,22 +6410,226 @@ export class XVibeModule extends XModule {
           ? params.prompt
           : undefined;
     const prompt = resolve_prompt(params);
-    const mode = read_mode(params._mode);
+    const requested_artifact_type = read_artifact_type(params._artifact_type);
+    let planned_flow_ids = read_optional_string_array(params._planned_flow_ids, "_planned_flow_ids");
+    const skip_artifact_plan = params._skip_artifact_plan === true;
+
+    _xlog.log("[xvibe] intent classifier input", {
+      _prompt: prompt,
+      _requested_artifact_type: requested_artifact_type,
+      _forced_artifact_type: forced_artifact_type,
+      _skip_artifact_plan: skip_artifact_plan,
+      _planned_flow_ids: planned_flow_ids,
+    });
+
+    const artifact_intent = this.intent_planner.infer_artifact_intent(prompt);
+    _xlog.log("[xvibe] artifact intent", {
+      _prompt: prompt,
+      _intent: artifact_intent,
+    });
+    const artifact_scope_lock =
+      this.create_artifact_scope_lock(artifact_intent);
+
+    const artifact_action_plan = infer_xvibe_artifact_action_plan(prompt);
+    if (artifact_action_plan && typeof params._app_id !== "string") {
+      _xlog.log("[xvibe] intent-resolution-trace", {
+        _prompt: prompt,
+        _llm_intent: artifact_action_plan._artifact_type,
+        _negative_intents: artifact_intent._forbidden_targets,
+        _artifact_action: artifact_action_plan._action,
+        _artifact_plan: [artifact_action_plan._artifact_type],
+        _final_artifact_type: artifact_action_plan._artifact_type,
+      });
+      _xlog.log("[xvibe] artifact action intent detected", {
+        _artifact_action: artifact_action_plan,
+      });
+
+      return {
+        _ok: true,
+        _artifact_action: artifact_action_plan,
+      };
+    }
+
+    let mode = read_mode(params._mode);
     const app_id = read_required_string(params._app_id, "_app_id");
     const env = read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
-    const requested_view_id = read_optional_string(params._view_id, "_view_id");
-    const requested_artifact_type = read_artifact_type(params._artifact_type);
+    let requested_view_id = read_optional_string(params._view_id, "_view_id");
+    if (artifact_scope_lock?._artifact_type === "view") {
+      if (artifact_scope_lock._target_id) {
+        requested_view_id = artifact_scope_lock._target_id;
+        params._view_id = requested_view_id;
+      }
+      if (artifact_scope_lock._action === "update" && requested_view_id) {
+        mode = "refine";
+      }
+      if (artifact_scope_lock._action === "create") {
+        mode = "full";
+      }
+
+      _xlog.log("[xvibe] artifact scope locked", {
+        _artifact_type: artifact_scope_lock._artifact_type,
+        _action: artifact_scope_lock._action,
+        ...(artifact_scope_lock._target_id ? { _target_id: artifact_scope_lock._target_id } : {}),
+        _mode: mode,
+        _reason: artifact_scope_lock._reason,
+      });
+    }
     const capabilities = read_optional_string_array(params._capabilities, "_capabilities");
-    const planned_flow_ids = read_optional_string_array(params._planned_flow_ids, "_planned_flow_ids");
-    const generation_id = read_optional_string(params._generation_id, "_generation_id");
+    const generation_id = read_optional_generation_id(params._generation_id);
     const effective_generation_id = generation_id ?? safe_short_id();
-    if (!generation_id) {
-      _xlog.warn("[xvibe] generation_id missing; generated fallback id", {
+    params._generation_id = effective_generation_id;
+    if (generation_id) {
+      _xlog.log("[xvibe] generation_id received", {
+        _generation_id: generation_id,
+      });
+    } else {
+      _xlog.log("[xvibe] generation_id generated", {
         _generation_id: effective_generation_id,
       });
     }
     const supplied_intent_plan = is_plain_object(params._intent_plan) ? params._intent_plan : {};
-    const artifact_type = forced_artifact_type ?? infer_artifact_type(prompt, requested_artifact_type);
+    const base_artifact_plan =
+      this.intent_planner.build_artifact_plan_from_intent(
+        prompt,
+        artifact_intent,
+        requested_artifact_type,
+      );
+    log_artifact_inference_branch(base_artifact_plan);
+    warn_suspicious_entity_override(prompt, base_artifact_plan);
+
+    const single_inferred_artifact_type =
+      forced_artifact_type ??
+      base_artifact_plan._primary_artifact_type;
+    let inferred_artifact_plan: XVibeInferredArtifactPlan =
+      forced_artifact_type || skip_artifact_plan
+        ? {
+          _primary_artifact_type: single_inferred_artifact_type,
+          _artifact_types: [single_inferred_artifact_type],
+          ...(planned_flow_ids.length > 0 ? { _flow_ids: planned_flow_ids } : {}),
+          _intent: artifact_intent,
+          _reason: forced_artifact_type
+            ? "forced_artifact_type"
+            : "artifact_plan_skipped",
+        }
+        : base_artifact_plan;
+
+    inferred_artifact_plan =
+      this.apply_artifact_scope_lock_to_plan(
+        artifact_scope_lock,
+        inferred_artifact_plan,
+      );
+
+    if (artifact_scope_lock?._artifact_type === "view") {
+      _xlog.log("[xvibe] artifact scope applied", {
+        _artifact_type: artifact_scope_lock._artifact_type,
+        _action: artifact_scope_lock._action,
+        ...(artifact_scope_lock._target_id ? { _target_id: artifact_scope_lock._target_id } : {}),
+        _mode: mode,
+      });
+    }
+
+    _xlog.log("[xvibe] intent classifier result", {
+      _primary_artifact_type: inferred_artifact_plan._primary_artifact_type,
+      _artifact_types: inferred_artifact_plan._artifact_types,
+      _flow_ids: inferred_artifact_plan._flow_ids,
+      _entity_ids: inferred_artifact_plan._entity_ids,
+      _reason: inferred_artifact_plan._reason,
+    });
+    warn_suspicious_entity_override(prompt, inferred_artifact_plan);
+
+    const inferred_artifact_type = inferred_artifact_plan._primary_artifact_type;
+
+    _xlog.log("[xvibe] final artifact selection", {
+      _forced_artifact_type: forced_artifact_type,
+      _requested_artifact_type: requested_artifact_type,
+      _skip_artifact_plan: skip_artifact_plan,
+      _primary_artifact_type: inferred_artifact_plan._primary_artifact_type,
+      _artifact_types: inferred_artifact_plan._artifact_types,
+      _final_artifact_type: inferred_artifact_type,
+      _reason: inferred_artifact_plan._reason,
+    });
+    _xlog.log("[xvibe] intent-resolution-trace", {
+      _prompt: prompt,
+      _llm_intent: artifact_intent._target,
+      _negative_intents: artifact_intent._forbidden_targets,
+      _artifact_action: artifact_intent._action,
+      _artifact_plan:
+        inferred_artifact_plan._execution_plan?._artifacts
+          .map((artifact) => artifact._artifact_type) ??
+        inferred_artifact_plan._artifact_types,
+      _final_artifact_type: inferred_artifact_type,
+    });
+
+    if (planned_flow_ids.length === 0 && inferred_artifact_plan._flow_ids?.length) {
+      planned_flow_ids = inferred_artifact_plan._flow_ids;
+      params._planned_flow_ids = planned_flow_ids;
+    }
+
+    _xlog.log("[xvibe] final artifact plan", {
+      _primary_artifact_type: inferred_artifact_plan._primary_artifact_type,
+      _artifact_types: inferred_artifact_plan._artifact_types,
+      ...(planned_flow_ids.length > 0 ? { _flow_ids: planned_flow_ids } : {}),
+      ...(inferred_artifact_plan._reason ? { _reason: inferred_artifact_plan._reason } : {}),
+    });
+
+    if (inferred_artifact_type === "module") {
+      const runtime_mode = app_id === "vibe-system" ? "system" : "runtime";
+      const runtime_skills =
+        this.get_runtime_skills(app_id, env, runtime_mode);
+
+      return this.execute_module_generation_route({
+        app_id,
+        env,
+        runtime_mode,
+        prompt: user_prompt ?? prompt,
+        supplied_intent_plan,
+        runtime_skills,
+        inferred_artifact_plan,
+        generation_id: effective_generation_id,
+        _progress:
+          (stage_name, message, details = {}) => {
+            this.push_generation_stage(
+              app_id,
+              env,
+              stage_name,
+              message,
+              effective_generation_id,
+              {
+                _artifact_type: "module",
+                ...details,
+              },
+            );
+          },
+      });
+    }
+
+    const artifact_type: VibeArtifactType = inferred_artifact_type;
+
+    if (
+      !forced_artifact_type &&
+      !skip_artifact_plan &&
+      inferred_artifact_plan._execution_plan?._artifacts.length
+    ) {
+      return this.execute_artifact_execution_plan({
+        _prompt: prompt,
+        _params: params,
+        _execution_plan: inferred_artifact_plan._execution_plan,
+        _app_id: app_id,
+        _env: env,
+        _mode: mode,
+        ...(requested_view_id ? { _entry_view_id: requested_view_id } : {}),
+        _generation_id: effective_generation_id,
+      });
+    }
+
+    if (!forced_artifact_type) {
+      _xlog.log("[xvibe] inferred artifact type", {
+        _prompt: prompt,
+        _inferred_artifact_type: inferred_artifact_type,
+        _requested_artifact_type: requested_artifact_type ?? null,
+      });
+    }
+
     const archive_started_at = Date.now();
     const archive_created_at = new Date().toISOString();
     const archive_validation: XVibeRunValidationArchive = {};
@@ -5015,11 +6639,12 @@ export class XVibeModule extends XModule {
       _env: env,
       ...(requested_view_id ? { _view_id: requested_view_id } : {}),
       _mode: mode,
-      _artifact_type: artifact_type,
+      _artifact_type: inferred_artifact_type,
       _created_at: archive_created_at,
       _user_prompt: user_prompt ?? prompt,
       _validation: archive_validation,
     };
+    let behavior_intent: VibeBehaviorIntent = {};
     const stage: XVibeGenerationProgressCallback =
       (stage_name, message, details = {}) => {
         this.push_generation_archive_stage({
@@ -5031,7 +6656,7 @@ export class XVibeModule extends XModule {
           message,
           generation_id: archive._generation_id,
           details: {
-            _artifact_type: artifact_type,
+            _artifact_type: inferred_artifact_type,
             ...(requested_view_id ? { _view_id: requested_view_id } : {}),
             ...details,
           },
@@ -5039,12 +6664,12 @@ export class XVibeModule extends XModule {
       };
     const view_stage: XVibeGenerationProgressCallback =
       (stage_name, message, details) => {
-        if (artifact_type !== "view") return;
+        if (inferred_artifact_type !== "view") return;
         stage(stage_name, message, details);
       };
 
     try {
-      view_stage(
+      stage(
         "preparing",
         "Preparing generation...",
       );
@@ -5052,7 +6677,7 @@ export class XVibeModule extends XModule {
       if (mode !== "refine") {
         this.log_view_mutation_refine_decision({
           _mode: mode,
-          _artifact_type: artifact_type,
+          _artifact_type: inferred_artifact_type,
           ...(requested_view_id ? { _view_id: requested_view_id } : {}),
           _prompt: prompt,
           _current_view: undefined,
@@ -5060,10 +6685,10 @@ export class XVibeModule extends XModule {
         });
       }
 
-      if (mode === "refine" && artifact_type !== "view") {
+      if (mode === "refine" && inferred_artifact_type !== "view") {
         this.log_view_mutation_refine_decision({
           _mode: mode,
-          _artifact_type: artifact_type,
+          _artifact_type: inferred_artifact_type,
           ...(requested_view_id ? { _view_id: requested_view_id } : {}),
           _prompt: prompt,
           _current_view: undefined,
@@ -5076,7 +6701,7 @@ export class XVibeModule extends XModule {
       if (mode === "refine" && !requested_view_id) {
         this.log_view_mutation_refine_decision({
           _mode: mode,
-          _artifact_type: artifact_type,
+          _artifact_type: inferred_artifact_type,
           _prompt: prompt,
           _current_view: undefined,
           _eligible: false,
@@ -5087,40 +6712,49 @@ export class XVibeModule extends XModule {
 
       _xlog.log("[xvibe] generate", {
         _mode: mode,
-        _artifact_type: artifact_type,
+        _artifact_type: inferred_artifact_type,
         ...(capabilities.length > 0 ? { _capabilities: capabilities } : {}),
         _app_id: app_id,
         _env: env,
-        ...(generation_id ? { _generation_id: generation_id } : {}),
+        _generation_id: effective_generation_id,
       });
 
       const runtime_mode = app_id === "vibe-system" ? "system" : "runtime";
 
       let runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
 
-      view_stage(
+      stage(
         "planning",
         "Planning intent...",
       );
       const planning_started_at = Date.now();
       let intent_plan = this.create_artifact_intent_plan({
         prompt,
-        artifact_type,
+        artifact_type: inferred_artifact_type,
         supplied_intent_plan,
         runtime_skills,
       });
+      intent_plan =
+        this.apply_artifact_scope_lock_to_intent_plan(
+          artifact_scope_lock,
+          intent_plan,
+        );
+      _xlog.log("[xvibe] artifact intent selected", {
+        _artifact_type: inferred_artifact_type,
+        _intent_plan: intent_plan,
+      });
       archive._intent_plan = intent_plan;
 
-    // View generation now discovers server modules from
-    // actual xvm.call-server wiring later.
-    // Prevent generic placeholder modules from being created.
+      // View generation now discovers server modules from
+      // actual xvm.call-server wiring later.
+      // Prevent generic placeholder modules from being created.
 
       if (
         artifact_type === "view" &&
         intent_plan._module_name === "generated-module"
       ) {
         _xlog.log("[xvibe] suppressing generic module inference", {
-          _artifact_type: artifact_type,
+          _artifact_type: inferred_artifact_type,
           _module_name: intent_plan._module_name,
         });
 
@@ -5135,6 +6769,21 @@ export class XVibeModule extends XModule {
         archive._intent_plan = intent_plan;
       }
 
+      behavior_intent =
+        this.behavior_planner.infer_behavior_intent({
+          _prompt: prompt,
+          _artifact_type: artifact_type,
+          _artifact_action_plan: artifact_action_plan,
+          _artifact_intent: artifact_intent,
+          _intent_plan: intent_plan,
+        }) ?? { _behavior: "unknown" };
+      _xlog.log("[xvibe] behavior intent", behavior_intent);
+      _xlog.log("[xvibe] behavior planning completed", {
+        _artifact_type: artifact_type,
+        _behavior: behavior_intent?._behavior,
+      });
+      archive._behavior_intent = behavior_intent;
+
       const module_ensure_result =
         await this.ensure_server_module_for_intent({
           app_id,
@@ -5144,14 +6793,20 @@ export class XVibeModule extends XModule {
           intent_plan,
           _progress: stage,
         });
-      
+
       intent_plan = module_ensure_result._intent_plan;
+      intent_plan =
+        this.apply_artifact_scope_lock_to_intent_plan(
+          artifact_scope_lock,
+          intent_plan,
+        );
       archive._intent_plan = intent_plan;
 
-      if (
-        prompt_requests_module_only(prompt) &&
-        module_ensure_result._module_name
-      ) {
+      if (prompt_requests_module_only(prompt)) {
+        if (!module_ensure_result._module_name) {
+          throw new Error("Unable to infer module requirement from prompt");
+        }
+
         _xlog.log("[xvibe] module-only request completed", {
           _module_name: module_ensure_result._module_name,
           _module_ops: module_ensure_result._module_ops,
@@ -5173,6 +6828,67 @@ export class XVibeModule extends XModule {
             : {}),
         };
 
+        stage(
+          "selecting-skills",
+          "Selecting skills...",
+        );
+        stage(
+          "skills-selected",
+          "Skills selected",
+          {
+            _module_name: module_ensure_result._module_name,
+            _module_ops: module_ensure_result._module_ops,
+          },
+        );
+        stage(
+          "building-prompt",
+          "Building prompt...",
+        );
+        stage(
+          "generating",
+          "Generating module...",
+        );
+        stage(
+          "parsing",
+          "Parsing module...",
+        );
+        stage(
+          "validating",
+          "Validating artifact...",
+          {
+            _artifact_id: module_ensure_result._module_name,
+            _module_name: module_ensure_result._module_name,
+          },
+        );
+        stage(
+          "saving",
+          "Saving module...",
+          {
+            _artifact_id: module_ensure_result._module_name,
+            _module_name: module_ensure_result._module_name,
+          },
+        );
+        stage(
+          "complete",
+          "Module ready",
+          {
+            _artifact_id: module_ensure_result._module_name,
+            _module_name: module_ensure_result._module_name,
+          },
+        );
+        this.push_generation_complete({
+          app_id,
+          env,
+          artifact_type: "module",
+          artifact_id: module_ensure_result._module_name,
+          message: "Module ready",
+          generation_id: archive._generation_id,
+          details: {
+            _module_name: module_ensure_result._module_name,
+            _module_ops: module_ensure_result._module_ops,
+          },
+        });
+
         return {
           _ok: true,
           _result: {
@@ -5189,317 +6905,460 @@ export class XVibeModule extends XModule {
         };
       }
 
-    runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
+      runtime_skills = this.get_runtime_skills(app_id, env, runtime_mode);
 
-    const selection_started_at = Date.now();
-    view_stage(
-      "selecting-skills",
-      "Selecting skills...",
-    );
-    const selection = this.selector.select(
-      prompt,
-      artifact_type,
-      capabilities,
-      runtime_skills,
-      intent_plan
-    );
+      const selection_started_at = Date.now();
+      stage(
+        "selecting-skills",
+        "Selecting skills...",
+      );
+      const selection = this.selector.select(
+        prompt,
+        artifact_type,
+        capabilities,
+        runtime_skills,
+        intent_plan
+      );
 
-    _xlog.log("[xvibe] selected skills", {
-      _artifact_type: artifact_type,
-      _skill_ids: selection.skill_ids,
-    });
-    archive._selected_skill_ids = selection.skill_ids;
-    archive._selected_skills = selected_skills_archive_payload(selection);
-    view_stage(
-      "skills-selected",
-      "Skills selected",
-      {
+      _xlog.log("[xvibe] selected skills", {
+        _artifact_type: artifact_type,
         _skill_ids: selection.skill_ids,
-        _duration_ms: Date.now() - selection_started_at,
-        _planning_duration_ms: selection_started_at - planning_started_at,
-      },
-    );
-
-    if (mode === "refine" && requested_view_id) {
-      view_stage(
-        "loading-view",
-        "Loading current view...",
+      });
+      archive._selected_skill_ids = selection.skill_ids;
+      archive._selected_skills = selected_skills_archive_payload(selection);
+      stage(
+        "skills-selected",
+        "Skills selected",
         {
-          _view_id: requested_view_id,
+          _skill_ids: selection.skill_ids,
+          _duration_ms: Date.now() - selection_started_at,
+          _planning_duration_ms: selection_started_at - planning_started_at,
         },
       );
-    }
-    const current_view =
-      mode === "refine" && requested_view_id
-        ? await this.load_current_view_for_refine({
+
+      if (mode === "refine" && requested_view_id) {
+        view_stage(
+          "loading-view",
+          "Loading current view...",
+          {
+            _view_id: requested_view_id,
+          },
+        );
+      }
+      const current_view =
+        mode === "refine" && requested_view_id
+          ? await this.load_current_view_for_refine({
+            _app_id: app_id,
+            _env: env,
+            _view_id: requested_view_id,
+          })
+          : undefined;
+
+      let use_view_mutation = false;
+      if (mode === "refine" && artifact_type === "view") {
+        use_view_mutation =
+          this.should_use_view_mutation(prompt, current_view);
+
+        this.log_view_mutation_refine_decision({
+          _mode: mode,
+          _artifact_type: artifact_type,
+          ...(requested_view_id ? { _view_id: requested_view_id } : {}),
+          _prompt: prompt,
+          _current_view: current_view,
+          _eligible: use_view_mutation,
+        });
+      }
+
+      const runtime_context = await this.collect_runtime_awareness_context({
+        _app_id: app_id,
+        _env: env,
+
+        ...(requested_view_id
+          ? { _view_id: requested_view_id }
+          : {}),
+
+        ...(current_view
+          ? { _current_view: current_view }
+          : {}),
+
+        ...(is_plain_object(params._generated_artifacts)
+          ? { _generated_artifacts: params._generated_artifacts }
+          : {}),
+
+        _runtime_skills: runtime_skills,
+      });
+      runtime_context._behavior_intent = behavior_intent;
+      archive._runtime_context = {
+        ...runtime_context,
+        _selected_modules: intent_plan._modules,
+        _selected_objects: intent_plan._objects,
+        _selected_xui_objects: intent_plan._xui_objects,
+        _selected_entities: intent_plan._entities,
+      };
+
+      verbose_log("[xvibe] runtime context", runtime_context);
+
+      if (use_view_mutation && requested_view_id) {
+        const mutation_response =
+          await this.try_apply_view_mutation({
+            app_id,
+            env,
+            view_id: requested_view_id,
+            prompt,
+            current_view,
+            include_artifact_type: forced_artifact_type !== "view",
+            archive,
+            progress: view_stage,
+            archive_started_at,
+          });
+
+        if (mutation_response) {
+          return mutation_response;
+        }
+      }
+
+      let deterministic_skeleton: XVibeViewArtifact | undefined;
+
+      if (artifact_type === "view" && mode !== "refine") {
+        const artifact_factory_diagnostics: VibeArtifactFactoryDiagnostic[] = [];
+        deterministic_skeleton = this.view_builder.build({
+          _intent_ir: intent_plan,
+          _prompt: prompt,
+          _runtime_context: runtime_context,
+          _runtime_skills: runtime_skills,
+          _planned_flow_ids: planned_flow_ids,
+          _selected_skills: selection.skills,
+          _artifact_factory_diagnostics: artifact_factory_diagnostics,
+        });
+
+        verbose_log("[xvibe] artifact factory diagnostics", {
+          _diagnostics: artifact_factory_diagnostics,
+        });
+
+        const skeleton_validation = this.validate_generated_artifact({
+          _prompt: prompt,
+          _artifact_type: "view",
+          _artifact: deterministic_skeleton,
+          _runtime_skills: runtime_skills,
+          _generated_artifacts: params._generated_artifacts,
+          _planned_flow_ids: planned_flow_ids,
+        });
+
+        if (!skeleton_validation._ok) {
+          throw new Error(
+            `Invalid deterministic view skeleton: ${this.validation_error_summary(skeleton_validation._errors)}`
+          );
+        }
+
+        verbose_log("[xvibe] resolved skeleton flow ids", {
+          _flow_ids: collect_view_flow_ids(deterministic_skeleton),
+        });
+
+        verbose_log("[xvibe] deterministic skeleton validation success", {
+          _artifact_type: "view",
+          _view_id: deterministic_skeleton._id,
+        });
+
+        verbose_log("[xvibe] deterministic view skeleton", {
+          _view: deterministic_skeleton,
+        });
+      }
+
+      const prompt_started_at = Date.now();
+      stage(
+        "building-prompt",
+        "Building prompt...",
+      );
+      const final_prompt = this.prompt_builder.build({
+        prompt,
+        _mode: mode,
+        _artifact_type: artifact_type,
+        selection,
+        runtime_context,
+        ...(deterministic_skeleton ? { deterministic_skeleton } : {}),
+      });
+      archive._final_prompt = final_prompt;
+
+      if (mode === "refine") {
+        _xlog.log("[xvibe] refine prompt mode", {
           _app_id: app_id,
           _env: env,
           _view_id: requested_view_id,
-        })
-        : undefined;
-
-    let use_view_mutation = false;
-    if (mode === "refine" && artifact_type === "view") {
-      use_view_mutation =
-        this.should_use_view_mutation(prompt, current_view);
-
-      this.log_view_mutation_refine_decision({
-        _mode: mode,
-        _artifact_type: artifact_type,
-        ...(requested_view_id ? { _view_id: requested_view_id } : {}),
-        _prompt: prompt,
-        _current_view: current_view,
-        _eligible: use_view_mutation,
-      });
-    }
-
-    const runtime_context = await this.collect_runtime_awareness_context({
-      _app_id: app_id,
-      _env: env,
-
-      ...(requested_view_id
-        ? { _view_id: requested_view_id }
-        : {}),
-
-      ...(current_view
-        ? { _current_view: current_view }
-        : {}),
-
-      ...(is_plain_object(params._generated_artifacts)
-        ? { _generated_artifacts: params._generated_artifacts }
-        : {}),
-    });
-    archive._runtime_context = {
-      ...runtime_context,
-      _selected_modules: intent_plan._modules,
-      _selected_objects: intent_plan._objects,
-      _selected_xui_objects: intent_plan._xui_objects,
-      _selected_entities: intent_plan._entities,
-    };
-
-    verbose_log("[xvibe] runtime context", runtime_context);
-
-    if (use_view_mutation && requested_view_id) {
-      const mutation_response =
-        await this.try_apply_view_mutation({
-          app_id,
-          env,
-          view_id: requested_view_id,
-          prompt,
-          current_view,
-          include_artifact_type: forced_artifact_type !== "view",
-          archive,
-          progress: view_stage,
-          archive_started_at,
         });
-
-      if (mutation_response) {
-        return mutation_response;
       }
-    }
 
-    let deterministic_skeleton: XVibeViewArtifact | undefined;
+      verbose_log("[xvibe] FINAL PROMPT", { _prompt: final_prompt });
 
-    if (artifact_type === "view" && mode !== "refine") {
-      const artifact_factory_diagnostics: VibeArtifactFactoryDiagnostic[] = [];
-      deterministic_skeleton = this.view_builder.build({
-        _intent_ir: intent_plan,
-        _prompt: prompt,
-        _runtime_context: runtime_context,
-        _runtime_skills: runtime_skills,
-        _planned_flow_ids: planned_flow_ids,
-        _selected_skills: selection.skills,
-        _artifact_factory_diagnostics: artifact_factory_diagnostics,
-      });
+      const generation_started_at = Date.now();
+      stage(
+        "generating",
+        "Generating JSON...",
+        {
+          _duration_ms: generation_started_at - prompt_started_at,
+        },
+      );
+      const xai_result: any = unwrap_command_result(
+        await _x.execute({
+          _module: "xai",
+          _op: "generate",
+          _params: {
+            _prompt: final_prompt,
+            response_format: {
+              type: "json_object",
+            },
+          },
+        } as any)
+      );
+      archive._ai_output = xai_result;
 
-      verbose_log("[xvibe] artifact factory diagnostics", {
-        _diagnostics: artifact_factory_diagnostics,
-      });
+      verbose_log("[xvibe] raw ai output", { _result: xai_result });
 
-      const skeleton_validation = this.validate_generated_artifact({
-        _prompt: prompt,
-        _artifact_type: "view",
-        _artifact: deterministic_skeleton,
-        _runtime_skills: runtime_skills,
-        _generated_artifacts: params._generated_artifacts,
-        _planned_flow_ids: planned_flow_ids,
-      });
+      stage(
+        "parsing",
+        "Parsing response...",
+        {
+          _duration_ms: Date.now() - generation_started_at,
+        },
+      );
+      const parsed = this.output_parser.parse(
+        read_generated_text(xai_result),
+        artifact_type
+      );
 
-      if (!skeleton_validation._ok) {
+      if (parsed._artifact_type !== artifact_type) {
         throw new Error(
-          `Invalid deterministic view skeleton: ${this.validation_error_summary(skeleton_validation._errors)}`
+          `Invalid AI output: expected '${artifact_type}' artifact but received '${parsed._artifact_type}'`
         );
       }
 
-      verbose_log("[xvibe] resolved skeleton flow ids", {
-        _flow_ids: collect_view_flow_ids(deterministic_skeleton),
-      });
+      if (artifact_type === "view") {
+        if (!parsed._view) {
+          throw new Error("Invalid AI output: expected parsed view artifact");
+        }
 
-      verbose_log("[xvibe] deterministic skeleton validation success", {
-        _artifact_type: "view",
-        _view_id: deterministic_skeleton._id,
-      });
-
-      verbose_log("[xvibe] deterministic view skeleton", {
-        _view: deterministic_skeleton,
-      });
-    }
-
-    const prompt_started_at = Date.now();
-    view_stage(
-      "building-prompt",
-      "Building prompt...",
-    );
-    const final_prompt = this.prompt_builder.build({
-      prompt,
-      _mode: mode,
-      _artifact_type: artifact_type,
-      selection,
-      runtime_context,
-      ...(deterministic_skeleton ? { deterministic_skeleton } : {}),
-    });
-    archive._final_prompt = final_prompt;
-
-    if (mode === "refine") {
-      _xlog.log("[xvibe] refine prompt mode", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: requested_view_id,
-      });
-    }
-
-    verbose_log("[xvibe] FINAL PROMPT", { _prompt: final_prompt });
-
-    const generation_started_at = Date.now();
-    view_stage(
-      "generating",
-      "Generating JSON...",
-      {
-        _duration_ms: generation_started_at - prompt_started_at,
-      },
-    );
-    const xai_result: any = unwrap_command_result(
-      await _x.execute({
-        _module: "xai",
-        _op: "generate",
-        _params: {
-          _prompt: final_prompt,
-          response_format: {
-            type: "json_object",
-          },
-        },
-      } as any)
-    );
-    archive._ai_output = xai_result;
-
-    verbose_log("[xvibe] raw ai output", { _result: xai_result });
-
-    view_stage(
-      "parsing",
-      "Parsing response...",
-      {
-        _duration_ms: Date.now() - generation_started_at,
-      },
-    );
-    const parsed = this.output_parser.parse(
-      read_generated_text(xai_result),
-      artifact_type
-    );
-
-    if (parsed._artifact_type !== artifact_type) {
-      throw new Error(
-        `Invalid AI output: expected '${artifact_type}' artifact but received '${parsed._artifact_type}'`
-      );
-    }
-
-    if (artifact_type === "view") {
-      if (!parsed._view) {
-        throw new Error("Invalid AI output: expected parsed view artifact");
-      }
-
-      return this.persist_view_artifact({
-        app_id,
-        env,
-        mode,
-        prompt,
-        runtime_skills,
-        requested_view_id,
-        parsed_view: parsed._view,
-        generated_artifacts: params._generated_artifacts,
-        planned_flow_ids,
-        generation_id,
-        include_artifact_type: forced_artifact_type !== "view",
-        archive,
-        archive_started_at,
-        progress: stage,
-      });
-    }
-
-    if (artifact_type === "flow") {
-      if (!parsed._flow) {
-        throw new Error("Invalid AI output: expected parsed flow artifact");
-      }
-
-      if (planned_flow_ids.length === 1) {
-        parsed._flow._id = planned_flow_ids[0];
-
-        verbose_log("[xvibe] forced planned flow id", {
-          _flow_id: planned_flow_ids[0],
+        return this.persist_view_artifact({
+          app_id,
+          env,
+          mode,
+          prompt,
+          runtime_skills,
+          requested_view_id,
+          parsed_view: parsed._view,
+          generated_artifacts: params._generated_artifacts,
+          planned_flow_ids,
+          generation_id: effective_generation_id,
+          include_artifact_type: forced_artifact_type !== "view",
+          archive,
+          archive_started_at,
+          progress: stage,
         });
       }
 
-      const flow = await this.validate_or_repair_generated_artifact({
+      if (artifact_type === "flow") {
+        if (!parsed._flow) {
+          throw new Error("Invalid AI output: expected parsed flow artifact");
+        }
+
+        if (planned_flow_ids.length === 1) {
+          parsed._flow._id = planned_flow_ids[0];
+
+          verbose_log("[xvibe] forced planned flow id", {
+            _flow_id: planned_flow_ids[0],
+          });
+        }
+
+        const validation_started_at = Date.now();
+        stage(
+          "validating",
+          "Validating artifact...",
+          {
+            _artifact_type: "flow",
+          },
+        );
+        const flow = await this.validate_or_repair_generated_artifact({
+          _prompt: prompt,
+          _artifact_type: "flow",
+          _artifact: parsed._flow,
+          _runtime_skills: runtime_skills,
+          _archive_validation: archive_validation,
+          _progress: stage,
+        }) as XVibeFlowArtifact;
+
+        const flow_id = ensure_artifact_id(flow, "_flow._id");
+        const saving_started_at = Date.now();
+        stage(
+          "saving",
+          "Saving flow...",
+          {
+            _artifact_type: "flow",
+            _artifact_id: flow_id,
+            _flow_id: flow_id,
+            _duration_ms: saving_started_at - validation_started_at,
+          },
+        );
+        const result = await this.persist_flow_artifact(app_id, env, flow, archive);
+        if (is_plain_object(result) && result._ok === false) {
+          throw new XVibeStructuredError(result);
+        }
+        if (!archive._result) {
+          archive._result = archive_result_from_response("flow", result);
+        }
+        stage(
+          "complete",
+          "Flow updated",
+          {
+            _artifact_type: "flow",
+            _artifact_id: flow_id,
+            _flow_id: flow_id,
+            _duration_ms: Date.now() - archive_started_at,
+            _save_duration_ms: Date.now() - saving_started_at,
+          },
+        );
+        this.push_generation_complete({
+          app_id,
+          env,
+          artifact_type: "flow",
+          artifact_id: flow_id,
+          message: "Flow updated",
+          generation_id: archive._generation_id,
+          details: {
+            _flow_id: flow_id,
+          },
+        });
+        return result;
+      }
+
+      if (artifact_type === "entity") {
+        if (!parsed._entity) {
+          throw new Error("Invalid AI output: expected parsed entity artifact");
+        }
+
+        const validation_started_at = Date.now();
+        stage(
+          "validating",
+          "Validating artifact...",
+          {
+            _artifact_type: "entity",
+          },
+        );
+        const entity = await this.validate_or_repair_generated_artifact({
+          _prompt: prompt,
+          _artifact_type: "entity",
+          _artifact: parsed._entity,
+          _runtime_skills: runtime_skills,
+          _archive_validation: archive_validation,
+          _progress: stage,
+        }) as XVibeEntityArtifact;
+
+        const entity_id = ensure_artifact_id(entity, "_entity._id");
+        const saving_started_at = Date.now();
+        stage(
+          "saving",
+          "Saving entity...",
+          {
+            _artifact_type: "entity",
+            _artifact_id: entity_id,
+            _entity_id: entity_id,
+            _duration_ms: saving_started_at - validation_started_at,
+          },
+        );
+        const result = await this.persist_entity_artifact(app_id, env, entity, archive);
+        if (is_plain_object(result) && result._ok === false) {
+          throw new XVibeStructuredError(result);
+        }
+        if (!archive._result) {
+          archive._result = archive_result_from_response("entity", result);
+        }
+        stage(
+          "complete",
+          "Entity updated",
+          {
+            _artifact_type: "entity",
+            _artifact_id: entity_id,
+            _entity_id: entity_id,
+            _duration_ms: Date.now() - archive_started_at,
+            _save_duration_ms: Date.now() - saving_started_at,
+          },
+        );
+        this.push_generation_complete({
+          app_id,
+          env,
+          artifact_type: "entity",
+          artifact_id: entity_id,
+          message: "Entity updated",
+          generation_id: archive._generation_id,
+          details: {
+            _entity_id: entity_id,
+          },
+        });
+        return result;
+      }
+
+      if (!parsed._command) {
+        throw new Error("Invalid AI output: expected parsed command artifact");
+      }
+
+      const validation_started_at = Date.now();
+      stage(
+        "validating",
+        "Validating artifact...",
+        {
+          _artifact_type: "command",
+        },
+      );
+      const command = await this.validate_or_repair_generated_artifact({
         _prompt: prompt,
-        _artifact_type: "flow",
-        _artifact: parsed._flow,
+        _artifact_type: "command",
+        _artifact: parsed._command,
         _runtime_skills: runtime_skills,
         _archive_validation: archive_validation,
-      }) as XVibeFlowArtifact;
+        _progress: stage,
+      }) as XVibeCommandArtifact;
 
-      const result = await this.persist_flow_artifact(app_id, env, flow, archive);
+      const module_name = read_required_string(command._module, "_command._module");
+      const op_name = read_required_string(command._op, "_command._op");
+      const command_id = `${module_name}.${op_name}`;
+      const saving_started_at = Date.now();
+      stage(
+        "saving",
+        "Saving command...",
+        {
+          _artifact_type: "command",
+          _artifact_id: command_id,
+          _module: module_name,
+          _op: op_name,
+          _duration_ms: saving_started_at - validation_started_at,
+        },
+      );
+      const result = this.return_command_artifact(app_id, env, command, archive);
       if (!archive._result) {
-        archive._result = archive_result_from_response("flow", result);
+        archive._result = archive_result_from_response("command", result);
       }
+      stage(
+        "complete",
+        "Command generated",
+        {
+          _artifact_type: "command",
+          _artifact_id: command_id,
+          _module: module_name,
+          _op: op_name,
+          _duration_ms: Date.now() - archive_started_at,
+          _save_duration_ms: Date.now() - saving_started_at,
+        },
+      );
+      this.push_generation_complete({
+        app_id,
+        env,
+        artifact_type: "command",
+        artifact_id: command_id,
+        message: "Command generated",
+        generation_id: archive._generation_id,
+        details: {
+          _module: module_name,
+          _op: op_name,
+        },
+      });
       return result;
-    }
-
-    if (artifact_type === "entity") {
-      if (!parsed._entity) {
-        throw new Error("Invalid AI output: expected parsed entity artifact");
-      }
-
-      const entity = await this.validate_or_repair_generated_artifact({
-        _prompt: prompt,
-        _artifact_type: "entity",
-        _artifact: parsed._entity,
-        _runtime_skills: runtime_skills,
-        _archive_validation: archive_validation,
-      }) as XVibeEntityArtifact;
-
-      const result = await this.persist_entity_artifact(app_id, env, entity, archive);
-      if (!archive._result) {
-        archive._result = archive_result_from_response("entity", result);
-      }
-      return result;
-    }
-
-    if (!parsed._command) {
-      throw new Error("Invalid AI output: expected parsed command artifact");
-    }
-
-    const command = await this.validate_or_repair_generated_artifact({
-      _prompt: prompt,
-      _artifact_type: "command",
-      _artifact: parsed._command,
-      _runtime_skills: runtime_skills,
-      _archive_validation: archive_validation,
-    }) as XVibeCommandArtifact;
-
-    const result = this.return_command_artifact(app_id, env, command, archive);
-    if (!archive._result) {
-      archive._result = archive_result_from_response("command", result);
-    }
-    return result;
     } catch (error) {
       const diagnostic = parser_diagnostic(error);
       const diagnostics = parser_diagnostics(error);
@@ -5570,11 +7429,15 @@ export class XVibeModule extends XModule {
         _env: input.env,
         _view_id: input.requested_view_id,
       });
+      if (input.requested_view_id) {
+        view_to_persist._id = input.requested_view_id;
+      }
     } else {
       normalize_full_view_id(view_to_persist, input.requested_view_id);
     }
 
     ensure_valid_xui_root(view_to_persist);
+    this.assign_view_ids(view_to_persist);
 
     const normalized_commands =
       normalize_known_generated_module_commands(
@@ -5646,6 +7509,12 @@ export class XVibeModule extends XModule {
           input.archive?._validation as XVibeRunValidationArchive | undefined,
         _progress: input.progress,
       }) as XVibeJsonObject;
+    if (input.mode === "refine" && input.requested_view_id) {
+      view_to_persist._id = input.requested_view_id;
+    } else if (input.mode !== "refine") {
+      normalize_full_view_id(view_to_persist, input.requested_view_id);
+    }
+    this.assign_view_ids(view_to_persist);
 
     const normalized_repaired_commands =
       normalize_known_generated_module_commands(
@@ -5659,6 +7528,7 @@ export class XVibeModule extends XModule {
       });
     }
 
+    this.assign_view_ids(view_to_persist);
     const view_id = read_required_string(view_to_persist._id, "_view._id");
     const saving_started_at = Date.now();
     input.progress?.(
@@ -6147,180 +8017,180 @@ export class XVibeModule extends XModule {
         : {};
 
     try {
-    const prompt = resolve_prompt(params);
-    const app_id =
-      read_optional_string(params._app_id, "_app_id") ?? "xvibe-app";
-    const env =
-      read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
-    const generation_id = read_optional_string(params._generation_id, "_generation_id");
-    const entry_view_id = "main";
+      const prompt = resolve_prompt(params);
+      const app_id =
+        read_optional_string(params._app_id, "_app_id") ?? "xvibe-app";
+      const env =
+        read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
+      const generation_id = read_optional_string(params._generation_id, "_generation_id");
+      const entry_view_id = "main";
 
-    _xlog.log("[xvibe] generate_app:start", {
-      _prompt: prompt,
-      _app_id: app_id,
-      _env: env,
-    });
-
-    await _x.execute({
-      _module: "server-xvm",
-      _op: "create_app",
-      _params: {
+      _xlog.log("[xvibe] generate_app:start", {
+        _prompt: prompt,
         _app_id: app_id,
         _env: env,
-        _name: app_id,
-        _entry_view_id: entry_view_id,
-      }
-    });
+      });
 
-    this.push_generation_stage(
-      app_id,
-      env,
-      "shell",
-      "Creating application...",
-      generation_id
-    );
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "create_app",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _name: app_id,
+          _entry_view_id: entry_view_id,
+        }
+      });
 
-    await _x.execute({
-      _module: "server-xvm",
-      _op: "push_update",
-      _params: {
+      this.push_generation_stage(
+        app_id,
+        env,
+        "shell",
+        "Creating application...",
+        generation_id
+      );
+
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "push_update",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          ...(generation_id ? { _generation_id: generation_id } : {}),
+          _view: this.build_live_shell_view(app_id, env, entry_view_id),
+        }
+      });
+
+      _xlog.log("[xvibe] live shell pushed", {
+        _app_id: app_id,
+        _env: env,
+        _view_id: entry_view_id,
+      });
+
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "set_active_app",
+        _params: {
+          _app_id: app_id,
+          _env: env
+        }
+      });
+
+      _xlog.log("[xvibe] active app set early", {
+        _app_id: app_id,
+        _env: env,
+      });
+
+      const plan = this.planner.plan_app(prompt);
+      _xlog.log("[xvibe] app plan created", {
+        _app_type: plan._app_type,
+        _logic_level: plan._logic_level,
+        _artifacts: plan._artifacts,
+        ...(plan._flow_ids ? { _flow_ids: plan._flow_ids } : {}),
+        _requires_module: plan._requires_module,
+      });
+
+      this.push_generation_stage(
+        app_id,
+        env,
+        "planning",
+        "Planning application...",
+        generation_id
+      );
+
+      let intent_plan = await this.create_intent_plan({
+        prompt,
+        app_plan: plan,
+        app_id,
+        env,
+      });
+      const module_ensure_result =
+        await this.ensure_server_module_for_intent({
+          app_id,
+          env,
+          runtime_mode:
+            app_id === "vibe-system"
+              ? "system"
+              : "runtime",
+          prompt,
+          intent_plan,
+        });
+      intent_plan = module_ensure_result._intent_plan;
+
+      this.push_generation_stage(
+        app_id,
+        env,
+        "planned",
+        "Application plan created",
+        generation_id
+      );
+
+      this.log_intent_plan("artifact_type", intent_plan);
+      const execution_plan = this.build_execution_plan_for_intent(plan, intent_plan);
+      _xlog.log("[xvibe] execution plan created", {
+        _app_id: app_id,
+        _execution_plan: execution_plan,
+      });
+
+      this.push_generation_stage(
+        app_id,
+        env,
+        "generating",
+        "Generating artifacts...",
+        generation_id
+      );
+      const context = this.build_artifact_generation_context({
+        _plan: plan,
+        _intent_plan: intent_plan,
         _app_id: app_id,
         _env: env,
         ...(generation_id ? { _generation_id: generation_id } : {}),
-        _view: this.build_live_shell_view(app_id, env, entry_view_id),
-      }
-    });
-
-    _xlog.log("[xvibe] live shell pushed", {
-      _app_id: app_id,
-      _env: env,
-      _view_id: entry_view_id,
-    });
-
-    await _x.execute({
-      _module: "server-xvm",
-      _op: "set_active_app",
-      _params: {
-        _app_id: app_id,
-        _env: env
-      }
-    });
-
-    _xlog.log("[xvibe] active app set early", {
-      _app_id: app_id,
-      _env: env,
-    });
-
-    const plan = this.planner.plan_app(prompt);
-    _xlog.log("[xvibe] app plan created", {
-      _app_type: plan._app_type,
-      _logic_level: plan._logic_level,
-      _artifacts: plan._artifacts,
-      ...(plan._flow_ids ? { _flow_ids: plan._flow_ids } : {}),
-      _requires_module: plan._requires_module,
-    });
-
-    this.push_generation_stage(
-      app_id,
-      env,
-      "planning",
-      "Planning application...",
-      generation_id
-    );
-
-    let intent_plan = await this.create_intent_plan({
-      prompt,
-      app_plan: plan,
-      app_id,
-      env,
-    });
-    const module_ensure_result =
-      await this.ensure_server_module_for_intent({
-        app_id,
-        env,
-        runtime_mode:
-          app_id === "vibe-system"
-            ? "system"
-            : "runtime",
-        prompt,
-        intent_plan,
-      });
-    intent_plan = module_ensure_result._intent_plan;
-
-    this.push_generation_stage(
-      app_id,
-      env,
-      "planned",
-      "Application plan created",
-      generation_id
-    );
-
-    this.log_intent_plan("artifact_type", intent_plan);
-    const execution_plan = this.build_execution_plan_for_intent(plan, intent_plan);
-    _xlog.log("[xvibe] execution plan created", {
-      _app_id: app_id,
-      _execution_plan: execution_plan,
-    });
-
-    this.push_generation_stage(
-      app_id,
-      env,
-      "generating",
-      "Generating artifacts...",
-      generation_id
-    );
-    const context = this.build_artifact_generation_context({
-      _plan: plan,
-      _intent_plan: intent_plan,
-      _app_id: app_id,
-      _env: env,
-      ...(generation_id ? { _generation_id: generation_id } : {}),
-    });
-
-    const generated_artifacts =
-      await this.generate_planned_artifacts({
-        _prompt: prompt,
-        _entry_view_id: entry_view_id,
-        _execution_plan: execution_plan,
-        _context: context,
       });
 
+      const generated_artifacts =
+        await this.generate_planned_artifacts({
+          _prompt: prompt,
+          _entry_view_id: entry_view_id,
+          _execution_plan: execution_plan,
+          _context: context,
+        });
 
 
-    await _x.execute({
-      _module: "server-xvm",
-      _op: "set_active_app",
-      _params: {
-        _app_id: app_id,
-        _env: env
-      }
-    });
 
-    _xlog.log("[xvibe] app orchestration completed", {
-      _app_id: app_id,
-      _env: env,
-      _generated_artifacts: generated_artifacts,
-    });
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "set_active_app",
+        _params: {
+          _app_id: app_id,
+          _env: env
+        }
+      });
 
-    this.push_generation_stage(
-      app_id,
-      env,
-      "complete",
-      "Application ready",
-      generation_id
-    );
-
-    return {
-      _ok: true,
-      _result: {
+      _xlog.log("[xvibe] app orchestration completed", {
         _app_id: app_id,
         _env: env,
-        _entry_view_id: entry_view_id,
-        _plan: plan,
-        _intent_plan: intent_plan,
         _generated_artifacts: generated_artifacts,
-      }
-    };
+      });
+
+      this.push_generation_stage(
+        app_id,
+        env,
+        "complete",
+        "Application ready",
+        generation_id
+      );
+
+      return {
+        _ok: true,
+        _result: {
+          _app_id: app_id,
+          _env: env,
+          _entry_view_id: entry_view_id,
+          _plan: plan,
+          _intent_plan: intent_plan,
+          _generated_artifacts: generated_artifacts,
+        }
+      };
     } catch (error) {
       this.broadcast_generation_failed(
         {

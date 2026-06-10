@@ -10,6 +10,13 @@ export {VibeOutputParser,VibeOutputParserError,} from "./VibeOutputParser.js";
 export { VibeKnowledgeSelector } from "./VibeKnowledgeSelector.js";
 export { VibeIntentPlanner, normalize_string_array } from "./VibeIntentPlanner.js";
 export type { VibeIntentPlan, VibeRuntimeCapabilityRegistry } from "./VibeIntentPlanner.js";
+export { VibeBehaviorPlanner } from "./VibeBehaviorPlanner.js";
+export type {
+  RuntimeAssets,
+  RuntimeAssetRef,
+  VibeBehaviorIntent,
+  VibeBehaviorPlannerInput,
+} from "./VibeBehaviorPlanner.js";
 export {
   budgetSkills,
   isWeakSkill,

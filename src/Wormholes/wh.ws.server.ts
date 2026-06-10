@@ -60,6 +60,20 @@ function isOpen(ws: WebSocket): boolean {
   return ws.readyState === WebSocket.OPEN;
 }
 
+function getBearerToken(header: unknown): string | undefined {
+  if (!header) return undefined;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== "string") return undefined;
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  return match?.[1];
+}
+
+function safeMetaForLog(meta: WHContext["_meta"]): WHContext["_meta"] {
+  if (!meta) return meta;
+  const { _token, ...safe_meta } = meta;
+  return safe_meta;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Server                                                                     */
 /* -------------------------------------------------------------------------- */
@@ -83,6 +97,7 @@ export function createWormholesWSServer(
     const wid = _xu.guid();
     const sid_local = _xu.guid();
     const session = new WHSession(sid_local);
+    const token = getBearerToken(req?.headers?.authorization);
 
     const ctx: WHContext = {
       _sid: session._sid,
@@ -91,6 +106,7 @@ export function createWormholesWSServer(
         _wid: wid,
         _user_agent: req?.headers?.["user-agent"] as string | undefined,
         _ip: (req?.socket?.remoteAddress as string | undefined) ?? undefined,
+        ...(token ? { _token: token } : {}),
       },
       _route: {
         _from: { _client: "ws" },
@@ -256,7 +272,7 @@ export function wsBroadcastScoped(
     }
     _xlog.log("[WH] checking conn", {
       wid,
-      meta: conn._ctx._meta
+      meta: safeMetaForLog(conn._ctx._meta)
     });
   }
 
