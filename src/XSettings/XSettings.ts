@@ -1,53 +1,69 @@
 // Settings.ts
 // Module to manage server properties with real-time updates from a JSON file
 
-import { _XEventManager } from "../XEM/XEventManager.js";
+import { _xem } from "../XEM/XEventManager.js";
 import * as fs from 'fs';
 import * as path from 'path';
 import { _xu } from "../XNUtils/XUtils.js";
+import { _xlog } from "@xpell/core";
 
 
 
 
 
 
-const XSettingsFolder = "settings";
-
-export class _XSettings extends _XEventManager {
+export class _XSettings {
     private filePath!: string;
     private data: Record<string, any> = {};
     private watcher?: fs.FSWatcher;
 
     constructor() {
-        super();
     }
 
     onSetup(workFolder: string = ".work") {
         const settingsFolderPath = path.join(workFolder, "settings");
         _xu.checkFolders([settingsFolderPath]);
-        const jsonFilePath: string = path.join( settingsFolderPath, "server-settings.json");
-        this.filePath = path.resolve(jsonFilePath);
-        this.save();
+
+        this.filePath = path.resolve(
+            path.join(settingsFolderPath, "server-settings.json")
+        );
+
+        const loaded = this.load(this.filePath);
+
+        if (!loaded && !fs.existsSync(this.filePath)) {
+            this.data = {};
+            this.save();
+        }
+
         this.watch();
     }
 
     init(workFolder: string = ".work") {
-        const settingsFolderPath = path.join(workFolder, "settings");
-        const jsonFilePath: string = path.join( settingsFolderPath, "server-settings.json");
-        this.load(jsonFilePath);
+        this.onSetup(workFolder);
     }
 
-
-    load(jsonFilePath: string) {
+    load(jsonFilePath: string): boolean {
         try {
             this.filePath = path.resolve(jsonFilePath);
-            const raw = fs.readFileSync(this.filePath, 'utf-8');
-            this.data = JSON.parse(raw);
-            this.fire('update', this.data);
+
+            if (!fs.existsSync(this.filePath)) {
+                return false;
+            }
+
+            const raw = fs.readFileSync(this.filePath, "utf-8").trim();
+
+            if (!raw) {
+                this.data = {};
+            } else {
+                this.data = JSON.parse(raw);
+            }
+
+            _xem.fire("settings:update", this.data);
+            return true;
         } catch (err) {
-            this.fire('error', err);
+            _xem.fire("settings:error", err);
+            return false;
         }
-        this.watch();
     }
 
     private watch() {
@@ -68,16 +84,53 @@ export class _XSettings extends _XEventManager {
         this.save();
     }
 
+    public getPath(path: string, fallback?: any): any {
+        return _xu.get_path(this.data, path, fallback);
+    }
+
+    public setPath(path: string, value: any): void {
+        _xu.set_path(this.data, path, value);
+        this.save();
+    }
+
+    public hasPath(path: string): boolean {
+        const missing = Symbol("xsettings.missing");
+        return _xu.get_path(this.data, path, missing) !== missing;
+    }
+
+    public ensurePath(path: string, value: any): void {
+        if (!this.hasPath(path)) {
+            this.setPath(path, value);
+        }
+    }
+
+    public ensure(key: string, value: any) {
+        if (!this.has(key)) {
+            this.set(key, value);
+        }
+    }
+
     public has(key: string): boolean {
         return this.data.hasOwnProperty(key);
     }
 
+    public ensureDefaults(key: string, defaults: any) {
+        const current = this.data[key] ?? {};
+        const merged = _xu.deepMergeDefaults(current, defaults);
+
+        if (JSON.stringify(current) !== JSON.stringify(merged)) {
+            this.data[key] = merged;
+            this.save();
+        }
+    }
+
+
     private save() {
         try {
             fs.writeFileSync(this.filePath, JSON.stringify(this.data, null, 2), 'utf-8');
-            this.fire('update', this.data);
+            _xem.fire('settings:update', this.data);
         } catch (err) {
-            this.fire('error', err);
+            _xem.fire('settings:error', err);
         }
     }
 

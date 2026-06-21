@@ -18,7 +18,6 @@ import { _x, _xlog } from "@xpell/core";
 import { _xu } from "../XNUtils/XUtils.js";
 import { _xs } from "../XSettings/XSettings.js";
 import { fileURLToPath } from "url";
-
 import {
   createWormholesWSServer,
   createWormholesRestRouter,
@@ -79,7 +78,7 @@ export class XWebServer {
   _app!: express.Express;
   _routes_handlers: Array<(app: Express, server: XWebServer) => void> = [];
 
-  constructor() {}
+  constructor() { }
 
   get _express_app() {
     return this._app;
@@ -93,12 +92,15 @@ export class XWebServer {
     this._work_folder = path.resolve(workFolder);
     this._public_folder = path.resolve(workFolder, "public");
   }
+  private ensureDefaultWebSettings() {
+    _xs.ensureDefaults("xweb", DEFAULT_XWEB_SETTINGS);
+  }
 
   onSetup(workFolder = ".work") {
     this.init(workFolder);
     _xu.checkFolders([this._public_folder]);
 
-    _xs.set("xweb", DEFAULT_XWEB_SETTINGS);
+    this.ensureDefaultWebSettings();
 
     const indexSrc = path.resolve(
       "./node_modules/xpell-node/dist/assets/index.html"
@@ -115,8 +117,14 @@ export class XWebServer {
   /* ---------------------------------------------------------------- */
 
   load() {
-    this._web_settings = _xs.get("xweb");
-
+    this._web_settings = {
+      ...DEFAULT_XWEB_SETTINGS,
+      ...(_xs.get("xweb") ?? {}),
+      "ssl-settings": {
+        ...DEFAULT_XWEB_SETTINGS["ssl-settings"],
+        ...((_xs.get("xweb") as any)?.["ssl-settings"] ?? {})
+      }
+    };
     this._app = express();
     this._app.use(express.json());
     this._app.use(cors({ origin: true }));

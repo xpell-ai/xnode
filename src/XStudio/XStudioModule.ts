@@ -82,6 +82,10 @@ function is_plain_object(_value: unknown): _value is Record<string, unknown> {
   return typeof _value === "object" && _value !== null && !Array.isArray(_value);
 }
 
+function is_failed_generation_result(_value: unknown): boolean {
+  return is_plain_object(_value) && _value._ok === false;
+}
+
 function read_required_string(
   _value: unknown,
   _field_name: string,
@@ -372,7 +376,7 @@ export class XStudioModule extends XModule {
   }
   
   async onLoad() {
-    _xlog.log("[studio] module loaded**********************");
+    
   }
 
   async _op_create_module(xcmd: XCommand) {
@@ -539,6 +543,12 @@ export class XStudioModule extends XModule {
         const _result = await this._op_generate_view({
           _params: _view_params,
         } as unknown as XCommand);
+        if (is_failed_generation_result(_result)) {
+          _xlog.warn("[xstudio] artifact generation failed", {
+            _artifact_type: "view",
+          });
+          return _result;
+        }
         _xlog.log("[xstudio] artifact generation completed", {
           _artifact_type: "view",
         });
@@ -564,6 +574,12 @@ export class XStudioModule extends XModule {
             ...(_params._generation_id ? { _generation_id: _params._generation_id } : {}),
           },
         } as any);
+        if (is_failed_generation_result(_result)) {
+          _xlog.warn("[xstudio] artifact generation failed", {
+            _artifact_type: "module",
+          });
+          return _result;
+        }
         _xlog.log("[xstudio] artifact generation completed", {
           _artifact_type: "module",
         });
@@ -593,6 +609,12 @@ export class XStudioModule extends XModule {
         _op: "generate",
         _params: _route_params,
       } as any);
+      if (is_failed_generation_result(_result)) {
+        _xlog.warn("[xstudio] artifact generation failed", {
+          _artifact_type: _params._artifact_type,
+        });
+        return _result;
+      }
       _xlog.log("[xstudio] artifact generation completed", {
         _artifact_type: _params._artifact_type,
       });

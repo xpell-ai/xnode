@@ -59,7 +59,7 @@ export class XNode {
             _xlog.log("⚙️ Running Xpell Server for first time , performing initial setup");
             _xu.checkFolders(server_folders);
             _xs.onSetup(work_folder);
-            _xs.set("modules", {}); //save default settings file
+            _xs.ensure("modules", {});
             this._web_server.onSetup(work_folder);
 
             //create the file to mark initialization
@@ -98,6 +98,7 @@ export class XNode {
         setXEventManager(XEventManager);
         this._work_folder = work_folder;
         _xs.init(work_folder);
+        _xlog.log("XSettings xweb after init:", _xs.get("xweb"));
         this._web_server.init(work_folder);
         _xlog.log("Xpell Server initialization check ✅");
     }
@@ -110,7 +111,7 @@ export class XNode {
 
         const current = _xs.get("xweb");
         const merged = { ...(current ?? {}), ...overrides };
-        _xs.set("xweb", merged);
+        _xs.ensureDefaults("xweb", merged);
     }
 
 
@@ -180,6 +181,7 @@ export class XNode {
 
 
         this._started = true;
+        _xem.fire("server:started", { work_folder: this._work_folder });
     }
 
 
@@ -197,16 +199,21 @@ export class XNode {
     // this method bind to settings changes events
     // to apply changes dynamically
     private bindSettingsEvents() {
-        _xs.on("update", (data: any) => {
-            let needRestart: boolean = false;
+        _xem.on("settings:update", (data: any) => {
+            let needRestart = false;
+
             if (needRestart) {
-                _xlog.log(`Settings changed. Restart required to apply changes.`);
+                _xlog.log(
+                    "Settings changed. Restart required to apply changes."
+                );
             }
         });
-        _xs.on("error", (err: any) => {
+
+        _xem.on("settings:error", (err: any) => {
             _xlog.error("XpellServer settings error", err);
         });
-        _xlog.log("Xpell settings events bounded ✅");
+
+        _xlog.log("Xpell settings events bound ✅");
     }
 }
 

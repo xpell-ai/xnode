@@ -31,6 +31,84 @@ export type XVibeArtifactIntent = {
   _reason: string;
 };
 
+export type XVibeResolvedTaskAction =
+  | "create"
+  | "update"
+  | "delete"
+  | "disable"
+  | "archive"
+  | "rename"
+  | "inspect"
+  | "unknown";
+
+export type XVibeResolvedTaskArtifactType =
+  | "view"
+  | "flow"
+  | "entity"
+  | "module"
+  | "command"
+  | "app"
+  | "unknown";
+
+export type XVibeResolvedTask = {
+  _action: XVibeResolvedTaskAction;
+  _artifact_type: XVibeResolvedTaskArtifactType;
+  _target_id?: string;
+  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object";
+  _edit_target_id?: string;
+  _edit_target_text?: string;
+  _edit_target_type?: string;
+  _edit_move_position?: "before" | "after" | "top" | "bottom";
+  _edit_anchor_id?: string;
+  _edit_anchor_text?: string;
+  _edit_anchor_type?: string;
+  _edit_replacement_text?: string;
+  _edit_class_name?: string;
+  _edit_old_class_name?: string;
+  _edit_new_class_name?: string;
+  _edit_style_property?: string;
+  _edit_style_value?: string;
+  _edit_property_name?: string;
+  _edit_property_value?: string | number | boolean | null;
+  _edit_field?: string;
+  _explicit_artifact_type: boolean;
+  _explicit_target_id: boolean;
+  _module_name?: string;
+  _module_ops: string[];
+  _source: string;
+  _confidence: number;
+  _warnings: string[];
+};
+
+export type XVibeRuntimeAssetRef = {
+  _id: string;
+};
+
+export type XVibeRuntimeAssets = {
+  _views: XVibeRuntimeAssetRef[];
+  _flows: XVibeRuntimeAssetRef[];
+  _entities: XVibeRuntimeAssetRef[];
+  _modules: XVibeRuntimeAssetRef[];
+};
+
+export type XVibeRuntimePlan = {
+  _existing_views: string[];
+  _existing_flows: string[];
+  _existing_entities: string[];
+  _existing_modules: string[];
+  _allowed_xui_types: string[];
+  _allowed_modules: string[];
+  _allowed_ops: Record<string, string[]>;
+  _constraints: string[];
+  _warnings: string[];
+};
+
+export type XVibeValidationPlan = {
+  _ok: boolean;
+  _errors: string[];
+  _warnings: string[];
+};
+
 export type XVibeArtifactAction =
   | "create"
   | "update"

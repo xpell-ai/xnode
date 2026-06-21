@@ -15,7 +15,9 @@ import type {
   XAuthVerifySecretParams,
   XAuthVerifySecretResult,
   XAuthVerifyJwtParams,
-  XAuthVerifyJwtResult
+  XAuthVerifyJwtResult,
+  XAuthCreateJwtParams,
+  XAuthCreateJwtResult
 } from "./XAuthTypes.js";
 import {
   create_api_key,
@@ -56,6 +58,18 @@ export const XAUTH_OPS: Record<string, XpellSkillCommand> = {
     _description: "Verify a JWT and return authenticated auth context.",
     _params: {
       _token: "JWT token."
+    }
+  },
+
+  create_jwt: {
+    _name: "create_jwt",
+    _scope: "module",
+    _description: "Create a JWT for an authenticated runtime user.",
+    _params: {
+      _user_id: "Authenticated user id.",
+      _account_id: "Authenticated account id.",
+      _clearance_level: "Optional clearance level.",
+      _auth_type: "JWT auth type."
     }
   },
 
@@ -125,6 +139,7 @@ export const XAUTH_SKILL: XpellSkill = {
   _core_rules: [
     "Use xauth.authorize_req to resolve auth context for incoming requests.",
     "Use xauth.verify_jwt when a JWT token must be validated directly.",
+    "Use xauth.create_jwt only after upstream authentication has already succeeded.",
     "Use xauth.create_api_key only for issuing API keys; store only the hash.",
     "Use xauth.hash_secret and xauth.verify_secret for secret comparison.",
     "Do not expose JWT secrets, API key hashes, or raw credentials in generated views or logs."
@@ -243,6 +258,38 @@ export class XAuthModule extends XModule {
       _xlog.warn("[xauth] jwt verification failed");
       throw err;
     }
+  }
+
+  async _create_jwt(xcmd: XCommand): Promise<XAuthCreateJwtResult> {
+    const params = (xcmd._params ?? {}) as XAuthCreateJwtParams;
+    const user_id = typeof params._user_id === "string" ? params._user_id.trim() : "";
+    const account_id = typeof params._account_id === "string" ? params._account_id.trim() : "";
+    const clearance_level =
+      typeof params._clearance_level === "number"
+        ? params._clearance_level
+        : DEV_CLEARANCE_LEVEL;
+    const auth_type = params._auth_type === "jwt" ? "jwt" : "jwt";
+
+    if (!user_id || !account_id) {
+      throw xauth_unauthorized("Invalid JWT claims", XAUTH_ERR.INVALID_PARAM);
+    }
+
+    const token = sign_jwt({
+      _user_id: user_id,
+      _account_id: account_id,
+      _clearance_level: clearance_level,
+      _auth_type: auth_type
+    });
+
+    _xlog.log("[xauth] jwt created", {
+      _user_id: user_id,
+      _account_id: account_id
+    });
+
+    return {
+      _ok: true,
+      _token: token
+    };
   }
 
   async _create_api_key(xcmd: XCommand): Promise<XAuthCreateApiKeyResult> {

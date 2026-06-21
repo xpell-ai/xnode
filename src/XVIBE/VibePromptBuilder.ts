@@ -1,7 +1,7 @@
 import type { VibeKnowledgeSelection, VibeSkillDocument } from "./VibeKnowledgeSelector.js";
 import { _xlog } from "@xpell/core";
 import { _xu } from "../XNUtils/XUtils.js";
-import type { VibeArtifactType, VibeRequestedArtifactType } from "./XVibeTypes.js";
+import type { VibeArtifactType, VibeRequestedArtifactType, XVibeRuntimePlan } from "./XVibeTypes.js";
 
 type XVibeJsonObject = {
   [key: string]: unknown;
@@ -60,7 +60,26 @@ const STOP_SEARCH_TOKENS = new Set([
 const XUI_PROMPT_TOKENS = new Set(["button", "class", "style", "sheet", "ui", "view", "xui", "flow"]);
 const FLOW_PROMPT_TOKENS = new Set(["flow", "workflow", "trigger", "run", "execute", "call"]);
 const ENTITY_PROMPT_TOKENS = new Set(["entity", "entities", "schema", "users", "user", "records", "crud"]);
-
+const XUI_RULE_TYPE_TERMS = [
+  "badge",
+  "button",
+  "card",
+  "drawer",
+  "field",
+  "form",
+  "grid",
+  "kpi-card",
+  "label",
+  "modal",
+  "navlist",
+  "sidebar",
+  "stack",
+  "style-sheet",
+  "table",
+  "toolbar",
+  "view",
+  "xsection",
+];
 
 
 function has_value(value: unknown): boolean {
@@ -142,6 +161,61 @@ function format_string_array_section(title: string, value: unknown): string[] {
     `${title}:`,
     ...items.map((item) => `- ${item}`),
   ];
+}
+
+function xui_rule_type_pattern(type: string): RegExp {
+  const escaped = type.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\b${escaped}\\b`, "iu");
+}
+
+function mentions_unavailable_xui_type(
+  text: string,
+  allowed_xui_types: Set<string> | undefined,
+): boolean {
+  if (!allowed_xui_types || allowed_xui_types.size === 0) return false;
+  return XUI_RULE_TYPE_TERMS.some((type) =>
+    !allowed_xui_types.has(type) &&
+    xui_rule_type_pattern(type).test(text),
+  );
+}
+
+function filtered_rule_items(
+  value: unknown,
+  max_items: number,
+  allowed_xui_types?: Set<string>,
+): string[] {
+  return string_items(value, max_items)
+    .filter((item) => !mentions_unavailable_xui_type(item, allowed_xui_types));
+}
+
+function format_filtered_string_array_section(
+  title: string,
+  value: unknown,
+  allowed_xui_types?: Set<string>,
+): string[] {
+  const items =
+    filtered_rule_items(value, MAX_ARRAY_ITEMS, allowed_xui_types);
+  if (items.length === 0) return [];
+
+  return [
+    `${title}:`,
+    ...items.map((item) => `- ${item}`),
+  ];
+}
+
+function allowed_xui_types_from_runtime_context(
+  runtime_context: XVibeJsonObject | undefined,
+): Set<string> | undefined {
+  const runtime_plan = read_runtime_plan(runtime_context);
+  if (!runtime_plan || runtime_plan._allowed_xui_types.length === 0) {
+    return undefined;
+  }
+
+  return new Set(
+    runtime_plan._allowed_xui_types
+      .map((type) => normalize_id(type))
+      .filter((type): type is string => typeof type === "string"),
+  );
 }
 
 function compact_pattern(pattern: unknown): unknown {
@@ -438,12 +512,73 @@ function build_behavior_instruction_lines(
   return lines;
 }
 
-function format_skill(skill: VibeSkillDocument, max_chars: number): string {
+function extract_view_edit_intent(runtime_context: XVibeJsonObject | undefined): XVibeJsonObject | undefined {
+  const edit_intent = runtime_context?._edit_intent;
+  return edit_intent && typeof edit_intent === "object" && !Array.isArray(edit_intent)
+    ? edit_intent as XVibeJsonObject
+    : undefined;
+}
+
+function build_view_edit_intent_lines(runtime_context: XVibeJsonObject | undefined): string[] {
+  const edit_intent = extract_view_edit_intent(runtime_context);
+  if (!edit_intent) return [];
+
+  const action =
+    typeof edit_intent._action === "string"
+      ? edit_intent._action
+      : "update";
+  const target_id =
+    typeof edit_intent._target_id === "string"
+      ? edit_intent._target_id
+      : undefined;
+  const target_text =
+    typeof edit_intent._target_text === "string"
+      ? edit_intent._target_text
+      : undefined;
+  const replacement_text =
+    typeof edit_intent._replacement_text === "string"
+      ? edit_intent._replacement_text
+      : undefined;
+  const field =
+    typeof edit_intent._field === "string"
+      ? edit_intent._field
+      : undefined;
+  const instruction =
+    action === "remove"
+      ? "Remove this existing object from the view. Do not replace it. Do not delete the whole view. Do not create replacement nodes. Preserve all unrelated ids and children."
+      : action === "hide"
+        ? "Hide the matching existing node using class/style/visibility according to existing conventions. Do not remove it unless user said remove/delete. Preserve all unrelated ids and children."
+        : replacement_text && target_id && field
+          ? `Change only object ${target_id} field ${field}. Replace exact text "${target_text ?? ""}" with "${replacement_text}". Preserve all other ids, handlers, classes, and children. Do not modify unrelated nodes.`
+          : replacement_text
+          ? "Change only the matching text. Preserve all other ids, handlers, classes, and children. Do not modify unrelated nodes."
+          : "Update only the matching existing node. Preserve all unrelated nodes.";
+
+  return [
+    "VIEW EDIT INTENT:",
+    `- Action: ${action}`,
+    ...(target_id ? [`- Target id: ${target_id}`] : []),
+    ...(field ? [`- Field: ${field}`] : []),
+    ...(target_text ? [`- Target text: ${target_text}`] : []),
+    ...(replacement_text ? [`- Replacement text: ${replacement_text}`] : []),
+    ...(target_id && field ? [`- Change only object ${target_id} field ${field}`] : []),
+    ...(target_text && replacement_text ? [`- Replace exact text "${target_text}" with "${replacement_text}"`] : []),
+    "- Preserve all other ids, handlers, classes, and children",
+    "- Do not modify unrelated nodes",
+    `- Instruction: ${instruction}`,
+  ];
+}
+
+function format_skill(
+  skill: VibeSkillDocument,
+  max_chars: number,
+  allowed_xui_types?: Set<string>,
+): string {
   const lines: string[] = [
     "identity:",
     format_identity(skill),
-    ...format_string_array_section("priority_rules", skill._priority_rules),
-    ...format_string_array_section("core_rules", skill._core_rules),
+    ...format_filtered_string_array_section("priority_rules", skill._priority_rules, allowed_xui_types),
+    ...format_filtered_string_array_section("core_rules", skill._core_rules, allowed_xui_types),
     ...format_json_section("fields", skill._fields),
     ...format_json_section("exports", skill._exports),
   ];
@@ -470,14 +605,17 @@ function format_skills_block(
   selection: VibeKnowledgeSelection,
   max_skill_chars: number,
   max_total_chars: number,
+  runtime_context?: XVibeJsonObject,
 ): string {
   if (selection.skills.length === 0) return "No dynamic skills selected.";
 
   const blocks: string[] = [];
   let total_chars = 0;
+  const allowed_xui_types =
+    allowed_xui_types_from_runtime_context(runtime_context);
 
   for (const skill of selection.skills) {
-    const block = format_skill(skill, max_skill_chars);
+    const block = format_skill(skill, max_skill_chars, allowed_xui_types);
     const separator_chars = blocks.length > 0 ? "\n\n---\n\n".length : 0;
     if (total_chars + separator_chars + block.length > max_total_chars) {
       break;
@@ -854,7 +992,7 @@ export function isWeakSkill(skill: VibeSkillDocument): boolean {
 function format_skill_mini(
   skill: VibeSkillDocument,
   max_chars: number,
-  opts: { include_example?: boolean } = {},
+  opts: { include_example?: boolean; allowed_xui_types?: Set<string> } = {},
 ): string {
   try {
     const source: XVibeJsonObject = skill && typeof skill === "object" ? skill : {};
@@ -866,8 +1004,8 @@ function format_skill_mini(
       : "";
     const fields = field_names(source._fields);
     const rules = unique_strings([
-      ...string_items(source._priority_rules, 3),
-      ...string_items(source._core_rules, 5),
+      ...filtered_rule_items(source._priority_rules, 3, opts.allowed_xui_types),
+      ...filtered_rule_items(source._core_rules, 5, opts.allowed_xui_types),
     ]);
     const canonical_example = compact_array(source._canonical_examples, 1)[0];
 
@@ -911,6 +1049,12 @@ function format_mini_skills_block(
     rankSkillsForPrompt(prompt, skills, runtimeContext),
     max_total_chars,
   );
+  const allowed_xui_types =
+    allowed_xui_types_from_runtime_context(
+      runtimeContext && typeof runtimeContext === "object" && !Array.isArray(runtimeContext)
+        ? runtimeContext as XVibeJsonObject
+        : undefined,
+    );
 
   for (const item of budgeted_skills) {
     const separator_chars = blocks.length > 0 ? "\n---\n".length : 0;
@@ -920,7 +1064,10 @@ function format_mini_skills_block(
     const block = format_skill_mini(
       item.skill,
       Math.min(item.budget, remaining_total_chars),
-      { include_example: item.include_example },
+      {
+        include_example: item.include_example,
+        allowed_xui_types,
+      },
     );
     if (total_chars + separator_chars + block.length > max_total_chars) {
       break;
@@ -994,6 +1141,76 @@ function collect_skeleton_xui_types(value: unknown, target = new Set<string>()):
   }
 
   return [...target];
+}
+
+function collect_runtime_context_xui_types(runtime_context: XVibeJsonObject | undefined): string[] {
+  return unique_strings([
+    ...normalize_string_array(runtime_context?._selected_xui_objects),
+    ...normalize_string_array(runtime_context?._allowed_xui_objects),
+  ]);
+}
+
+function read_runtime_plan(runtime_context: XVibeJsonObject | undefined): XVibeRuntimePlan | undefined {
+  const plan = runtime_context?._runtime_plan;
+  if (!plan || typeof plan !== "object" || Array.isArray(plan)) return undefined;
+  const source = plan as XVibeJsonObject;
+  if (
+    !Array.isArray(source._allowed_xui_types) ||
+    !Array.isArray(source._allowed_modules) ||
+    typeof source._allowed_ops !== "object" ||
+    source._allowed_ops === null ||
+    Array.isArray(source._allowed_ops)
+  ) {
+    return undefined;
+  }
+
+  return plan as XVibeRuntimePlan;
+}
+
+function constrained_allowed_xui_objects(
+  desired_xui_objects: string[],
+  runtime_context: XVibeJsonObject | undefined,
+): string[] {
+  const desired = unique_strings(desired_xui_objects);
+  const runtime_plan = read_runtime_plan(runtime_context);
+  if (!runtime_plan || runtime_plan._allowed_xui_types.length === 0) {
+    return desired;
+  }
+
+  const allowed = new Set(runtime_plan._allowed_xui_types.map((type) => normalize_id(type)));
+  const allowed_by_key = new Map(
+    runtime_plan._allowed_xui_types.map((type) => [normalize_id(type), type]),
+  );
+
+  return desired
+    .map((type) => allowed_by_key.get(normalize_id(type)))
+    .filter((type): type is string => typeof type === "string" && allowed.has(normalize_id(type)))
+    .filter((type, index, all) => all.indexOf(type) === index);
+}
+
+function allowed_xui_preference_lines(allowed_xui_objects: string[]): string[] {
+  const allowed = new Set(allowed_xui_objects);
+  const lines: string[] = [];
+
+  if (allowed.has("button")) {
+    lines.push("Prefer button over generic view for actions.");
+  }
+
+  if (allowed.has("field")) {
+    lines.push("Prefer field for form inputs.");
+  }
+
+  const layout_types =
+    ["stack", "grid", "toolbar"].filter((type) => allowed.has(type));
+  if (layout_types.length > 0) {
+    lines.push(`Prefer ${layout_types.join("/")} for layout.`);
+  }
+
+  if (allowed.has("label")) {
+    lines.push("Prefer label for text output.");
+  }
+
+  return lines;
 }
 
 function output_contract_for_artifact(artifact_type: VibeArtifactType): string {
@@ -1074,42 +1291,72 @@ export class VibePromptBuilder {
 
   private build_artifact_specific_rules(
     artifact_type: VibeArtifactType,
+    allowed_xui_objects: string[] = [],
   ): string[] {
 
     if (artifact_type === "view") {
+      const allowed = new Set(allowed_xui_objects);
+      const semantic_layout_types =
+        ["stack", "grid", "toolbar", "card", "field"]
+          .filter((type) => allowed.has(type));
+      const structural_types =
+        ["card", "grid", "sidebar", "toolbar", "xsection"]
+          .filter((type) => allowed.has(type));
       return [
         "VIEW RULES:",
         "- Use semantic XUI objects.",
-        "- Use stack/grid/toolbar/card/field when appropriate.",
-        "- Use button for clickable actions.",
-        "- Use label with _text.",
+        ...(semantic_layout_types.length > 0
+          ? [`- Use ${semantic_layout_types.join("/")} when appropriate.`]
+          : []),
+        ...(allowed.has("button") ? ["- Use button for clickable actions."] : []),
+        ...(allowed.has("label") ? ["- Use label with _text."] : []),
         "- Use class, not _class.",
-        "- When styling is requested, style-sheet MUST be the first child in _children.",
+        ...(allowed.has("style-sheet")
+          ? ["- When styling is requested, style-sheet MUST be the first child in _children."]
+          : []),
         "- Never generate empty semantic objects.",
         "- Every semantic object must include minimal runtime-safe fields.",
-        "- Buttons need visible _text or _label.",
-        "- Do NOT add _flow to buttons unless the user explicitly mentions a flow id or explicitly asks for the button to trigger/run/execute/call a flow.",
-        "- Plain buttons are visual/actionless buttons.",
-        "- If no explicit flow is requested, buttons must contain _text or _label only and must not contain _flow.",
+        ...(allowed.has("button")
+          ? [
+            "- Buttons need visible _text or _label.",
+            "- Do NOT add _flow to buttons unless the user explicitly mentions a flow id or explicitly asks for the button to trigger/run/execute/call a flow.",
+            "- Plain buttons are visual/actionless buttons.",
+            "- If no explicit flow is requested, buttons must contain _text or _label only and must not contain _flow.",
+          ]
+          : []),
         "- Never invent flow ids such as flow-action-1, flow-submit, flow-save, etc.",
-        "- Button click actions must be placed under _on._click.",
-        "- Do not use button-level _command.",
-        '- Use _on._click: { "_module": "...", "_op": "...", "_params": {} } for a single command.',
-        "- Use _on._click: [ ... ] for sequential command chains.",
+        ...(allowed.has("button")
+          ? [
+            "- Button click actions must be placed under _on._click.",
+            "- Do not use button-level _command.",
+            '- Use _on._click: { "_module": "...", "_op": "...", "_params": {} } for a single command.',
+            "- Use _on._click: [ ... ] for sequential command chains.",
+          ]
+          : []),
         '- Object-targeted local nano commands may use { "_object": "target-id", "_op": "set-text", "_params": {} }.',
         "- Module commands require _module.",
         "- Object nano commands require _object.",
         "- Do not put _params directly under _on.",
-        "- field is a wrapper only.",
-        "- field input config goes in _control.",
-        "- never put _name or _placeholder directly on field.",
-        '- Fields require _control with _type and name or _name for input-like controls.',
-        "- Tables need _columns or a valid _data_source.",
-        "- KPI cards need _label/_title and _value.",
-        "- Navlists need _items or navigation children.",
-        "- Modals and drawers need content or children.",
-        "- Cards, grids, sidebars, toolbars, and xsections need meaningful children.",
-        "- Prefer XDashboard objects when available.",
+        ...(allowed.has("field")
+          ? [
+            "- field is a wrapper only.",
+            "- field input config goes in _control.",
+            "- never put _name or _placeholder directly on field.",
+            '- Fields require _control with _type and name or _name for input-like controls.',
+          ]
+          : []),
+        ...(allowed.has("table") ? ["- Tables need _columns or a valid _data_source."] : []),
+        ...(allowed.has("kpi-card") ? ["- KPI cards need _label/_title and _value."] : []),
+        ...(allowed.has("navlist") ? ["- Navlists need _items or navigation children."] : []),
+        ...(allowed.has("modal") || allowed.has("drawer")
+          ? ["- Modals and drawers need content or children."]
+          : []),
+        ...(structural_types.length > 0
+          ? [`- ${structural_types.join(", ")} need meaningful children.`]
+          : []),
+        ...(structural_types.length > 0
+          ? ["- Prefer XDashboard objects when available."]
+          : []),
         "- Do not use generic view objects when a semantic object exists.",
       ];
     }
@@ -1186,12 +1433,15 @@ export class VibePromptBuilder {
         input.prompt,
         input.runtime_context,
       );
+    const view_edit_intent_lines =
+      build_view_edit_intent_lines(input.runtime_context);
 
     const allowed_xui_objects =
-      Array.from(new Set([
+      constrained_allowed_xui_objects([
         ...collect_xui_types(input.selection),
+        ...collect_runtime_context_xui_types(input.runtime_context),
         ...collect_skeleton_xui_types(current_view),
-      ]));
+      ], input.runtime_context);
 
     const prompt = [
       "You are an Xpell JSON artifact editor.",
@@ -1228,10 +1478,17 @@ export class VibePromptBuilder {
       "- Do not invent unrelated layout.",
       "- Apply the user's request to the existing view.",
       "",
+      ...(view_edit_intent_lines.length > 0
+        ? [
+          ...view_edit_intent_lines,
+          "",
+        ]
+        : []),
 
       // 👇 keep semantic view rules in refine mode too
       ...this.build_artifact_specific_rules(
-        input._artifact_type
+        input._artifact_type,
+        allowed_xui_objects,
       ),
       ...(behavior_instructions.length > 0
         ? [
@@ -1275,6 +1532,7 @@ export class VibePromptBuilder {
       input.selection,
       this.max_skill_prompt_chars,
       this.max_total_skill_prompt_chars,
+      input.runtime_context,
     );
     const output_contract = output_contract_for_artifact(input._artifact_type);
     const normalized_user_task = truncate_text(_xu.normalizePrompt(input.prompt), this.max_user_task_chars);
@@ -1294,12 +1552,13 @@ export class VibePromptBuilder {
       );
 
     const allowed_xui_objects =
-      Array.from(new Set([
+      constrained_allowed_xui_objects([
         ...collect_xui_types(
           input.selection
         ),
+        ...collect_runtime_context_xui_types(input.runtime_context),
         ...collect_skeleton_xui_types(input.deterministic_skeleton),
-      ]));
+      ], input.runtime_context);
     const prompt = [
       "You are an Xpell JSON artifact generator.",
       "Return ONLY JSON.",
@@ -1337,13 +1596,11 @@ export class VibePromptBuilder {
       "ONLY use _type values from the allowed list above.",
       "NEVER invent new _type values.",
       "Use semantic UI objects whenever possible.",
-      "Prefer button over generic view for actions.",
-      "Prefer field for form inputs.",
-      "Prefer stack/grid/toolbar for layout.",
-      "Prefer label for text output.",
+      ...allowed_xui_preference_lines(allowed_xui_objects),
       "",
       ...this.build_artifact_specific_rules(
-        input._artifact_type
+        input._artifact_type,
+        allowed_xui_objects,
       ),
       ...(behavior_instructions.length > 0
         ? [

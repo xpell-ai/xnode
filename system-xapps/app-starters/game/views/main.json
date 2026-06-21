@@ -1,0 +1,11 @@
+{
+  "_id": "main",
+  "_type": "view",
+  "_children": [
+    {
+      "_id": "game-title",
+      "_type": "label",
+      "_text": "Game"
+    }
+  ]
+}

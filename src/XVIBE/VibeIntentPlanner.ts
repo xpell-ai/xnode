@@ -13,6 +13,8 @@ import type {
   XVibeIntentIRBinding,
   XVibeIntentIREntity,
   XVibeIntentIRStyle,
+  XVibeResolvedTask,
+  XVibeResolvedTaskArtifactType,
 } from "./XVibeTypes.js";
 
 type XVibeJsonObject = {
@@ -89,6 +91,7 @@ const INTENT_REGION_IDS = [
 ];
 const INTENT_OBJECT_IDS = [
   "view",
+  "label",
   "sidebar",
   "navlist",
   "toolbar",
@@ -107,6 +110,7 @@ const INTENT_OBJECT_IDS = [
   "style-sheet",
 ];
 const INTENT_OBJECT_ALIASES: Record<string, string> = {
+  labels: "label",
   "nav-list": "navlist",
   section: "xsection",
 };
@@ -123,6 +127,8 @@ const SIMPLE_UI_REGION_TERMS: Record<string, string[]> = {
   kpi_grid: ["kpi", "kpis", "metrics"],
 };
 const UI_ENTITY_NAMES = new Set([
+  "app",
+  "apps",
   "view",
   "views",
   "page",
@@ -131,20 +137,47 @@ const UI_ENTITY_NAMES = new Set([
   "screens",
   "layout",
   "layouts",
+  "label",
+  "labels",
+  "text",
+  "title",
+  "titles",
   "dashboard",
   "dashboards",
   "form",
   "forms",
+  "field",
+  "fields",
   "button",
   "buttons",
+  "toolbar",
+  "toolbars",
+  "sidebar",
+  "sidebars",
+  "card",
+  "cards",
   "grid",
   "grids",
+  "stack",
+  "stacks",
+  "section",
+  "sections",
+  "xsection",
+  "xsections",
   "row",
   "rows",
   "column",
   "columns",
+  "table",
+  "tables",
+  "modal",
+  "modals",
+  "drawer",
+  "drawers",
 ]);
 const ENTITY_STOP_WORDS = new Set([
+  "app",
+  "apps",
   "xpell",
   "view",
   "views",
@@ -154,11 +187,26 @@ const ENTITY_STOP_WORDS = new Set([
   "screens",
   "layout",
   "layouts",
+  "label",
+  "labels",
+  "text",
+  "title",
+  "titles",
   "statistic",
   "statistics",
   "status",
+  "card",
+  "cards",
+  "grid",
+  "grids",
+  "stack",
+  "stacks",
   "button",
   "buttons",
+  "field",
+  "fields",
+  "form",
+  "forms",
   "operation",
   "operations",
   "filter",
@@ -169,12 +217,16 @@ const ENTITY_STOP_WORDS = new Set([
   "navigation",
   "toolbar",
   "sidebar",
+  "sidebars",
   "modal",
+  "modals",
   "drawer",
-  "app",
+  "drawers",
   "page",
   "section",
   "sections",
+  "xsection",
+  "xsections",
   "data",
   "record",
   "records",
@@ -217,6 +269,25 @@ const ARTIFACT_TARGET_PLURALS: Record<string, XVibeArtifactIntentTarget> = {
   modules: "module",
 };
 const ARTIFACT_INTENT_TOKEN_PATTERN = String.raw`("[^"]+"|'[^']+'|[a-z][a-z0-9_-]*)`;
+const VIEW_EDIT_OBJECT_NOUN_PATTERN =
+  String.raw`(?:button|buttons|input|inputs|label|labels|field|fields|form|forms|card|cards|table|tables|row|rows|column|columns|toolbar|toolbars|sidebar|sidebars|modal|modals|drawer|drawers|section|sections|xsection|xsections|text|title|titles|heading|headings|image|images|icon|icons|link|links)`;
+const VIEW_EDIT_STYLE_PROPERTY_ALIASES: Array<[string, string]> = [
+  ["background color", "background-color"],
+  ["border radius", "border-radius"],
+  ["text color", "color"],
+  ["font size", "font-size"],
+  ["background", "background-color"],
+  ["color", "color"],
+  ["width", "width"],
+  ["height", "height"],
+  ["padding", "padding"],
+  ["margin", "margin"],
+];
+const VIEW_EDIT_STYLE_PROPERTY_PATTERN =
+  VIEW_EDIT_STYLE_PROPERTY_ALIASES
+    .map(([phrase]) => phrase.replace(/\s+/gu, String.raw`\s+`))
+    .join("|");
+const VIEW_EDIT_PROPERTY_NAME_PATTERN = String.raw`_?[a-z][a-z0-9_]*`;
 const RESERVED_EXPLICIT_MODULE_IDS = new Set([
   "called",
   "client",
@@ -232,6 +303,25 @@ const RESERVED_EXPLICIT_MODULE_IDS = new Set([
   "server",
   "with",
   "xmodule",
+]);
+const RESERVED_RESOLVED_TASK_TARGET_IDS = new Set([
+  "a",
+  "an",
+  "and",
+  "by",
+  "for",
+  "from",
+  "in",
+  "into",
+  "of",
+  "on",
+  "the",
+  "to",
+  "with",
+  "named",
+  "called",
+  "id",
+  "new",
 ]);
 
 type VibeInferredModuleRequirement = {
@@ -312,23 +402,27 @@ export function extract_module_operation_matches_from_prompt(
   const lines = prompt.split(/\r?\n/u);
 
   for (let index = 0; index < lines.length; index += 1) {
-    const negative_line_match =
-      lines[index].match(
-        /\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,80}\boperation\s+(_?[a-z][a-z0-9_-]*)\b/iu,
-      );
-    const negative_op =
-      normalize_module_operation_identifier(negative_line_match?.[1]);
-    if (negative_op) {
-      negative_matches.push(negative_op);
-      continue;
+    for (const negative_line_match of lines[index].matchAll(
+      /\b(?:do\s+not|don't|dont|never|no)\b[\s\S]{0,80}?\boperation\s+(_?[a-z][a-z0-9_-]*)\b/giu,
+    )) {
+      const negative_op =
+        normalize_module_operation_identifier(negative_line_match[1]);
+      if (negative_op) {
+        negative_matches.push(negative_op);
+      }
     }
 
     const header_match =
       lines[index].match(/(?:^|[\s.;])(?:operations|ops|methods|module\s+ops|expose\s+operation)\s*:\s*(.*)$/iu);
-    if (!header_match) continue;
+    if (!header_match) {
+      continue;
+    }
+
+    const inline_source =
+      header_match[1].split(/\b(?:do\s+not|don't|dont|never|no)\b/iu)[0];
 
     const inline_ops =
-      header_match[1]
+      inline_source
         .split(/[,\s]+/u)
         .map((value) => normalize_module_operation_identifier(value))
         .filter((value): value is string => Boolean(value));
@@ -338,7 +432,6 @@ export function extract_module_operation_matches_from_prompt(
       const line = lines[next_index];
       if (line_has_negative_operation_instruction(line)) break;
       if (/^\s*$/u.test(line)) {
-        if (positive_matches.length > 0) break;
         continue;
       }
 
@@ -374,9 +467,18 @@ export function extract_module_operation_matches_from_prompt(
     }
   }
 
+  if (positive_matches.length === 0 && /\b(?:xmodule|module|server\s+module|client\s+module)\b/iu.test(prompt)) {
+    for (const match of prompt.matchAll(/\bwith\s+(_[a-z][a-z0-9_-]*)\b/giu)) {
+      const op =
+        normalize_module_operation_identifier(match[1]);
+      if (op) positive_matches.push(op);
+    }
+  }
+
   const final_ops =
     positive_matches.length > 0
       ? unique(positive_matches)
+        .filter((op) => !negative_matches.includes(op))
       : [];
 
   return {
@@ -418,6 +520,1134 @@ export function extract_explicit_module_id_from_prompt(prompt: string): string |
       /\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:(?:server|client)\s+)?(?:xmodule|module)\s+([a-z][a-z0-9_-]*)\b/iu,
     );
   return normalize_explicit_module_id(direct_module_match?.[1]);
+}
+
+function normalize_resolved_task_target_id(value: string | undefined): string | undefined {
+  const normalized = normalize_artifact_identifier(value);
+  if (!normalized || RESERVED_RESOLVED_TASK_TARGET_IDS.has(normalized)) {
+    return undefined;
+  }
+
+  return normalized;
+}
+
+function artifact_type_from_requested_artifact_type(
+  value: VibeRequestedArtifactType | undefined,
+): XVibeResolvedTaskArtifactType | undefined {
+  if (
+    value === "view" ||
+    value === "flow" ||
+    value === "entity" ||
+    value === "command"
+  ) {
+    return value;
+  }
+
+  return undefined;
+}
+
+function resolved_artifact_type_from_intent_target(
+  target: XVibeArtifactIntentTarget,
+): XVibeResolvedTaskArtifactType {
+  if (
+    target === "view" ||
+    target === "flow" ||
+    target === "entity" ||
+    target === "module" ||
+    target === "app"
+  ) {
+    return target;
+  }
+
+  return "unknown";
+}
+
+function explicit_app_artifact_type(prompt: string): boolean {
+  const text = normalize_artifact_intent_prompt(prompt);
+  return /\b(?:create|build|generate|make)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:app|application)\b/u.test(text);
+}
+
+function prompt_explicitly_targets_main_view(prompt: string): boolean {
+  const text = normalize_artifact_intent_prompt(prompt);
+  return /\bmain\s+(?:view|page|screen|form)\b/u.test(text) ||
+    /\b(?:view|page|screen|form)\s+main\b/u.test(text);
+}
+
+function prompt_has_explicit_artifact_action_target(text: string): boolean {
+  return /\b(?:delete|remove|disable|archive|rename)\s+(?:a\s+|an\s+|the\s+)?(?:view|flow|entity|module)\b/u
+    .test(text);
+}
+
+function detect_view_edit_action(text: string): XVibeResolvedTask["_edit_action"] | undefined {
+  const action_text = strip_negated_artifact_phrases(text);
+  if (!action_text || prompt_has_explicit_artifact_action_target(action_text)) {
+    return undefined;
+  }
+
+  if (/\bmove\s+.+?\s+(?:before|after)\s+.+/u.test(action_text)) return "move-object";
+  if (/\bmove\s+.+?\s+to\s+(?:top|bottom)\b/u.test(action_text)) return "move-object";
+  if (new RegExp(String.raw`\b(?:make|set)\s+[a-z][a-z0-9]*[-_][a-z0-9_-]*\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+(?!to\b)\S+`, "u").test(action_text)) return "set-style-class-rule";
+  if (new RegExp(String.raw`\bremove\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+from\s+[a-z][a-z0-9]*[-_][a-z0-9_-]*\s+class\b`, "u").test(action_text)) return "remove-style-class-rule";
+  if (new RegExp(String.raw`\bset\s+.+?\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+to\s+\S+`, "u").test(action_text)) return "set-style";
+  if (new RegExp(String.raw`\bremove\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+from\s+`, "u").test(action_text)) return "remove-style";
+  if (new RegExp(String.raw`\bset\s+.+?\s+(?!text\s+to\b|label\s+to\b)${VIEW_EDIT_PROPERTY_NAME_PATTERN}\s+to\s+\S+`, "u").test(action_text)) return "set-property";
+  if (/\breplace\s+class\s+[a-z][a-z0-9_-]*\s+with\s+[a-z][a-z0-9_-]*\s+on\b/u.test(action_text)) return "replace-class";
+  if (/\btoggle\s+class\s+[a-z][a-z0-9_-]*\s+on\b/u.test(action_text)) return "toggle-class";
+  if (/\badd\s+class\s+[a-z][a-z0-9_-]*\s+to\b/u.test(action_text)) return "add-class";
+  if (/\bremove\s+class\s+[a-z][a-z0-9_-]*\s+from\b/u.test(action_text)) return "remove-class";
+  if (new RegExp(String.raw`\bremove\s+${VIEW_EDIT_PROPERTY_NAME_PATTERN}\s+from\s+.+`, "u").test(action_text)) return "remove-property";
+  if (/\b(?:show|unhide)\b/u.test(action_text)) return "show";
+  if (/\bmake\b/u.test(action_text) && /\bvisible\b/u.test(action_text)) return "show";
+  if (/\bhide\b/u.test(action_text)) return "hide";
+  if (/\bmake\b/u.test(action_text) && /\bhidden\b/u.test(action_text)) return "hide";
+  if (/\b(?:delete|remove)\b/u.test(action_text)) return "remove";
+  if (/\b(?:update|change|edit|modify|replace|set|rename)\b/u.test(action_text)) return "update";
+  return undefined;
+}
+
+function prompt_has_view_child_edit(text: string): boolean {
+  const edit_action = detect_view_edit_action(text);
+  if (!edit_action) return false;
+
+  if (/\b(?:from|in|on)\s+(?:the\s+)?(?:view|page|screen|form)\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:main|current)\s+(?:view|page|screen|form)\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:view|page|screen|form)\s+(?:main|current)\b/u.test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\b${VIEW_EDIT_OBJECT_NOUN_PATTERN}\b`, "u").test(text)) {
+    return true;
+  }
+
+  if (/\b(?:change|update)\s+[a-z][a-z0-9_-]*\s+(?:text|label)\s+from\s+["'][^"']+["']\s+to\s+["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\bset\s+[a-z][a-z0-9_-]*\s+(?:text|label)\s+to\s+["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\brename\s+[a-z][a-z0-9_-]*\s+to\s+["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:change|update)\s+["'][^"']+["']\s+to\s+["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\breplace\s+["'][^"']+["']\s+with\s+["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\b(?:delete|remove|hide|show|unhide)\s+(?:the\s+)?["'][^"']+["']/u.test(text)) {
+    return true;
+  }
+
+  if (/\badd\s+class\s+[a-z][a-z0-9_-]*\s+to\s+(?:the\s+)?(?:["'][^"']+["']|[a-z][a-z0-9_-]*)(?:\s+(?:button|label|text|title|heading))?\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\bremove\s+class\s+[a-z][a-z0-9_-]*\s+from\s+(?:the\s+)?(?:["'][^"']+["']|[a-z][a-z0-9_-]*)(?:\s+(?:button|label|text|title|heading))?\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\breplace\s+class\s+[a-z][a-z0-9_-]*\s+with\s+[a-z][a-z0-9_-]*\s+on\s+(?:the\s+)?(?:["'][^"']+["']|[a-z][a-z0-9_-]*)(?:\s+(?:button|label|text|title|heading))?\b/u.test(text)) {
+    return true;
+  }
+
+  if (/\btoggle\s+class\s+[a-z][a-z0-9_-]*\s+on\s+(?:the\s+)?(?:["'][^"']+["']|[a-z][a-z0-9_-]*)(?:\s+(?:button|label|text|title|heading))?\b/u.test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\bset\s+.+?\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+to\s+\S+`, "u").test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\bremove\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+from\s+.+`, "u").test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\b(?:make|set)\s+[a-z][a-z0-9]*[-_][a-z0-9_-]*\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+(?!to\b)\S+`, "u").test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\bremove\s+(?:${VIEW_EDIT_STYLE_PROPERTY_PATTERN})\s+from\s+[a-z][a-z0-9]*[-_][a-z0-9_-]*\s+class\b`, "u").test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\bset\s+.+?\s+(?!text\s+to\b|label\s+to\b)${VIEW_EDIT_PROPERTY_NAME_PATTERN}\s+to\s+\S+`, "u").test(text)) {
+    return true;
+  }
+
+  if (new RegExp(String.raw`\bremove\s+${VIEW_EDIT_PROPERTY_NAME_PATTERN}\s+from\s+.+`, "u").test(text)) {
+    return true;
+  }
+
+  if (/\bmove\s+.+?\s+(?:before|after)\s+.+/u.test(text)) {
+    return true;
+  }
+
+  if (/\bmove\s+.+?\s+to\s+(?:top|bottom)\b/u.test(text)) {
+    return true;
+  }
+
+  return /\b(?:delete|remove|hide|show|unhide)\s+(?:the\s+)?[a-z][a-z0-9]*[-_][a-z0-9_-]*\b/u.test(text);
+}
+
+function extract_explicit_view_target_id(prompt: string): string | undefined {
+  const patterns = [
+    new RegExp(String.raw`\b(?:from|in|on)\s+(?:the\s+)?(?:view|page|screen|form)\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
+    new RegExp(String.raw`\b${ARTIFACT_INTENT_TOKEN_PATTERN}\s+(?:view|page|screen|form)\b`, "iu"),
+  ];
+
+  for (const pattern of patterns) {
+    const target_id =
+      normalize_resolved_task_target_id(prompt.match(pattern)?.[1]);
+    if (target_id) return target_id;
+  }
+
+  return undefined;
+}
+
+function extract_quoted_text_change(prompt: string): Pick<XVibeResolvedTask, "_edit_target_id" | "_edit_target_text" | "_edit_replacement_text" | "_edit_field"> | undefined {
+  const patterns = [
+    /\b(?:change|update)\s+([a-z][a-z0-9_-]*)\s+(?:text|label)\s+from\s+["']([^"']+)["']\s+to\s+["']([^"']+)["']/iu,
+    /\b(?:set)\s+([a-z][a-z0-9_-]*)\s+(?:text|label)\s+to\s+["']([^"']+)["']/iu,
+    /\b(?:rename)\s+([a-z][a-z0-9_-]*)\s+to\s+["']([^"']+)["']/iu,
+    /\b(?:change|update)\s+["']([^"']+)["']\s+to\s+["']([^"']+)["']/iu,
+    /\b(?:replace)\s+["']([^"']+)["']\s+with\s+["']([^"']+)["']/iu,
+  ];
+
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern);
+    if (!match) continue;
+
+    if (match.length === 4) {
+      const target_id = normalize_resolved_task_target_id(match[1]);
+      return {
+        ...(target_id ? { _edit_target_id: target_id } : {}),
+        _edit_target_text: match[2].trim(),
+        _edit_replacement_text: match[3].trim(),
+        _edit_field: "_text",
+      };
+    }
+
+    if (pattern.source.includes("(?:set)") || pattern.source.includes("(?:rename)")) {
+      const target_id = normalize_resolved_task_target_id(match[1]);
+      return {
+        ...(target_id ? { _edit_target_id: target_id } : {}),
+        _edit_replacement_text: match[2].trim(),
+        _edit_field: "_text",
+      };
+    }
+
+    return {
+      _edit_target_text: match[1].trim(),
+      _edit_replacement_text: match[2].trim(),
+      _edit_field: "_text",
+    };
+  }
+
+  return undefined;
+}
+
+function trim_unquoted_edit_phrase(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/^(?:the|a|an)\s+/iu, "")
+    .replace(/^["'`]+|["'`]+$/gu, "")
+    .replace(/[.,;:!?]+$/u, "")
+    .trim();
+}
+
+function trim_unquoted_replacement_text(value: string): string {
+  let text = value.split(/\r?\n/u)[0] ?? "";
+  const constraint_match = text.search(
+    /\b(?:do\s+not|don't|dont|only\s+update|update\s+\w+\s+view\s+only|preserve|keep|without)\b/iu,
+  );
+  if (constraint_match >= 0) {
+    text = text.slice(0, constraint_match);
+  }
+
+  const sentence_boundary = text.search(/[.!?](?:\s|$)/u);
+  if (sentence_boundary >= 0) {
+    text = text.slice(0, sentence_boundary);
+  }
+
+  return trim_unquoted_edit_phrase(text);
+}
+
+function normalize_view_edit_target_type(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized === "buttons") return "button";
+  if (normalized === "labels") return "label";
+  if (normalized === "texts") return "text";
+  if (normalized === "titles") return "title";
+  if (normalized === "headings") return "heading";
+  if (
+    normalized === "button" ||
+    normalized === "label" ||
+    normalized === "text" ||
+    normalized === "title" ||
+    normalized === "heading"
+  ) {
+    return normalized;
+  }
+
+  return undefined;
+}
+
+function extract_unquoted_text_change(prompt: string): Pick<XVibeResolvedTask, "_edit_target_text" | "_edit_target_type" | "_edit_replacement_text" | "_edit_field"> | undefined {
+  const object_hint_pattern = String.raw`(?:buttons?|labels?|texts?|titles?|headings?)`;
+  const change_patterns = [
+    new RegExp(
+      String.raw`\b(?:change|update|set)\s+([^.!?\r\n]+?)\s+(${object_hint_pattern})\s+(?:text|label)\s+to\s+([^\r\n]+)`,
+      "iu",
+    ),
+    new RegExp(
+      String.raw`\brename\s+([^.!?\r\n]+?)\s+(${object_hint_pattern})\s+to\s+([^\r\n]+)`,
+      "iu",
+    ),
+  ];
+
+  for (const pattern of change_patterns) {
+    const match = prompt.match(pattern);
+    if (!match) continue;
+
+    const target_text = trim_unquoted_edit_phrase(match[1] ?? "");
+    const target_type = normalize_view_edit_target_type(match[2]);
+    const replacement_text = trim_unquoted_replacement_text(match[3] ?? "");
+    if (!target_text || !replacement_text) continue;
+
+    return {
+      _edit_target_text: target_text,
+      ...(target_type ? { _edit_target_type: target_type } : {}),
+      _edit_replacement_text: replacement_text,
+      _edit_field: "_text",
+    };
+  }
+
+  return undefined;
+}
+
+function normalize_view_edit_style_property(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase().replace(/\s+/gu, " ");
+  for (const [phrase, property] of VIEW_EDIT_STYLE_PROPERTY_ALIASES) {
+    if (normalized === phrase) return property;
+  }
+
+  return undefined;
+}
+
+function parse_view_edit_style_target(value: string | undefined): Pick<XVibeResolvedTask, "_edit_target_id" | "_edit_target_text" | "_edit_target_type"> | undefined {
+  const target = trim_unquoted_edit_phrase(value ?? "");
+  if (!target) return undefined;
+
+  const target_id =
+    normalize_resolved_task_target_id(target);
+  if (target_id && /[-_]/u.test(target_id)) {
+    return { _edit_target_id: target_id };
+  }
+
+  const typed_target_match =
+    target.match(new RegExp(String.raw`^(.+?)\s+(${VIEW_EDIT_OBJECT_NOUN_PATTERN})$`, "iu"));
+  const target_type =
+    normalize_view_edit_target_type(typed_target_match?.[2]);
+  const target_text =
+    typed_target_match
+      ? trim_unquoted_edit_phrase(typed_target_match[1] ?? "")
+      : target;
+  if (!target_text) return undefined;
+
+  return {
+    _edit_target_text: target_text,
+    ...(target_type ? { _edit_target_type: target_type } : {}),
+  };
+}
+
+function parse_view_edit_move_ref(
+  value: string | undefined,
+  prefix: "target" | "anchor",
+): Pick<XVibeResolvedTask, "_edit_target_id" | "_edit_target_text" | "_edit_target_type" | "_edit_anchor_id" | "_edit_anchor_text" | "_edit_anchor_type"> | undefined {
+  const target = trim_unquoted_edit_phrase(value ?? "");
+  if (!target) return undefined;
+
+  const typed_target_match =
+    target.match(new RegExp(String.raw`^(.+?)\s+(${VIEW_EDIT_OBJECT_NOUN_PATTERN})$`, "iu"));
+  const target_type =
+    normalize_view_edit_target_type(typed_target_match?.[2]);
+  if (typed_target_match && target_type) {
+    const target_text =
+      trim_unquoted_edit_phrase(typed_target_match[1] ?? "");
+    if (!target_text) return undefined;
+    return prefix === "target"
+      ? {
+        _edit_target_text: target_text,
+        _edit_target_type: target_type,
+      }
+      : {
+        _edit_anchor_text: target_text,
+        _edit_anchor_type: target_type,
+      };
+  }
+
+  const target_id =
+    normalize_resolved_task_target_id(target);
+  if (target_id && /[-_]/u.test(target_id)) {
+    return prefix === "target"
+      ? { _edit_target_id: target_id }
+      : { _edit_anchor_id: target_id };
+  }
+
+  return prefix === "target"
+    ? { _edit_target_text: target }
+    : { _edit_anchor_text: target };
+}
+
+function extract_move_edit_metadata(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_target_id" | "_edit_target_text" | "_edit_target_type" | "_edit_move_position" | "_edit_anchor_id" | "_edit_anchor_text" | "_edit_anchor_type"> | undefined {
+  if (edit_action !== "move-object") {
+    return undefined;
+  }
+
+  const anchored_match =
+    prompt.match(/\bmove\s+(.+?)\s+(before|after)\s+(.+?)(?:[.!?\r\n]|$)/iu);
+  if (anchored_match) {
+    const target =
+      parse_view_edit_move_ref(anchored_match[1], "target");
+    const anchor =
+      parse_view_edit_move_ref(anchored_match[3], "anchor");
+    const position = anchored_match[2]?.toLowerCase();
+    if (
+      target &&
+      anchor &&
+      (position === "before" || position === "after")
+    ) {
+      return {
+        ...target,
+        _edit_move_position: position,
+        ...anchor,
+      };
+    }
+  }
+
+  const edge_match =
+    prompt.match(/\bmove\s+(.+?)\s+to\s+(top|bottom)\b/iu);
+  if (!edge_match) return undefined;
+
+  const target =
+    parse_view_edit_move_ref(edge_match[1], "target");
+  const position = edge_match[2]?.toLowerCase();
+  if (
+    target &&
+    (position === "top" || position === "bottom")
+  ) {
+    return {
+      ...target,
+      _edit_move_position: position,
+    };
+  }
+
+  return undefined;
+}
+
+function extract_style_edit_metadata(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_style_property" | "_edit_style_value" | "_edit_target_id" | "_edit_target_text" | "_edit_target_type"> | undefined {
+  if (edit_action !== "set-style" && edit_action !== "remove-style") {
+    return undefined;
+  }
+
+  const property_pattern = String.raw`(${VIEW_EDIT_STYLE_PROPERTY_PATTERN})`;
+  const match =
+    edit_action === "set-style"
+      ? prompt.match(new RegExp(String.raw`\bset\s+(.+?)\s+${property_pattern}\s+to\s+([^\r\n]+)`, "iu"))
+      : prompt.match(new RegExp(String.raw`\bremove\s+${property_pattern}\s+from\s+(.+?)(?:[.!?\r\n]|$)`, "iu"));
+  if (!match) return undefined;
+
+  const property =
+    normalize_view_edit_style_property(
+      edit_action === "set-style" ? match[2] : match[1],
+    );
+  if (!property) return undefined;
+
+  const target =
+    parse_view_edit_style_target(
+      edit_action === "set-style" ? match[1] : match[2],
+    );
+  if (!target) return undefined;
+
+  const style_value =
+    edit_action === "set-style"
+      ? trim_unquoted_replacement_text(match[3] ?? "")
+      : undefined;
+  if (edit_action === "set-style" && !style_value) {
+    return undefined;
+  }
+
+  return {
+    _edit_style_property: property,
+    ...(style_value ? { _edit_style_value: style_value } : {}),
+    ...target,
+  };
+}
+
+function extract_style_class_rule_edit_metadata(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_class_name" | "_edit_style_property" | "_edit_style_value"> | undefined {
+  if (
+    edit_action !== "set-style-class-rule" &&
+    edit_action !== "remove-style-class-rule"
+  ) {
+    return undefined;
+  }
+
+  const property_pattern = String.raw`(${VIEW_EDIT_STYLE_PROPERTY_PATTERN})`;
+  const class_name_pattern = String.raw`([a-z][a-z0-9]*[-_][a-z0-9_-]*)`;
+  const match =
+    edit_action === "set-style-class-rule"
+      ? prompt.match(new RegExp(String.raw`\b(?:make|set)\s+${class_name_pattern}\s+${property_pattern}\s+(?!to\b)([^\r\n]+)`, "iu"))
+      : prompt.match(new RegExp(String.raw`\bremove\s+${property_pattern}\s+from\s+${class_name_pattern}\s+class\b`, "iu"));
+  if (!match) return undefined;
+
+  const class_name =
+    edit_action === "set-style-class-rule"
+      ? normalize_resolved_task_target_id(match[1])
+      : normalize_resolved_task_target_id(match[2]);
+  if (!class_name) return undefined;
+
+  const property =
+    normalize_view_edit_style_property(
+      edit_action === "set-style-class-rule" ? match[2] : match[1],
+    );
+  if (!property) return undefined;
+
+  const style_value =
+    edit_action === "set-style-class-rule"
+      ? trim_unquoted_replacement_text(match[3] ?? "")
+      : undefined;
+  if (edit_action === "set-style-class-rule" && !style_value) {
+    return undefined;
+  }
+
+  return {
+    _edit_class_name: class_name,
+    _edit_style_property: property,
+    ...(style_value ? { _edit_style_value: style_value } : {}),
+  };
+}
+
+function normalize_view_edit_property_name(value: string | undefined): string | undefined {
+  const property_name =
+    typeof value === "string"
+      ? value.trim().toLowerCase()
+      : "";
+  return property_name || undefined;
+}
+
+function coerce_view_edit_property_value(value: string): string | number | boolean | null {
+  const trimmed = trim_unquoted_replacement_text(value);
+  if (/^true$/iu.test(trimmed)) return true;
+  if (/^false$/iu.test(trimmed)) return false;
+  if (/^null$/iu.test(trimmed)) return null;
+  if (/^-?\d+(?:\.\d+)?$/u.test(trimmed)) return Number(trimmed);
+  return trimmed;
+}
+
+function extract_property_edit_metadata(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_property_name" | "_edit_property_value" | "_edit_target_id" | "_edit_target_text" | "_edit_target_type"> | undefined {
+  if (edit_action !== "set-property" && edit_action !== "remove-property") {
+    return undefined;
+  }
+
+  const property_pattern = String.raw`(${VIEW_EDIT_PROPERTY_NAME_PATTERN})`;
+  const match =
+    edit_action === "set-property"
+      ? prompt.match(new RegExp(String.raw`\bset\s+(.+?)\s+${property_pattern}\s+to\s+([^\r\n]+)`, "iu"))
+      : prompt.match(new RegExp(String.raw`\bremove\s+${property_pattern}\s+from\s+(.+?)(?:[.!?\r\n]|$)`, "iu"));
+  if (!match) return undefined;
+
+  const property_name =
+    normalize_view_edit_property_name(
+      edit_action === "set-property" ? match[2] : match[1],
+    );
+  if (!property_name) return undefined;
+
+  const target =
+    parse_view_edit_style_target(
+      edit_action === "set-property" ? match[1] : match[2],
+    );
+  if (!target) return undefined;
+
+  return {
+    _edit_property_name: property_name,
+    ...(edit_action === "set-property"
+      ? { _edit_property_value: coerce_view_edit_property_value(match[3] ?? "") }
+      : {}),
+    ...target,
+  };
+}
+
+function extract_class_edit_metadata(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_class_name" | "_edit_old_class_name" | "_edit_new_class_name" | "_edit_target_id" | "_edit_target_text" | "_edit_target_type"> | undefined {
+  if (
+    edit_action !== "add-class" &&
+    edit_action !== "remove-class" &&
+    edit_action !== "replace-class" &&
+    edit_action !== "toggle-class"
+  ) {
+    return undefined;
+  }
+
+  const verb =
+    edit_action === "add-class"
+      ? "add"
+      : edit_action === "remove-class"
+        ? "remove"
+        : edit_action === "replace-class"
+          ? "replace"
+          : "toggle";
+  const preposition =
+    edit_action === "add-class"
+      ? "to"
+      : edit_action === "remove-class"
+        ? "from"
+        : "on";
+  const class_pattern =
+    edit_action === "replace-class"
+      ? String.raw`([a-z][a-z0-9_-]*)\s+with\s+([a-z][a-z0-9_-]*)`
+      : String.raw`([a-z][a-z0-9_-]*)`;
+  const base_pattern = String.raw`\b${verb}\s+class\s+([a-z][a-z0-9_-]*)\s+${preposition}\s+(?:the\s+)?`;
+  const replace_base_pattern = String.raw`\b${verb}\s+class\s+${class_pattern}\s+${preposition}\s+(?:the\s+)?`;
+  const effective_base_pattern =
+    edit_action === "replace-class"
+      ? replace_base_pattern
+      : base_pattern;
+  const class_name_pattern = new RegExp(
+    `${effective_base_pattern}([a-z][a-z0-9]*[-_][a-z0-9_-]*)(?:\\s|$|[.,;:!?])`,
+    "iu",
+  );
+  const text_type_pattern = new RegExp(
+    `${effective_base_pattern}(?:"([^"]+)"|'([^']+)'|([^.!?\\r\\n]+?))\\s+(button|label|text|title|heading)\\b`,
+    "iu",
+  );
+
+  const text_type_match = prompt.match(text_type_pattern);
+  if (text_type_match) {
+    const class_name = text_type_match[1]?.trim();
+    const new_class_name =
+      edit_action === "replace-class"
+        ? text_type_match[2]?.trim()
+        : undefined;
+    const target_offset = edit_action === "replace-class" ? 1 : 0;
+    const target_text =
+      text_type_match[2 + target_offset]?.trim() ??
+      text_type_match[3 + target_offset]?.trim() ??
+      trim_unquoted_edit_phrase(text_type_match[4 + target_offset] ?? "");
+    const target_type = normalize_view_edit_target_type(text_type_match[5 + target_offset]);
+    if (class_name && target_text && (edit_action !== "replace-class" || new_class_name)) {
+      return {
+        ...(edit_action === "replace-class"
+          ? {
+            _edit_old_class_name: class_name,
+            _edit_new_class_name: new_class_name,
+          }
+          : { _edit_class_name: class_name }),
+        _edit_target_text: target_text,
+        ...(target_type ? { _edit_target_type: target_type } : {}),
+      };
+    }
+  }
+
+  const class_name_match = prompt.match(class_name_pattern);
+  const class_name = class_name_match?.[1]?.trim();
+  const new_class_name =
+    edit_action === "replace-class"
+      ? class_name_match?.[2]?.trim()
+      : undefined;
+  const target_id_index = edit_action === "replace-class" ? 3 : 2;
+  const target_id =
+    normalize_resolved_task_target_id(class_name_match?.[target_id_index]);
+  if (class_name && target_id && (edit_action !== "replace-class" || new_class_name)) {
+    return {
+      ...(edit_action === "replace-class"
+        ? {
+          _edit_old_class_name: class_name,
+          _edit_new_class_name: new_class_name,
+        }
+        : { _edit_class_name: class_name }),
+      _edit_target_id: target_id,
+    };
+  }
+
+  return undefined;
+}
+
+function extract_view_edit_metadata(prompt: string): Pick<XVibeResolvedTask, "_edit_action" | "_edit_target_id" | "_edit_target_text" | "_edit_target_type" | "_edit_replacement_text" | "_edit_class_name" | "_edit_old_class_name" | "_edit_new_class_name" | "_edit_style_property" | "_edit_style_value" | "_edit_property_name" | "_edit_property_value" | "_edit_move_position" | "_edit_anchor_id" | "_edit_anchor_text" | "_edit_anchor_type" | "_edit_field"> | undefined {
+  const text = normalize_artifact_intent_prompt(prompt);
+  const edit_action = detect_view_edit_action(text);
+  if (!edit_action || !prompt_has_view_child_edit(text)) return undefined;
+
+  const metadata: Pick<XVibeResolvedTask, "_edit_action" | "_edit_target_id" | "_edit_target_text" | "_edit_target_type" | "_edit_replacement_text" | "_edit_class_name" | "_edit_old_class_name" | "_edit_new_class_name" | "_edit_style_property" | "_edit_style_value" | "_edit_property_name" | "_edit_property_value" | "_edit_move_position" | "_edit_anchor_id" | "_edit_anchor_text" | "_edit_anchor_type" | "_edit_field"> = {
+    _edit_action: edit_action,
+  };
+
+  const move_edit =
+    extract_move_edit_metadata(prompt, edit_action);
+  if (move_edit) {
+    Object.assign(metadata, move_edit);
+    return metadata;
+  }
+
+  const style_class_rule_edit =
+    extract_style_class_rule_edit_metadata(prompt, edit_action);
+  if (style_class_rule_edit) {
+    Object.assign(metadata, style_class_rule_edit);
+    return metadata;
+  }
+
+  const style_edit = extract_style_edit_metadata(prompt, edit_action);
+  if (style_edit) {
+    Object.assign(metadata, style_edit);
+    return metadata;
+  }
+
+  const property_edit =
+    extract_property_edit_metadata(prompt, edit_action);
+  if (property_edit) {
+    Object.assign(metadata, property_edit);
+    return metadata;
+  }
+
+  const class_edit = extract_class_edit_metadata(prompt, edit_action);
+  if (class_edit) {
+    Object.assign(metadata, class_edit);
+    return metadata;
+  }
+
+  const text_change = extract_quoted_text_change(prompt);
+  if (text_change) {
+    Object.assign(metadata, text_change);
+  } else {
+    const unquoted_text_change = extract_unquoted_text_change(prompt);
+    if (unquoted_text_change) {
+      Object.assign(metadata, unquoted_text_change);
+    }
+  }
+
+  const quoted_target_match =
+    prompt.match(/\b(?:delete|remove|hide|show|unhide)\s+(?:the\s+)?(?:(button|label|text|title|heading)\s+)?["']([^"']+)["'](?:\s+(button|label|text|title|heading))?/iu);
+  const quoted_target = quoted_target_match?.[2];
+  if (quoted_target?.trim() && !metadata._edit_target_text) {
+    metadata._edit_target_text = quoted_target.trim();
+  }
+  const quoted_target_type =
+    normalize_view_edit_target_type(quoted_target_match?.[1] ?? quoted_target_match?.[3]);
+  if (quoted_target_type && !metadata._edit_target_type) {
+    metadata._edit_target_type = quoted_target_type;
+  }
+
+  const unquoted_remove_match =
+    edit_action === "remove"
+      ? prompt.match(/\b(?:delete|remove)\s+(?:the\s+)?([^.!?\r\n]+?)\s+(button|label|text|title|heading)\b/iu)
+      : undefined;
+  const unquoted_remove_target = unquoted_remove_match?.[1];
+  if (unquoted_remove_target?.trim() && !metadata._edit_target_text) {
+    metadata._edit_target_text = trim_unquoted_edit_phrase(unquoted_remove_target);
+  }
+  const unquoted_remove_target_type =
+    normalize_view_edit_target_type(unquoted_remove_match?.[2]);
+  if (unquoted_remove_target_type && !metadata._edit_target_type) {
+    metadata._edit_target_type = unquoted_remove_target_type;
+  }
+
+  const unquoted_hide_match =
+    edit_action === "hide"
+      ? (
+        prompt.match(/\bhide\s+(?:the\s+)?([^.!?\r\n]+?)\s+(button|label|text|title|heading)\b/iu) ??
+        prompt.match(/\bmake\s+(?:the\s+)?([^.!?\r\n]+?)\s+(button|label|text|title|heading)\s+hidden\b/iu)
+      )
+      : undefined;
+  const unquoted_hide_target = unquoted_hide_match?.[1];
+  if (unquoted_hide_target?.trim() && !metadata._edit_target_text) {
+    metadata._edit_target_text = trim_unquoted_edit_phrase(unquoted_hide_target);
+  }
+  const unquoted_hide_target_type =
+    normalize_view_edit_target_type(unquoted_hide_match?.[2]);
+  if (unquoted_hide_target_type && !metadata._edit_target_type) {
+    metadata._edit_target_type = unquoted_hide_target_type;
+  }
+
+  const unquoted_show_match =
+    edit_action === "show"
+      ? (
+        prompt.match(/\b(?:show|unhide)\s+(?:the\s+)?([^.!?\r\n]+?)\s+(button|label|text|title|heading)\b/iu) ??
+        prompt.match(/\bmake\s+(?:the\s+)?([^.!?\r\n]+?)\s+(button|label|text|title|heading)\s+visible\b/iu)
+      )
+      : undefined;
+  const unquoted_show_target = unquoted_show_match?.[1];
+  if (unquoted_show_target?.trim() && !metadata._edit_target_text) {
+    metadata._edit_target_text = trim_unquoted_edit_phrase(unquoted_show_target);
+  }
+  const unquoted_show_target_type =
+    normalize_view_edit_target_type(unquoted_show_match?.[2]);
+  if (unquoted_show_target_type && !metadata._edit_target_type) {
+    metadata._edit_target_type = unquoted_show_target_type;
+  }
+
+  const id_target =
+    prompt.match(
+      new RegExp(
+        String.raw`\b(?:delete|remove|hide|show|unhide)\s+(?:the\s+)?(?:${VIEW_EDIT_OBJECT_NOUN_PATTERN}\s+)?([a-z][a-z0-9]*[-_][a-z0-9_-]*)\b`,
+        "iu",
+      ),
+    )?.[1];
+  const normalized_id = normalize_resolved_task_target_id(id_target);
+  if (normalized_id) {
+    metadata._edit_target_id = normalized_id;
+  }
+
+  return metadata;
+}
+
+function extract_explicit_resolved_target_id(
+  prompt: string,
+  artifact_type: XVibeResolvedTaskArtifactType,
+): string | undefined {
+  if (
+    artifact_type !== "view" &&
+    artifact_type !== "flow" &&
+    artifact_type !== "entity"
+  ) {
+    return undefined;
+  }
+
+  return normalize_resolved_task_target_id(
+    extract_artifact_target_id(prompt, artifact_type),
+  );
+}
+
+function is_resolved_task_explicit_artifact_type(
+  input: {
+    _requested_artifact_type?: VibeRequestedArtifactType;
+    _prompt: string;
+    _intent: XVibeArtifactIntent;
+    _artifact_type: XVibeResolvedTaskArtifactType;
+  },
+): boolean {
+  if (artifact_type_from_requested_artifact_type(input._requested_artifact_type)) {
+    return true;
+  }
+
+  if (input._artifact_type === "app" && explicit_app_artifact_type(input._prompt)) {
+    return true;
+  }
+
+  return input._intent._target !== "unknown" && input._intent._reason !== "fallback_view";
+}
+
+export function resolve_xvibe_task(input: {
+  _prompt: string;
+  _requested_artifact_type?: VibeRequestedArtifactType;
+  _view_id?: string;
+}): XVibeResolvedTask {
+  const planner = new VibeIntentPlanner();
+  const prompt = input._prompt;
+  const intent = planner.infer_artifact_intent(prompt);
+  const warnings: string[] = [];
+  const requested_artifact_type =
+    artifact_type_from_requested_artifact_type(input._requested_artifact_type);
+  let artifact_type: XVibeResolvedTaskArtifactType =
+    requested_artifact_type ??
+    (explicit_app_artifact_type(prompt)
+      ? "app"
+      : resolved_artifact_type_from_intent_target(intent._target));
+  let target_id: string | undefined;
+  let explicit_target_id = false;
+  let module_name: string | undefined;
+  const module_ops =
+    extract_explicit_module_ops_from_prompt(prompt);
+
+  if (artifact_type === "unknown" && intent._reason === "fallback_view") {
+    artifact_type = "view";
+  }
+
+  if (artifact_type === "view") {
+    const view_id =
+      normalize_resolved_task_target_id(input._view_id);
+    if (view_id) {
+      target_id = view_id;
+      explicit_target_id = true;
+    } else {
+      const explicit_id =
+        extract_explicit_resolved_target_id(prompt, artifact_type);
+      if (explicit_id) {
+        target_id = explicit_id;
+        explicit_target_id = true;
+      } else {
+        const explicit_view_target_id =
+          extract_explicit_view_target_id(prompt);
+        if (explicit_view_target_id) {
+          target_id = explicit_view_target_id;
+          explicit_target_id = true;
+        } else if (prompt_explicitly_targets_main_view(prompt)) {
+          target_id = "main";
+          explicit_target_id = true;
+        }
+      }
+    }
+  } else if (artifact_type === "flow" || artifact_type === "entity") {
+    const explicit_id =
+      extract_explicit_resolved_target_id(prompt, artifact_type);
+    if (explicit_id) {
+      target_id = explicit_id;
+      explicit_target_id = true;
+    }
+  }
+
+  const edit_metadata =
+    artifact_type === "view"
+      ? extract_view_edit_metadata(prompt)
+      : undefined;
+  const resolved_action =
+    edit_metadata ? "update" : intent._action;
+
+  if (artifact_type === "view" && edit_metadata && !target_id) {
+    const view_id =
+      normalize_resolved_task_target_id(input._view_id);
+    if (view_id) {
+      target_id = view_id;
+      explicit_target_id = true;
+    }
+  }
+
+  if (artifact_type === "module") {
+    module_name = extract_explicit_module_id_from_prompt(prompt);
+    if (module_ops.length === 0) {
+      warnings.push("missing_explicit_module_ops");
+    }
+  }
+
+  const rejected_intent_id =
+    intent._target_id &&
+    !target_id &&
+    RESERVED_RESOLVED_TASK_TARGET_IDS.has(intent._target_id);
+  if (rejected_intent_id) {
+    warnings.push("rejected_reserved_target_id");
+  }
+
+  return {
+    _action: resolved_action,
+    _artifact_type: artifact_type,
+    ...(target_id ? { _target_id: target_id } : {}),
+    ...(edit_metadata ?? {}),
+    _explicit_artifact_type:
+      is_resolved_task_explicit_artifact_type({
+        _requested_artifact_type: input._requested_artifact_type,
+        _prompt: prompt,
+        _intent: intent,
+        _artifact_type: artifact_type,
+      }),
+    _explicit_target_id: explicit_target_id,
+    ...(module_name ? { _module_name: module_name } : {}),
+    _module_ops: module_ops,
+    _source: intent._reason,
+    _confidence: intent._confidence,
+    _warnings: unique(warnings),
+  };
+}
+
+function collect_plan_artifact_types(plan: unknown): Set<string> {
+  const types = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (!is_plain_object(value)) return;
+
+    if (typeof value._primary_artifact_type === "string") {
+      types.add(value._primary_artifact_type);
+    }
+
+    if (typeof value._artifact_type === "string") {
+      types.add(value._artifact_type);
+    }
+
+    if (Array.isArray(value._artifact_types)) {
+      for (const item of value._artifact_types) {
+        if (typeof item === "string") types.add(item);
+      }
+    }
+
+    if (Array.isArray(value._artifacts)) {
+      for (const item of value._artifacts) visit(item);
+    }
+
+    if (is_plain_object(value._execution_plan)) {
+      visit(value._execution_plan);
+    }
+  };
+
+  visit(plan);
+  return types;
+}
+
+function collect_plan_ids_for_artifact_type(
+  plan: unknown,
+  artifact_type: string,
+): string[] {
+  const ids: string[] = [];
+  const add_id = (value: unknown): void => {
+    if (typeof value !== "string") return;
+    const id = normalize_resolved_task_target_id(value);
+    if (id) ids.push(id);
+  };
+  const visit = (value: unknown): void => {
+    if (!is_plain_object(value)) return;
+
+    if (
+      value._artifact_type === artifact_type ||
+      value._primary_artifact_type === artifact_type
+    ) {
+      add_id(value._artifact_id);
+      add_id(value._target_id);
+      add_id(value._view_id);
+      add_id(value._flow_id);
+      add_id(value._entity_id);
+    }
+
+    if (artifact_type === "flow" && Array.isArray(value._flow_ids)) {
+      for (const item of value._flow_ids) add_id(item);
+    }
+
+    if (artifact_type === "entity" && Array.isArray(value._entity_ids)) {
+      for (const item of value._entity_ids) add_id(item);
+    }
+
+    if (artifact_type === "module" && Array.isArray(value._module_names)) {
+      for (const item of value._module_names) add_id(item);
+    }
+
+    if (Array.isArray(value._artifacts)) {
+      for (const item of value._artifacts) visit(item);
+    }
+
+    if (is_plain_object(value._execution_plan)) {
+      visit(value._execution_plan);
+    }
+  };
+
+  visit(plan);
+  return unique(ids);
+}
+
+export function warn_if_plan_violates_resolved_task(
+  resolved_task: XVibeResolvedTask,
+  plan: unknown,
+): void {
+  const artifact_types =
+    collect_plan_artifact_types(plan);
+  const primary_artifact_type =
+    is_plain_object(plan) && typeof plan._primary_artifact_type === "string"
+      ? plan._primary_artifact_type
+      : undefined;
+
+  if (
+    resolved_task._artifact_type === "module" &&
+    (
+      artifact_types.has("view") ||
+      artifact_types.has("entity") ||
+      artifact_types.has("flow")
+    )
+  ) {
+    _xlog.warn("[xvibe] resolved task soft lock violation", {
+      _reason: "module_plan_includes_non_module_artifact",
+      _resolved_task: resolved_task,
+      _plan_artifact_types: [...artifact_types],
+    });
+  }
+
+  if (
+    resolved_task._artifact_type === "view" &&
+    primary_artifact_type === "entity"
+  ) {
+    _xlog.warn("[xvibe] resolved task soft lock violation", {
+      _reason: "view_plan_primary_artifact_is_entity",
+      _resolved_task: resolved_task,
+      _plan_primary_artifact_type: primary_artifact_type,
+    });
+  }
+
+  if (resolved_task._target_id) {
+    const plan_ids =
+      collect_plan_ids_for_artifact_type(
+        plan,
+        resolved_task._artifact_type,
+      );
+    const mismatched_ids =
+      plan_ids.filter((id) => id !== resolved_task._target_id);
+    if (mismatched_ids.length > 0) {
+      _xlog.warn("[xvibe] resolved task soft lock violation", {
+        _reason: "target_id_mismatch",
+        _resolved_task: resolved_task,
+        _plan_target_ids: plan_ids,
+      });
+    }
+  }
+}
+
+function module_target_from_resolved_task_prompt(prompt: string): Exclude<VibeModuleTarget, null> {
+  const text = normalize_artifact_intent_prompt(prompt);
+  return /\bclient\s+(?:xmodule|module)\b/u.test(text)
+    ? "client"
+    : "server";
+}
+
+export function create_module_intent_plan_from_resolved_task(
+  resolved_task: XVibeResolvedTask,
+  prompt: string,
+  runtime_capabilities: VibeRuntimeCapabilityRegistry,
+): VibeIntentPlan {
+  return {
+    _ir_version: INTENT_IR_VERSION,
+    _intent_type: "module",
+    _artifact_types: ["module"],
+    _entities: [],
+    _regions: [],
+    _objects: [],
+    _actions: [],
+    _bindings: [],
+    _modules: [],
+    _style: {},
+    _xui_objects: [],
+    _capabilities: [],
+    _crud_ops: [],
+    _ui_patterns: [],
+    _ui_keywords: [],
+    _flow_keywords: [],
+    _entity_keywords: [],
+    _requires_module: true,
+    _module_target: module_target_from_resolved_task_prompt(prompt),
+    _module_name: resolved_task._module_name,
+    _module_ops: resolved_task._module_ops,
+    _module_reason: "Resolved XVibe task requested module generation.",
+    _runtime_capabilities: runtime_capabilities,
+  };
 }
 
 function unique_artifact_targets(values: XVibeArtifactIntentTarget[]): XVibeArtifactIntentTarget[] {
@@ -583,12 +1813,14 @@ function extract_artifact_target_id(
     if (quoted_view_id) return quoted_view_id;
   }
 
-  const quoted_id =
-    artifact_target_id_from_pattern(
-      prompt,
-      new RegExp(String.raw`\b${target_pattern}\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
-    );
-  if (quoted_id) return quoted_id;
+  if (target !== "view") {
+    const quoted_id =
+      artifact_target_id_from_pattern(
+        prompt,
+        new RegExp(String.raw`\b${target_pattern}\s+${ARTIFACT_INTENT_TOKEN_PATTERN}(?:\s|$|[.,;:])`, "iu"),
+      );
+    if (quoted_id) return quoted_id;
+  }
 
   return artifact_target_id_from_pattern(
     prompt,
@@ -709,31 +1941,46 @@ function prompt_has_explicit_view_update(text: string): boolean {
 function prompt_has_view_update_request(text: string): boolean {
   return (
     prompt_has_explicit_view_update(text) ||
+    prompt_has_view_child_edit(text) ||
     /\b(?:update|change|edit|modify|replace)\b[\s\S]{0,120}\b(?:view|page|screen|form|button|field|layout)\b/u.test(text)
   );
 }
 
-function has_explicit_flow_intent(text: string): boolean {
+export function has_explicit_flow_intent(text: string): boolean {
   return (
     /\bflow-[a-z0-9][a-z0-9_-]*\b/u.test(text) ||
+    /\bflow\s+named\s+[a-z][a-z0-9_-]*\b/u.test(text) ||
+    /\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?flow(?:\s+named)?(?:\s+[a-z][a-z0-9_-]*)?\b/u.test(text) ||
+    /\bwith\s+[a-z][a-z0-9_-]*\s+flow\b/u.test(text) ||
+    /\bbutton\b[\s\S]{0,80}\b(?:trigger|triggers|triggering|run|runs|running|execute|executes|executing|call|calls|calling)\s+(?:a\s+|an\s+|the\s+)?(?:[a-z][a-z0-9_-]*\s+)?flow\b/u.test(text) ||
     /\b(?:trigger|triggers|triggering|run|runs|running|execute|executes|executing|call|calls|calling)\s+(?:a|an|the)?\s*flow\b/u.test(text) ||
     /\bflow\s+(?:trigger|action|button)\b/u.test(text)
   );
 }
 
-function extract_prompt_flow_ids(text: string): string[] {
+export function extract_prompt_flow_ids(text: string): string[] {
   const ids: string[] = [];
   ids.push(...(text.match(/\bflow-[a-z0-9][a-z0-9_-]*\b/gi) ?? []));
 
-  const named_flow_pattern =
-    /\b(?:run|trigger|call|execute)?\s*(?:a\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu;
+  const flow_id_patterns = [
+    /\b(?:run|trigger|call|execute|create|build|generate|add|make)?\s*(?:a\s+|an\s+|the\s+)?flow\s+named\s+([a-z][a-z0-9_-]*)\b/giu,
+    /\b(?:create|build|generate|add|make)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?flow\s+([a-z][a-z0-9_-]*)\b/giu,
+    /\bwith\s+([a-z][a-z0-9_-]*)\s+flow\b/giu,
+    /\bbutton\b[\s\S]{0,80}\b(?:trigger|triggers|triggering|run|runs|running|execute|executes|executing|call|calls|calling)\s+(?:a\s+|an\s+|the\s+)?([a-z][a-z0-9_-]*)\s+flow\b/giu,
+    /\b(?:trigger|triggers|triggering|run|runs|running|execute|executes|executing|call|calls|calling)\s+(?:a\s+|an\s+|the\s+)?([a-z][a-z0-9_-]*)\s+flow\b/giu,
+  ];
 
-  for (const match of text.matchAll(named_flow_pattern)) {
-    ids.push(match[1]);
+  for (const pattern of flow_id_patterns) {
+    for (const match of text.matchAll(pattern)) {
+      ids.push(match[1]);
+    }
   }
 
   return unique(
-    ids.map((match) => match.trim().toLowerCase()).filter((match) => match.length > 0)
+    ids
+      .map((match) => match.trim().toLowerCase())
+      .filter((match) => match.length > 0)
+      .filter((match) => !RESERVED_RESOLVED_TASK_TARGET_IDS.has(match))
   );
 }
 
@@ -1011,6 +2258,17 @@ function resolve_negative_constraints(prompt: string): XVibeIntentResolverResult
 
 function resolve_fallback_classifier(prompt: string): XVibeIntentResolverResult | null {
   const text = strip_negated_artifact_phrases(normalize_artifact_intent_prompt(prompt));
+  if (prompt_has_view_child_edit(text)) {
+    return {
+      _matched: true,
+      _reason: "view_child_edit_intent",
+      _artifact_type: "view",
+      _confidence: 0.85,
+      _action: "update",
+      _artifact_id: extract_explicit_view_target_id(prompt),
+    };
+  }
+
   const explicit_target =
     infer_explicit_artifact_target(text) ??
     infer_vocabulary_artifact_target(text);
@@ -1024,7 +2282,7 @@ function resolve_fallback_classifier(prompt: string): XVibeIntentResolverResult 
       _reason: explicit_target.reason,
       _artifact_type: artifact_type,
       _confidence: explicit_target.confidence,
-      _action: detect_artifact_action(text),
+      _action: detect_view_edit_action(text) ? "update" : detect_artifact_action(text),
       _artifact_id: extract_artifact_target_id(prompt, explicit_target.target),
     };
   }
@@ -1523,7 +2781,7 @@ export class VibeIntentPlanner {
       _ops: normalized._ops.length,
       _capability_keywords: normalized._capability_keywords.length,
     });
-    verbose_log("[xvibe] normalized capability extraction", normalized);
+    // verbose_log("[xvibe] normalized capability extraction", normalized);
 
     return normalized;
   }
@@ -1730,7 +2988,7 @@ export class VibeIntentPlanner {
         ? module_op_extraction._module_ops
         : inferred_module_requirement?._module_ops.length
           ? inferred_module_requirement._module_ops
-          : ["run"];
+          : [];
     const plan: VibeIntentPlan = {
       _ir_version: INTENT_IR_VERSION,
       _intent_type: "module",
@@ -1899,8 +3157,6 @@ export class VibeIntentPlanner {
     if (this.contains_any(text, ["dashboard", "analytics", "metrics", "reports", "overview"])) {
       inferred._intent_type = "dashboard";
       append_unique(inferred._regions, ["sidebar", "toolbar", "kpi_grid", "records_table"]);
-      this.add_available(inferred._objects, ["xsection", "grid", "table", "kpi-card", "sidebar", "toolbar"], runtime_capabilities._semantic_object_ids);
-      this.add_available(inferred._xui_objects, ["xsection", "grid", "table", "kpi-card", "sidebar", "toolbar"], runtime_capabilities._semantic_object_ids);
       append_unique(inferred._capabilities, ["dashboard", "analytics", "metrics"]);
       append_unique(inferred._ui_patterns, ["dashboard"]);
       inferred._style = {
@@ -1915,7 +3171,6 @@ export class VibeIntentPlanner {
       append_unique(inferred._regions, ["toolbar", "records_table", "create_modal", "details_drawer", "filters"]);
       this.add_available(inferred._objects, ["modal", "form", "table", "button", "toolbar", "field", "xselect", "drawer"], runtime_capabilities._semantic_object_ids);
       this.add_available(inferred._xui_objects, ["modal", "form", "table", "button", "toolbar", "field", "xselect", "drawer"], runtime_capabilities._semantic_object_ids);
-      this.add_available(inferred._modules, ["entity-client", "entity-manager", "xdb-entity", "xd"], runtime_capabilities._module_ids);
       this.add_available(inferred._crud_ops, ["find", "list", "add", "get", "update", "delete"], runtime_capabilities._ops);
       append_unique(inferred._capabilities, ["entity", "crud", "storage"]);
     }
@@ -1935,14 +3190,12 @@ export class VibeIntentPlanner {
       append_unique(inferred._regions, ["sidebar", "content"]);
       this.add_available(inferred._objects, ["navlist", "sidebar", "toolbar"], runtime_capabilities._semantic_object_ids);
       this.add_available(inferred._xui_objects, ["navlist", "sidebar", "toolbar"], runtime_capabilities._semantic_object_ids);
-      this.add_available(inferred._modules, ["server-xvm", "xvm", "router"], runtime_capabilities._module_ids);
       append_unique(inferred._capabilities, ["navigation", "routing"]);
       append_unique(inferred._ui_patterns, ["navigation"]);
     }
 
     if (this.contains_any(text, ["realtime", "real-time", "live", "streaming", "stream", "subscribe", "push"])) {
       append_unique(inferred._artifact_types, ["flow"]);
-      this.add_available(inferred._modules, ["xem", "wormholes"], runtime_capabilities._module_ids);
       append_unique(inferred._capabilities, ["realtime", "events", "streaming"]);
       append_unique(inferred._flow_keywords, ["realtime", "events"]);
     }
@@ -1988,7 +3241,6 @@ export class VibeIntentPlanner {
     }
 
     if (this.contains_any(text, ["storage", "state", "persist", "database", "save", "load"])) {
-      this.add_available(inferred._modules, ["xd", "xdb", "xdb-entity"], runtime_capabilities._module_ids);
       append_unique(inferred._capabilities, ["storage", "state"]);
     }
 
@@ -2170,12 +3422,17 @@ export class VibeIntentPlanner {
     if (/\bbuttons?\b/u.test(text)) {
       objects.push("button");
     }
+    if (/\b(?:labels?|text)\b/u.test(text)) {
+      objects.push("label");
+    }
     if (/\b(?:cards?)\b/u.test(text)) {
       objects.push("card");
-      this.add_layout_object(objects, runtime_capabilities);
     }
-    if (/\b(?:grid|grids|row|rows|column|columns|aligned|layout)\b/u.test(text)) {
-      this.add_layout_object(objects, runtime_capabilities);
+    if (/\b(?:stacks?)\b/u.test(text)) {
+      objects.push("stack");
+    }
+    if (/\b(?:grid|grids|row|rows|column|columns|aligned)\b/u.test(text)) {
+      objects.push("grid");
     }
     if (/\btoolbar\b/u.test(text)) {
       objects.push("toolbar");
@@ -2191,24 +3448,6 @@ export class VibeIntentPlanner {
     }
 
     return unique(objects);
-  }
-
-  private add_layout_object(
-    objects: string[],
-    runtime_capabilities: VibeRuntimeCapabilityRegistry,
-  ): void {
-    const runtime_ids = new Set(
-      runtime_capabilities._semantic_object_ids.map((item) => normalize_lookup_key(item)),
-    );
-
-    if (runtime_ids.size === 0 || runtime_ids.has("grid")) {
-      objects.push("grid");
-      return;
-    }
-
-    if (runtime_ids.has("stack")) {
-      objects.push("stack");
-    }
   }
 
   private normalize_selected_values(
@@ -2905,7 +4144,7 @@ export class VibeIntentPlanner {
         _module_ops:
           opMatches.length > 0
             ? unique(opMatches)
-            : ["run"],
+            : [],
         _module_reason:
           "User explicitly requested creation of a server module.",
       });

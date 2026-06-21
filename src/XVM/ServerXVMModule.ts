@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { XModule, type XCommand, _xlog, _x, XError ,type XpellSkill,type XpellSkillCommand} from "@xpell/core";
+import { XModule, type XCommand, _xlog, _x, XError, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 import { _xu } from "../XNUtils/XUtils.js";
 import { wsBroadcastScoped, wsSetScope } from "../Wormholes/wh.index.js";
@@ -141,6 +141,53 @@ export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
     _name: "get_active_app",
     _scope: "module",
     _description: "Get active application."
+  },
+  list_apps: {
+    _name: "list_apps",
+    _scope: "module",
+    _description: "List loaded runtime applications."
+  },
+
+  load_app_from_disk: {
+    _name: "load_app_from_disk",
+    _scope: "module",
+    _description: "Load or reload a user application from persisted disk storage."
+  },
+
+  reload_app: {
+    _name: "reload_app",
+    _scope: "module",
+    _description: "Reload a user application from persisted disk storage."
+  },
+
+  list_views: {
+    _name: "list_views",
+    _scope: "module",
+    _description: "List view artifacts for an application."
+  },
+
+  list_flows: {
+    _name: "list_flows",
+    _scope: "module",
+    _description: "List flow artifacts for an application."
+  },
+
+  list_entities: {
+    _name: "list_entities",
+    _scope: "module",
+    _description: "List entity artifacts for an application."
+  },
+
+  list_generated_modules: {
+    _name: "list_generated_modules",
+    _scope: "module",
+    _description: "List generated runtime modules."
+  },
+
+  save_view_json: {
+    _name: "save_view_json",
+    _scope: "module",
+    _description: "Persist a view JSON artifact."
   }
 };
 
@@ -319,9 +366,12 @@ export class ServerXVMModule extends XModule {
   async _list_apps(xcmd: XCommand) {
     const params = _xu.ensure_params(xcmd?._params);
     const env = typeof params._env === "string" ? params._env : undefined;
+    const include_system = params._include_system === true;
+
     const apps = Array.from(this._apps.values())
       .map(bundle => bundle._app)
-      .filter(app => !env || app._env === env);
+      .filter(app => !env || app._env === env)
+      .filter(app => include_system || app._system !== true);
 
     return {
       _ok: true,
@@ -330,6 +380,49 @@ export class ServerXVMModule extends XModule {
         _apps: apps
       }
     };
+  }
+
+  async _load_app_from_disk(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const app_id = this.resolve_safe_segment(params._app_id, "_app_id", "E_XVM_INVALID_APP_ID");
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const app_dir = this.resolve_user_app_dir(env, app_id);
+
+    if (!fs.existsSync(path.join(app_dir, "app.json"))) {
+      throw new XError("E_XVM_APP_NOT_FOUND", `App not found on disk: ${app_id}`);
+    }
+
+    const loaded = await this.loadAppFromDir(app_dir, env, false);
+
+    if (loaded._apps < 1) {
+      throw new XError("E_XVM_APP_LOAD_FAILED", `Failed to load app from disk: ${app_id}`);
+    }
+
+    const bundle = this.get_bundle(app_id, env);
+
+    _xlog.log("[server-xvm] user app loaded/reloaded", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app: bundle._app,
+        _view_ids: Object.keys(bundle._views || {}),
+        _flow_ids: Object.keys(bundle._flows || {}),
+        _entity_ids: Object.keys(bundle._entities || {}),
+        _reloaded: true
+      }
+    };
+  }
+
+  async _reload_app(xcmd: XCommand) {
+    return this._load_app_from_disk(xcmd);
   }
 
   /* ------------------------------------------------------------------------ */
@@ -1062,6 +1155,34 @@ export class ServerXVMModule extends XModule {
     }
   }
 
+
+  private resolve_safe_segment(value: unknown, field_name: string, code: string): string {
+    if (typeof value !== "string") {
+      throw new XError(code, `Invalid ${field_name}`);
+    }
+
+    const segment = value.trim();
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u.test(segment)) {
+      throw new XError(code, `Invalid ${field_name}`);
+    }
+
+    return segment;
+  }
+
+  private resolve_user_app_dir(env: string, app_id: string): string {
+    const root = path.resolve(this._apps_root);
+    const app_dir = path.resolve(root, env, app_id);
+    const relative = path.relative(root, app_dir);
+
+    if (
+      relative.startsWith("..") ||
+      path.isAbsolute(relative)
+    ) {
+      throw new XError("E_XVM_INVALID_APP_PATH", "Invalid user app path");
+    }
+
+    return app_dir;
+  }
 
 
 

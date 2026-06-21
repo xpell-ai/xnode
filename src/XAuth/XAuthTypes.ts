@@ -39,6 +39,13 @@ export type XAuthVerifyJwtParams = {
   _token?: unknown;
 };
 
+export type XAuthCreateJwtParams = {
+  _user_id?: unknown;
+  _account_id?: unknown;
+  _clearance_level?: unknown;
+  _auth_type?: unknown;
+};
+
 export type XAuthCreateApiKeyParams = {
   _prefix?: unknown;
   _env?: unknown;
@@ -69,6 +76,11 @@ export type XAuthVerifyJwtResult = {
   _ok: true;
   _valid: true;
   _auth: XAuthVerifiedAuth;
+};
+
+export type XAuthCreateJwtResult = {
+  _ok: true;
+  _token: string;
 };
 
 export type XAuthCreateApiKeyResult = {
