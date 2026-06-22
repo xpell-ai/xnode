@@ -4,6 +4,7 @@ import type {
   XAuthJWTClaims,
   XAuthJWTConfig,
   XAuthJWTPayload,
+  XAuthSafeJWTClaims,
   XAuthTokenType
 } from "./XAuthTypes.js";
 
@@ -146,7 +147,36 @@ export function verify_jwt(
     throw xauth_unauthorized("Invalid token payload", XAUTH_ERR.INVALID_TOKEN);
   }
 
-  return payload as XAuthJWTPayload;
+  const verified_payload: XAuthJWTPayload = {
+    _user_id: payload._user_id,
+    _account_id: payload._account_id,
+    _clearance_level: payload._clearance_level,
+    _auth_type: "jwt",
+    iat: payload.iat as number,
+    exp: payload.exp,
+    ...pick_safe_jwt_claims(payload)
+  };
+
+  if (typeof payload.iss === "string") {
+    verified_payload.iss = payload.iss;
+  }
+
+  return verified_payload;
+}
+
+export function pick_safe_jwt_claims(
+  claims: Record<string, unknown>
+): XAuthSafeJWTClaims {
+  const safe_claims: XAuthSafeJWTClaims = {};
+  const email = read_optional_string_claim(claims._email);
+  const role = read_optional_string_claim(claims._role);
+  const roles = read_optional_string_array_claim(claims._roles);
+
+  if (email) safe_claims._email = email;
+  if (role) safe_claims._role = role;
+  if (roles) safe_claims._roles = roles;
+
+  return safe_claims;
 }
 
 export function create_api_key(
@@ -265,6 +295,22 @@ function looks_like_jwt(token: string): boolean {
   } catch {
     return false;
   }
+}
+
+function read_optional_string_claim(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function read_optional_string_array_claim(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const items = value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  return items.length ? items : undefined;
 }
 
 function sign(unsigned: string, secret: string): string {

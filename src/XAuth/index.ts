@@ -20,6 +20,7 @@ export type {
   XAuthJWTClaims,
   XAuthJWTConfig,
   XAuthJWTPayload,
+  XAuthSafeJWTClaims,
   XAuthLoginParams,
   XAuthLoginResult,
   XAuthTokenType,

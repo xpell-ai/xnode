@@ -1,7 +1,13 @@
 export type XAuthType = "jwt" | "api_key" | "super_user";
 export type XAuthTokenType = XAuthType | "unknown";
 
-export type XAuthJWTClaims = {
+export type XAuthSafeJWTClaims = {
+  _email?: string;
+  _role?: string;
+  _roles?: string[];
+};
+
+export type XAuthJWTClaims = XAuthSafeJWTClaims & {
   _user_id: string;
   _account_id: string;
   _clearance_level: number;
@@ -14,7 +20,7 @@ export type XAuthJWTPayload = XAuthJWTClaims & {
   exp: number;
 };
 
-export type XAuthVerifiedAuth = {
+export type XAuthVerifiedAuth = XAuthSafeJWTClaims & {
   _authenticated: true;
   _auth_type: XAuthType;
   _user_id?: string;
@@ -44,6 +50,9 @@ export type XAuthCreateJwtParams = {
   _account_id?: unknown;
   _clearance_level?: unknown;
   _auth_type?: unknown;
+  _email?: unknown;
+  _role?: unknown;
+  _roles?: unknown;
 };
 
 export type XAuthCreateApiKeyParams = {

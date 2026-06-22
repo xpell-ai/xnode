@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { _x, _xlog } from "@xpell/core";
 import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
+import { XAuthModule } from "./XAuth/index.js";
 import { XDB, XDBStorageFS } from "./XDB/index.js";
 import { XEntityManager } from "./XEntityManager/XEntityManager.js";
 import { ServerXVMModule } from "./XVM/ServerXVMModule.js";
@@ -97,6 +98,62 @@ function collect_missing_xui_node_ids(value: unknown, path = "_view", missing: s
 
   return missing;
 }
+
+function decode_jwt_payload_for_test(token: string): Record<string, unknown> {
+  const payload_part = token.split(".")[1];
+  assert.ok(payload_part, "JWT payload part is required");
+  const base64 = payload_part.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
+  return JSON.parse(Buffer.from(padded, "base64").toString("utf-8"));
+}
+
+await _x.loadModuleAsync(new XAuthModule());
+
+const xauth_safe_claims_create_res = await _x.execute({
+  _module: "xauth",
+  _op: "create-jwt",
+  _params: {
+    _user_id: "user-claims",
+    _account_id: "account-claims",
+    _email: "aime@example.com",
+    _role: "admin",
+    _roles: ["admin", "operator"],
+    _password: "must-not-appear",
+    _secret: "must-not-appear",
+    _token: "must-not-appear",
+    _unknown: "must-not-appear"
+  }
+});
+
+assert.equal(xauth_safe_claims_create_res._ok, true);
+assert.equal(typeof xauth_safe_claims_create_res._token, "string");
+
+const xauth_safe_claims_payload = decode_jwt_payload_for_test(xauth_safe_claims_create_res._token);
+assert.equal(xauth_safe_claims_payload._email, "aime@example.com");
+assert.equal(xauth_safe_claims_payload._role, "admin");
+assert.deepEqual(xauth_safe_claims_payload._roles, ["admin", "operator"]);
+assert.equal("_password" in xauth_safe_claims_payload, false);
+assert.equal("_secret" in xauth_safe_claims_payload, false);
+assert.equal("_token" in xauth_safe_claims_payload, false);
+assert.equal("_unknown" in xauth_safe_claims_payload, false);
+
+const xauth_safe_claims_verify_res = await _x.execute({
+  _module: "xauth",
+  _op: "verify-jwt",
+  _params: {
+    _token: xauth_safe_claims_create_res._token
+  }
+});
+
+assert.equal(xauth_safe_claims_verify_res._ok, true);
+assert.equal(xauth_safe_claims_verify_res._valid, true);
+assert.equal(xauth_safe_claims_verify_res._auth._email, "aime@example.com");
+assert.equal(xauth_safe_claims_verify_res._auth._role, "admin");
+assert.deepEqual(xauth_safe_claims_verify_res._auth._roles, ["admin", "operator"]);
+assert.equal("_password" in xauth_safe_claims_verify_res._auth, false);
+assert.equal("_secret" in xauth_safe_claims_verify_res._auth, false);
+assert.equal("_token" in xauth_safe_claims_verify_res._auth, false);
+assert.equal("_unknown" in xauth_safe_claims_verify_res._auth, false);
 
 const settings_path_work_folder = await mkdtemp(path.join(tmpdir(), "xsettings-path-"));
 const settings_path_settings = new _XSettings();

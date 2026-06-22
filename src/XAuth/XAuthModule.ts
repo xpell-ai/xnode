@@ -25,6 +25,7 @@ import {
   get_jwt_config,
   hash_secret,
   is_local_dev_mode,
+  pick_safe_jwt_claims,
   sign_jwt,
   verify_secret,
   verify_jwt,
@@ -69,7 +70,10 @@ export const XAUTH_OPS: Record<string, XpellSkillCommand> = {
       _user_id: "Authenticated user id.",
       _account_id: "Authenticated account id.",
       _clearance_level: "Optional clearance level.",
-      _auth_type: "JWT auth type."
+      _auth_type: "JWT auth type.",
+      _email: "Optional safe email claim.",
+      _role: "Optional safe role claim.",
+      _roles: "Optional safe roles claim."
     }
   },
 
@@ -251,7 +255,8 @@ export class XAuthModule extends XModule {
           _auth_type: "jwt",
           _user_id: payload._user_id,
           _account_id: payload._account_id,
-          _clearance_level: payload._clearance_level
+          _clearance_level: payload._clearance_level,
+          ...pick_safe_jwt_claims(payload)
         }
       };
     } catch (err) {
@@ -278,7 +283,8 @@ export class XAuthModule extends XModule {
       _user_id: user_id,
       _account_id: account_id,
       _clearance_level: clearance_level,
-      _auth_type: auth_type
+      _auth_type: auth_type,
+      ...pick_safe_jwt_claims(params as Record<string, unknown>)
     });
 
     _xlog.log("[xauth] jwt created", {
