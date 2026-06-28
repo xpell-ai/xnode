@@ -129,10 +129,11 @@ export class XWebServer {
     this._app.use(express.json());
     this._app.use(cors({ origin: true }));
 
+    this._app.use(express.static(this._public_folder));
     this._app.use("/public", express.static(this._public_folder));
+    _xlog.log("XWeb public folder", this._public_folder);
 
     this.applyRoutes();
-    this._app.get("/", this.loadHome);
 
     // 🔴 DO NOT ADD FALLBACK HERE (breaks REST wormholes)
     _xlog.log("Xpell Web Server loaded ✅", this._engine_id);
@@ -225,15 +226,6 @@ export class XWebServer {
   /* ---------------------------------------------------------------- */
   /* HELPERS                                                          */
   /* ---------------------------------------------------------------- */
-
-  loadHome = (_req: any, res: any) => {
-    res.send(
-      fs.readFileSync(
-        path.resolve(this._public_folder, "index.html"),
-        "utf-8"
-      )
-    );
-  };
 
   private applyRoutes() {
     for (const handler of this._routes_handlers) {

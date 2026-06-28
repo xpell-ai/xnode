@@ -216,6 +216,119 @@ function is_server_xvm_push_update_result(
   );
 }
 
+function stringify_inspector_value(_value: unknown): string {
+  if (_value === undefined || _value === null) return "";
+  if (typeof _value === "string") return _value;
+
+  try {
+    return JSON.stringify(_value, null, 2);
+  } catch {
+    return String(_value);
+  }
+}
+
+function read_summary_string(
+  _summary: Record<string, unknown>,
+  _field_name: string,
+): string {
+  const _value = _summary[_field_name];
+  return typeof _value === "string" && _value.trim().length > 0
+    ? _value.trim()
+    : "-";
+}
+
+function read_summary_bool(
+  _summary: Record<string, unknown>,
+  _field_name: string,
+): string {
+  return _summary[_field_name] === true ? "true" : "false";
+}
+
+function format_runtime_inspector_summary(
+  _summary: Record<string, unknown>,
+): string {
+  const _deterministic_reason =
+    read_summary_string(_summary, "_deterministic_reason");
+  const _deterministic_action =
+    read_summary_string(_summary, "_deterministic_action");
+
+  return [
+    `generation_id: ${read_summary_string(_summary, "_generation_id")}`,
+    `artifact_type: ${read_summary_string(_summary, "_artifact_type")}`,
+    `mode: ${read_summary_string(_summary, "_mode")}`,
+    `status: ${read_summary_string(_summary, "_status")}`,
+    `deterministic eligible: ${read_summary_bool(_summary, "_deterministic_eligible")}`,
+    `deterministic reason/action: ${_deterministic_reason} / ${_deterministic_action}`,
+    `error code: ${read_summary_string(_summary, "_error_code")}`,
+    `final-prompt exists: ${read_summary_bool(_summary, "_has_final_prompt")}`,
+  ].join("\n");
+}
+
+function build_runtime_inspector_payload(
+  _run: Record<string, unknown>,
+): Record<string, unknown> {
+  const _files =
+    is_plain_object(_run._files)
+      ? _run._files
+      : {};
+  const _summary =
+    is_plain_object(_run._summary)
+      ? _run._summary
+      : {};
+
+  const _sections = [
+    {
+      _id: "resolved-task",
+      _label: "Resolved Task",
+      _file: "resolved-task.json",
+      _content: _files["resolved-task.json"] ?? null,
+      _preview: stringify_inspector_value(_files["resolved-task.json"]),
+    },
+    {
+      _id: "deterministic",
+      _label: "Deterministic",
+      _file: "deterministic-mutation.json",
+      _content: _files["deterministic-mutation.json"] ?? null,
+      _preview: stringify_inspector_value(_files["deterministic-mutation.json"]),
+    },
+    {
+      _id: "result",
+      _label: "Result",
+      _file: "result.json",
+      _content: _files["result.json"] ?? null,
+      _preview: stringify_inspector_value(_files["result.json"]),
+    },
+    {
+      _id: "prompt",
+      _label: "Prompt",
+      _file: "final-prompt.txt",
+      _content: _files["final-prompt.txt"] ?? _files["prompt.txt"] ?? null,
+      _preview: stringify_inspector_value(
+        _files["final-prompt.txt"] ?? _files["prompt.txt"],
+      ),
+    },
+    {
+      _id: "runtime-context",
+      _label: "Runtime Context",
+      _file: "runtime-context.json",
+      _content: _files["runtime-context.json"] ?? null,
+      _preview: stringify_inspector_value(_files["runtime-context.json"]),
+    },
+  ];
+
+  return {
+    _title: "Runtime Inspector",
+    _button_label: "Inspect Last Run",
+    _status:
+      typeof _summary._status === "string"
+        ? _summary._status
+        : "completed",
+    _summary,
+    _summary_text: format_runtime_inspector_summary(_summary),
+    _sections,
+  };
+}
+
 export const XSTUDIO_OPS: Record<string, XpellSkillCommand> = {
   "generate-view": {
     _name: "generate-view",
@@ -280,6 +393,18 @@ export const XSTUDIO_OPS: Record<string, XpellSkillCommand> = {
     _params: {
       _include_objects: "Optional flag to include object skill chains.",
       _include_modules: "Optional flag to include module skills."
+    }
+  },
+
+  "inspect-latest-run": {
+    _name: "inspect-latest-run",
+    _scope: "module",
+    _description:
+      "Fetch and format the latest XVibe run diagnostics for the current Studio app/env.",
+    _params: {
+      _app_id: "Target XVM app id.",
+      _env: "Optional environment. Defaults to default.",
+      _generation_id: "Optional generation id. Defaults to the latest vibe-run."
     }
   },
 
@@ -684,6 +809,49 @@ export class XStudioModule extends XModule {
     }
   }
 
+  async _inspect_latest_run(xcmd: XCommand) {
+    return this._op_inspect_latest_run(xcmd);
+  }
+
+  async _op_inspect_latest_run(xcmd: XCommand) {
+    try {
+      const _params = this.parse_inspect_latest_run_params(xcmd?._params);
+      const _run_result: unknown = await _x.execute({
+        _module: "xvibe",
+        _op: "get-latest-run",
+        _params,
+      } as any);
+
+      const _command_error = extract_command_error_result(_run_result);
+      if (_command_error) {
+        return _command_error;
+      }
+
+      if (!is_plain_object(_run_result) || _run_result._ok !== true) {
+        return create_error_result(
+          "E_STUDIO_INVALID_INSPECT_RESPONSE",
+          "XVibe returned an invalid run inspector response",
+          {
+            _app_id: _params._app_id,
+            _env: _params._env,
+          },
+        );
+      }
+
+      return {
+        ..._run_result,
+        _inspector: build_runtime_inspector_payload(_run_result),
+      };
+    } catch (_error) {
+      _xlog.error("[studio] inspect_latest_run failed", _error);
+      return this.normalize_error(
+        _error,
+        "E_STUDIO_INSPECT_LATEST_RUN",
+        "Failed to inspect the latest XVibe run",
+      );
+    }
+  }
+
   private parse_generate_view_params(
     _params: unknown,
   ): XStudioGenerateViewParams & { _generation_id?: string } {
@@ -769,6 +937,26 @@ export class XStudioModule extends XModule {
           : DEFAULT_ENV,
       _view_id: read_required_string(_params._view_id, "_view_id"),
       _view: clone_view(_params._view),
+    };
+  }
+
+  private parse_inspect_latest_run_params(
+    _params: unknown,
+  ): { _app_id: string; _env: string; _generation_id?: string } {
+    if (!is_plain_object(_params)) {
+      throw new Error("Invalid '_params': expected object");
+    }
+
+    const _generation_id =
+      read_optional_string(_params._generation_id, "_generation_id");
+
+    return {
+      _app_id: read_required_string(_params._app_id, "_app_id"),
+      _env:
+        typeof _params._env === "string" && _params._env.trim().length > 0
+          ? _params._env.trim()
+          : DEFAULT_ENV,
+      ...(_generation_id ? { _generation_id } : {}),
     };
   }
 

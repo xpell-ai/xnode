@@ -78,6 +78,8 @@ const XVIBE_STARTER_NOT_FOUND = "E_XVIBE_STARTER_NOT_FOUND";
 const XVIBE_APP_ALREADY_EXISTS = "E_XVIBE_APP_ALREADY_EXISTS";
 const XVIBE_STARTER_COPY_FAILED = "E_XVIBE_STARTER_COPY_FAILED";
 const XVIBE_STARTER_LOAD_FAILED = "E_XVIBE_STARTER_LOAD_FAILED";
+const XVIBE_RUN_NOT_FOUND = "E_XVIBE_RUN_NOT_FOUND";
+const XVIBE_INVALID_GENERATION_ID = "E_XVIBE_INVALID_GENERATION_ID";
 const BUILTIN_SERVER_MODULES = new Set([
   "xvm",
   "xd",
@@ -109,6 +111,7 @@ const FALLBACK_XUI_VALIDATION_TYPES = new Set([
   "badge",
   "modal",
   "drawer",
+  "xvm-view",
 ]);
 const RESERVED_VIEW_IDS = new Set([
   "a",
@@ -194,7 +197,7 @@ type XVibeViewMutationArtifact = XVibeJsonObject & {
 };
 
 type XVibeViewEditIntent = XVibeJsonObject & {
-  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object";
+  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -206,6 +209,7 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _style_value?: string;
   _property_name?: string;
   _property_value?: string | number | boolean | null;
+  _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
   _anchor_id?: string;
   _anchor_text?: string;
@@ -214,9 +218,25 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _warnings?: string[];
 };
 
+type XVibeStructuredViewEditAction =
+  | "set-property"
+  | "remove-property"
+  | "set-style"
+  | "remove-style"
+  | "add-class"
+  | "remove-class"
+  | "replace-class"
+  | "toggle-class"
+  | "remove-object"
+  | "hide-object"
+  | "show-object"
+  | "move-object"
+  | "replace-object"
+  | "duplicate-object";
+
 type XVibeDeterministicViewEditEligibility = {
   _eligible: boolean;
-  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object";
+  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
   _target_id?: string;
   _field?: "_text";
   _reason: string;
@@ -228,7 +248,7 @@ type XVibeDeterministicViewEditResult = {
   _view?: unknown;
   _mutation?: {
     _type: "deterministic-view-edit";
-    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object";
+    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
     _target_id?: string;
     _field?: "_text";
     _previous_text?: string;
@@ -244,20 +264,59 @@ type XVibeDeterministicViewEditResult = {
     _previous_value?: unknown;
     _next_value?: unknown;
     _property_name?: string;
+    _previous_object?: XVibeJsonObject;
+    _next_object?: XVibeJsonObject;
     _move_position?: "before" | "after" | "top" | "bottom";
     _anchor_id?: string;
+    _before_id?: string;
+    _after_id?: string;
     _anchor_resolved_by?: "id" | "text" | "normalized_text" | "text_type_id";
     _parent_id?: string;
     _previous_index?: number;
     _next_index?: number;
+    _insert_index?: number;
+    _original_target_id?: string;
+    _new_target_id?: string;
     _removed_type?: string;
     _removed_text?: string;
     _hide_mechanism?: typeof XVIBE_DETERMINISTIC_HIDE_MECHANISM;
     _show_mechanism?: typeof XVIBE_DETERMINISTIC_SHOW_MECHANISM;
+    _target_view_id?: string;
+    _source_view_id?: string;
+    _requested_view_id?: string;
+    _resolved_via?: "xvm-view";
+    _warnings?: string[];
   };
   _reason?: string;
   _details?: unknown;
 };
+
+type XVibeReferencedView = {
+  _view_id: string;
+  _view: XVibeJsonObject;
+};
+
+type XVibeXVMViewReferenceLoadResult = {
+  _referenced_view_ids: string[];
+  _loaded_views: XVibeReferencedView[];
+  _missing_view_ids: string[];
+  _warnings: string[];
+};
+
+type XVibeDeterministicViewEditSourceResolution =
+  | {
+    _eligible: true;
+    _view_id: string;
+    _view: unknown;
+    _resolved_via: "current-view" | "xvm-view";
+    _eligibility: XVibeDeterministicViewEditEligibility;
+    _warnings: string[];
+  }
+  | {
+    _eligible: false;
+    _eligibility: XVibeDeterministicViewEditEligibility;
+    _warnings: string[];
+  };
 
 type XVibeViewMutationDecisionReason =
   | "eligible"
@@ -302,6 +361,8 @@ type XVibeRunArchiveData = {
   _app_id?: string;
   _env?: string;
   _view_id?: string;
+  _requested_view_id?: string;
+  _source_view_id?: string;
   _mode?: VibeAIMode;
   _artifact_type?: string;
   _created_at?: string;
@@ -324,6 +385,31 @@ type XVibeRunArchiveData = {
   _result?: XVibeJsonObject;
   _duration_ms?: number;
   _timeline?: XVibeRunArchiveTimelineItem[];
+};
+
+type XVibeRunDiagnosticSummary = {
+  _generation_id?: string;
+  _artifact_type?: string;
+  _mode?: string;
+  _status: "deterministic" | "fallback" | "failed" | "completed";
+  _deterministic_eligible: boolean;
+  _deterministic_reason?: string;
+  _deterministic_action?: string;
+  _error_code?: string;
+  _has_final_prompt: boolean;
+};
+
+type XVibeRunDiagnosticResult = {
+  _ok: true;
+  _run_id: string;
+  _run_dir: string;
+  _generation_id?: string;
+  _summary: XVibeRunDiagnosticSummary;
+  _files: Record<string, unknown>;
+  _file_errors?: Array<{
+    _file: string;
+    _message: string;
+  }>;
 };
 
 type XVibeRuntimeRegistry = {
@@ -456,6 +542,26 @@ const CALC_SAFE_EVALUATION_OPS = new Set([
   "calculate_expression",
   "calculate-expression",
 ]);
+
+const VIBE_RUN_DIAGNOSTIC_FILE_TYPES = {
+  "request.json": "json",
+  "resolved-task.json": "json",
+  "artifact-plan.json": "json",
+  "intent-plan.json": "json",
+  "runtime-plan.json": "json",
+  "runtime-context.json": "json",
+  "selected-skills.json": "json",
+  "deterministic-mutation.json": "json",
+  "validation-plan.json": "json",
+  "result.json": "json",
+  "timeline.json": "json",
+  "summary.json": "json",
+  "module-plan.json": "json",
+  "ai-output.json": "json",
+  "validation.json": "json",
+  "prompt.txt": "text",
+  "final-prompt.txt": "text",
+} as const;
 
 
 
@@ -1872,6 +1978,8 @@ function archive_vibe_run(data: XVibeRunArchiveData): void {
       _app_id: app_id,
       _env: env,
       ...(data._view_id ? { _view_id: data._view_id } : {}),
+      ...(data._requested_view_id ? { _requested_view_id: data._requested_view_id } : {}),
+      ...(data._source_view_id ? { _source_view_id: data._source_view_id } : {}),
       ...(data._mode ? { _mode: data._mode } : {}),
       ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
       ...(data._resolved_task ? { _resolved_task: data._resolved_task } : {}),
@@ -1958,6 +2066,8 @@ function archive_vibe_run(data: XVibeRunArchiveData): void {
       _app_id: app_id,
       _env: env,
       ...(data._view_id ? { _view_id: data._view_id } : {}),
+      ...(data._requested_view_id ? { _requested_view_id: data._requested_view_id } : {}),
+      ...(data._source_view_id ? { _source_view_id: data._source_view_id } : {}),
       ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
       ...(data._mode ? { _mode: data._mode } : {}),
       ...(data._resolved_task ? { _resolved_task: data._resolved_task } : {}),
@@ -1979,6 +2089,327 @@ function archive_vibe_run(data: XVibeRunArchiveData): void {
       _error: error_summary(error),
     });
   }
+}
+
+function read_safe_vibe_run_generation_id(value: unknown): string | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+
+  if (typeof value !== "string") {
+    throw_explicit_error(
+      XVIBE_INVALID_GENERATION_ID,
+      "Invalid '_generation_id': expected safe generation id",
+    );
+  }
+
+  const generation_id = value.trim();
+  if (
+    generation_id.length === 0 ||
+    generation_id.includes("/") ||
+    generation_id.includes("\\") ||
+    generation_id.includes("..") ||
+    !/^[a-zA-Z0-9._-]+$/u.test(generation_id)
+  ) {
+    throw_explicit_error(
+      XVIBE_INVALID_GENERATION_ID,
+      "Invalid '_generation_id': expected safe generation id",
+    );
+  }
+
+  return generation_id;
+}
+
+function resolve_vibe_runs_dir(input: {
+  _app_id: string;
+  _env: string;
+}): string {
+  const apps_root = path.resolve(resolve_xvibe_work_folder(), "xvm", "apps");
+  const runs_dir =
+    path.resolve(apps_root, input._env, input._app_id, "vibe-runs");
+
+  assert_path_inside(
+    apps_root,
+    runs_dir,
+    XVIBE_INVALID_APP_ID,
+    "Invalid vibe-run scope path",
+  );
+
+  return runs_dir;
+}
+
+function relative_vibe_run_dir(input: {
+  _app_id: string;
+  _env: string;
+  _run_id: string;
+}): string {
+  return path.posix.join(
+    "xvm",
+    "apps",
+    input._env,
+    input._app_id,
+    "vibe-runs",
+    input._run_id,
+  );
+}
+
+function list_vibe_run_dirs(runs_dir: string): string[] {
+  if (!fs.existsSync(runs_dir)) {
+    return [];
+  }
+
+  return fs.readdirSync(runs_dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((name) =>
+      !name.includes("/") &&
+      !name.includes("\\") &&
+      !name.includes("..")
+    )
+    .sort();
+}
+
+function read_vibe_run_json_file_if_present(
+  file_path: string,
+): XVibeJsonObject | undefined {
+  try {
+    const stat = fs.lstatSync(file_path);
+    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
+    const parsed = JSON.parse(fs.readFileSync(file_path, "utf-8"));
+    return _xu.is_plain_object(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function vibe_run_generation_id_from_dir(run_dir: string): string | undefined {
+  const summary =
+    read_vibe_run_json_file_if_present(path.join(run_dir, "summary.json"));
+  if (typeof summary?._generation_id === "string" && summary._generation_id.trim()) {
+    return summary._generation_id.trim();
+  }
+
+  const request =
+    read_vibe_run_json_file_if_present(path.join(run_dir, "request.json"));
+  if (typeof request?._generation_id === "string" && request._generation_id.trim()) {
+    return request._generation_id.trim();
+  }
+
+  return undefined;
+}
+
+function resolve_vibe_run_dir(input: {
+  _runs_dir: string;
+  _generation_id?: string;
+}): { _run_id: string; _run_dir: string; _generation_id?: string } {
+  const run_ids = list_vibe_run_dirs(input._runs_dir);
+  if (run_ids.length === 0) {
+    throw_explicit_error(
+      XVIBE_RUN_NOT_FOUND,
+      "No vibe-runs found for app/env",
+    );
+  }
+
+  if (!input._generation_id) {
+    const run_id = run_ids[run_ids.length - 1];
+    const run_dir = path.join(input._runs_dir, run_id);
+    assert_path_inside(
+      input._runs_dir,
+      run_dir,
+      XVIBE_RUN_NOT_FOUND,
+      "Invalid vibe-run path",
+    );
+
+    return {
+      _run_id: run_id,
+      _run_dir: run_dir,
+      _generation_id: vibe_run_generation_id_from_dir(run_dir),
+    };
+  }
+
+  const safe_generation_segment =
+    safe_archive_segment(input._generation_id, "run");
+
+  for (const run_id of [...run_ids].reverse()) {
+    const run_dir = path.join(input._runs_dir, run_id);
+    assert_path_inside(
+      input._runs_dir,
+      run_dir,
+      XVIBE_RUN_NOT_FOUND,
+      "Invalid vibe-run path",
+    );
+
+    const archived_generation_id =
+      vibe_run_generation_id_from_dir(run_dir);
+
+    if (
+      archived_generation_id === input._generation_id ||
+      run_id.endsWith(`_${safe_generation_segment}`)
+    ) {
+      return {
+        _run_id: run_id,
+        _run_dir: run_dir,
+        _generation_id: archived_generation_id ?? input._generation_id,
+      };
+    }
+  }
+
+  throw_explicit_error(
+    XVIBE_RUN_NOT_FOUND,
+    "Requested vibe-run was not found",
+    {
+      _generation_id: input._generation_id,
+    },
+  );
+}
+
+function read_vibe_run_diagnostic_files(
+  runs_dir: string,
+  run_dir: string,
+): {
+  _files: Record<string, unknown>;
+  _file_errors: Array<{ _file: string; _message: string }>;
+} {
+  assert_path_inside(
+    runs_dir,
+    run_dir,
+    XVIBE_RUN_NOT_FOUND,
+    "Invalid vibe-run path",
+  );
+
+  const files: Record<string, unknown> = {};
+  const file_errors: Array<{ _file: string; _message: string }> = [];
+
+  for (const [file_name, file_type] of Object.entries(VIBE_RUN_DIAGNOSTIC_FILE_TYPES)) {
+    const file_path = path.join(run_dir, file_name);
+    assert_path_inside(
+      run_dir,
+      file_path,
+      XVIBE_RUN_NOT_FOUND,
+      "Invalid vibe-run file path",
+    );
+
+    if (!fs.existsSync(file_path)) {
+      continue;
+    }
+
+    try {
+      const stat = fs.lstatSync(file_path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        continue;
+      }
+
+      const content = fs.readFileSync(file_path, "utf-8");
+      files[file_name] =
+        file_type === "json"
+          ? JSON.parse(content)
+          : content;
+    } catch (error) {
+      file_errors.push({
+        _file: file_name,
+        _message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return { _files: files, _file_errors: file_errors };
+}
+
+function diagnostic_file_object(
+  files: Record<string, unknown>,
+  file_name: string,
+): XVibeJsonObject | undefined {
+  const value = files[file_name];
+  return _xu.is_plain_object(value) ? value : undefined;
+}
+
+function first_string_value(
+  ...values: unknown[]
+): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+
+  return undefined;
+}
+
+function diagnostic_error_code(value: unknown): string | undefined {
+  if (!_xu.is_plain_object(value)) return undefined;
+
+  const direct =
+    first_string_value(value._code, value.code);
+  if (direct) return direct;
+
+  return (
+    diagnostic_error_code(value._error) ??
+    diagnostic_error_code(value._result) ??
+    diagnostic_error_code(value._details)
+  );
+}
+
+function summarize_vibe_run_diagnostics(input: {
+  _generation_id?: string;
+  _files: Record<string, unknown>;
+}): XVibeRunDiagnosticSummary {
+  const request = diagnostic_file_object(input._files, "request.json");
+  const summary = diagnostic_file_object(input._files, "summary.json");
+  const result = diagnostic_file_object(input._files, "result.json");
+  const resolved_task = diagnostic_file_object(input._files, "resolved-task.json");
+  const deterministic =
+    diagnostic_file_object(input._files, "deterministic-mutation.json");
+  const has_final_prompt =
+    typeof input._files["final-prompt.txt"] === "string";
+  const deterministic_eligible =
+    deterministic?._eligible === true;
+  const error_code =
+    diagnostic_error_code(result?._error) ??
+    diagnostic_error_code(result);
+  const failed =
+    result?._success === false ||
+    result?._ok === false ||
+    Boolean(error_code);
+  const status: XVibeRunDiagnosticSummary["_status"] =
+    failed
+      ? "failed"
+      : deterministic_eligible || result?._deterministic === true
+        ? "deterministic"
+        : deterministic?._eligible === false && has_final_prompt
+          ? "fallback"
+          : "completed";
+
+  return {
+    _generation_id:
+      first_string_value(
+        input._generation_id,
+        request?._generation_id,
+        summary?._generation_id,
+      ),
+    _artifact_type:
+      first_string_value(
+        result?._artifact_type,
+        request?._artifact_type,
+        summary?._artifact_type,
+        resolved_task?._artifact_type,
+      ),
+    _mode:
+      first_string_value(
+        request?._mode,
+        summary?._mode,
+      ),
+    _status: status,
+    _deterministic_eligible: deterministic_eligible,
+    _deterministic_reason:
+      first_string_value(deterministic?._reason),
+    _deterministic_action:
+      first_string_value(
+        deterministic?._action,
+        result?._mutation_action,
+      ),
+    ...(error_code ? { _error_code: error_code } : {}),
+    _has_final_prompt: has_final_prompt,
+  };
 }
 
 function generation_artifact_stage_fields(result: unknown): XVibeJsonObject {
@@ -3089,6 +3520,36 @@ export function validate_xvibe_generation_plan(input: {
   };
 }
 
+function defer_view_child_edit_validation_leakage(input: {
+  validation_plan: XVibeValidationPlan;
+  resolved_task: XVibeResolvedTask;
+  deterministic_attempted: boolean;
+}): XVibeValidationPlan {
+  if (
+    input.validation_plan._ok ||
+    !input.deterministic_attempted ||
+    !resolved_task_is_explicit_view_child_edit(input.resolved_task)
+  ) {
+    return input.validation_plan;
+  }
+
+  const deferrable_errors = new Set(["view_route_entity_leakage"]);
+  const non_deferrable_errors =
+    input.validation_plan._errors.filter((error) => !deferrable_errors.has(error));
+  if (non_deferrable_errors.length > 0) {
+    return input.validation_plan;
+  }
+
+  return {
+    _ok: true,
+    _errors: [],
+    _warnings: Array.from(new Set([
+      ...input.validation_plan._warnings,
+      ...input.validation_plan._errors.map((error) => `deferred:${error}`),
+    ])),
+  };
+}
+
 function supported_intent_xui_objects(
   value: unknown,
   runtime_skills: unknown,
@@ -3186,6 +3647,39 @@ function collect_view_nodes(node: unknown, out: XVibeJsonObject[] = []): XVibeJs
   }
 
   return out;
+}
+
+function collect_xvm_view_reference_ids(current_view: unknown): string[] {
+  const ids: string[] = [];
+  const seen = new Set<string>();
+
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        visit(item);
+      }
+      return;
+    }
+
+    if (!_xu.is_plain_object(node)) {
+      return;
+    }
+
+    if (node._type === "xvm-view") {
+      const view_id = normalize_safe_view_id(node._view_id);
+      if (view_id && !seen.has(view_id)) {
+        seen.add(view_id);
+        ids.push(view_id);
+      }
+    }
+
+    if (Array.isArray(node._children)) {
+      visit(node._children);
+    }
+  };
+
+  visit(current_view);
+  return ids;
 }
 
 function find_view_node_by_id(current_view: unknown, target_id: string | undefined): XVibeJsonObject | undefined {
@@ -3313,6 +3807,62 @@ function clone_deterministic_view_json(value: unknown): unknown {
     clone[key] = clone_deterministic_view_json(child);
   }
 
+  return clone;
+}
+
+function deterministic_duplicate_id_base(value: unknown, fallback_type: unknown): string {
+  const source_id =
+    typeof value === "string" ? value.trim() : "";
+  if (source_id) return `${source_id}-copy`;
+
+  const source_type =
+    typeof fallback_type === "string" ? fallback_type.trim() : "";
+  const normalized_type =
+    source_type
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "-")
+      .replace(/^-+|-+$/gu, "");
+  return `${normalized_type || "object"}-copy`;
+}
+
+function deterministic_next_duplicate_id(base: string, used_ids: Set<string>): string {
+  if (!used_ids.has(base)) {
+    used_ids.add(base);
+    return base;
+  }
+
+  for (let index = 2; ; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!used_ids.has(candidate)) {
+      used_ids.add(candidate);
+      return candidate;
+    }
+  }
+}
+
+function clone_deterministic_duplicate_subtree(
+  source_node: XVibeJsonObject,
+  used_ids: Set<string>,
+): XVibeJsonObject {
+  const clone =
+    clone_deterministic_view_json(source_node) as XVibeJsonObject;
+
+  const assign_ids = (node: unknown): void => {
+    if (!_xu.is_plain_object(node)) return;
+    if (typeof node._type !== "string" || !node._type.trim()) return;
+
+    const base =
+      deterministic_duplicate_id_base(node._id, node._type);
+    node._id = deterministic_next_duplicate_id(base, used_ids);
+
+    if (Array.isArray(node._children)) {
+      for (const child of node._children) {
+        assign_ids(child);
+      }
+    }
+  };
+
+  assign_ids(clone);
   return clone;
 }
 
@@ -3445,6 +3995,16 @@ function deterministic_style_is_empty(value: XVibeJsonObject): boolean {
   return Object.keys(value).length === 0;
 }
 
+function deterministic_allows_structured_class_property(input: {
+  _property_name: string;
+  _edit_intent?: XVibeViewEditIntent;
+}): boolean {
+  return (
+    input._property_name === "class" &&
+    input._edit_intent?._structured_apply_view_edit === true
+  );
+}
+
 function find_first_style_sheet_node(current_view: unknown): XVibeJsonObject | undefined {
   return collect_view_nodes(current_view)
     .find((node) => node._type === "style-sheet");
@@ -3466,6 +4026,38 @@ function deterministic_mutation_allows_inline_style(
   mutation: XVibeDeterministicViewEditResult["_mutation"] | undefined,
 ): boolean {
   return mutation?._action === "set-style" || mutation?._action === "remove-style";
+}
+
+function deterministic_target_text_is_id_phrase(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  return /^(?:button|label|object|input|field|form|card|table|row|column|toolbar|sidebar|modal|drawer|section|xsection|text|title|heading|image|icon|link)\s+id$/u
+    .test(value.trim().toLowerCase().replace(/\s+/g, " "));
+}
+
+function deterministic_edit_target_id(input: {
+  _resolved_task: XVibeResolvedTask;
+  _edit_intent?: XVibeViewEditIntent;
+}): string | undefined {
+  const intent_target_id =
+    typeof input._edit_intent?._target_id === "string"
+      ? input._edit_intent._target_id.trim()
+      : "";
+  const resolved_target_id =
+    typeof input._resolved_task._edit_target_id === "string"
+      ? input._resolved_task._edit_target_id.trim()
+      : "";
+  if (resolved_target_id) {
+    return intent_target_id || resolved_target_id;
+  }
+
+  if (
+    intent_target_id &&
+    deterministic_target_text_is_id_phrase(input._resolved_task._edit_target_text)
+  ) {
+    return intent_target_id;
+  }
+
+  return undefined;
 }
 
 function resolve_deterministic_view_edit_target(input: {
@@ -3671,6 +4263,7 @@ function deterministic_resolved_by_from_eligibility(
 export function can_apply_deterministic_view_edit(input: {
   _resolved_task: XVibeResolvedTask;
   _current_view?: unknown;
+  _edit_intent?: XVibeViewEditIntent;
 }): XVibeDeterministicViewEditEligibility {
   const resolved_task = input._resolved_task;
   if (resolved_task._artifact_type !== "view") {
@@ -3696,7 +4289,9 @@ export function can_apply_deterministic_view_edit(input: {
     resolved_task._edit_action !== "remove-style-class-rule" &&
     resolved_task._edit_action !== "set-property" &&
     resolved_task._edit_action !== "remove-property" &&
-    resolved_task._edit_action !== "move-object"
+    resolved_task._edit_action !== "move-object" &&
+    resolved_task._edit_action !== "replace-object" &&
+    resolved_task._edit_action !== "duplicate-object"
   ) {
     return { _eligible: false, _reason: "unsupported_edit_action" };
   }
@@ -3704,6 +4299,12 @@ export function can_apply_deterministic_view_edit(input: {
   if (input._current_view === undefined || input._current_view === null) {
     return { _eligible: false, _reason: "missing_current_view" };
   }
+
+  const target_id =
+    deterministic_edit_target_id({
+      _resolved_task: resolved_task,
+      _edit_intent: input._edit_intent,
+    });
 
   if (resolved_task._edit_action === "update") {
     if (resolved_task._edit_field !== "_text") {
@@ -3727,7 +4328,7 @@ export function can_apply_deterministic_view_edit(input: {
     const target_resolution =
       resolve_deterministic_view_edit_target({
         _current_view: input._current_view,
-        _target_id: resolved_task._edit_target_id,
+        _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
       });
@@ -3790,7 +4391,7 @@ export function can_apply_deterministic_view_edit(input: {
     const target_resolution =
       resolve_deterministic_view_edit_target({
         _current_view: input._current_view,
-        _target_id: resolved_task._edit_target_id,
+        _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
       });
@@ -3888,9 +4489,17 @@ export function can_apply_deterministic_view_edit(input: {
       return { _eligible: false, _reason: "missing_property_name" };
     }
 
+    const structured_class_property =
+      deterministic_allows_structured_class_property({
+        _property_name: property_name,
+        _edit_intent: input._edit_intent,
+      });
     if (
-      XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
-      !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
+      !structured_class_property &&
+      (
+        XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
+        !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
+      )
     ) {
       return {
         _eligible: false,
@@ -3911,7 +4520,7 @@ export function can_apply_deterministic_view_edit(input: {
     const target_resolution =
       resolve_deterministic_view_edit_target({
         _current_view: input._current_view,
-        _target_id: resolved_task._edit_target_id,
+        _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
       });
@@ -3936,6 +4545,106 @@ export function can_apply_deterministic_view_edit(input: {
     };
   }
 
+  if (resolved_task._edit_action === "replace-object") {
+    const object_value = input._edit_intent?._object_value;
+
+    if (!_xu.is_plain_object(object_value)) {
+      return { _eligible: false, _reason: "missing_object_value" };
+    }
+
+    const target_resolution =
+      resolve_deterministic_view_edit_target({
+        _current_view: input._current_view,
+        _target_id: target_id,
+        _target_text: resolved_task._edit_target_text,
+        _target_type: resolved_task._edit_target_type,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_location =
+      find_view_node_location_by_id(input._current_view, target_resolution._target_id);
+    if (
+      !target_location?._parent ||
+      !Array.isArray(target_location._children) ||
+      typeof target_location._index !== "number"
+    ) {
+      return {
+        _eligible: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: target_resolution._target_id,
+        },
+      };
+    }
+
+    const next_id =
+      typeof object_value._id === "string" ? object_value._id.trim() : "";
+    if (next_id !== target_resolution._target_id) {
+      return {
+        _eligible: false,
+        _reason: "object_id_mismatch",
+        _details: {
+          _target_id: target_resolution._target_id,
+          _object_id: next_id,
+        },
+      };
+    }
+
+    const current_type =
+      typeof target_resolution._target_node._type === "string"
+        ? target_resolution._target_node._type.trim()
+        : "";
+    const next_type =
+      typeof object_value._type === "string" ? object_value._type.trim() : "";
+    const requested_type =
+      typeof resolved_task._edit_target_type === "string"
+        ? resolved_task._edit_target_type.trim()
+        : "";
+    const expected_type = requested_type || current_type;
+
+    if (!next_type || (expected_type && next_type !== expected_type)) {
+      return {
+        _eligible: false,
+        _reason: "object_type_mismatch",
+        _details: {
+          _target_id: target_resolution._target_id,
+          _expected_type: expected_type,
+          _object_type: next_type,
+        },
+      };
+    }
+
+    if (current_type && next_type !== current_type) {
+      return {
+        _eligible: false,
+        _reason: "object_type_mismatch",
+        _details: {
+          _target_id: target_resolution._target_id,
+          _expected_type: current_type,
+          _object_type: next_type,
+        },
+      };
+    }
+
+    return {
+      _eligible: true,
+      _action: "replace-object",
+      _target_id: target_resolution._target_id,
+      _reason: target_resolution._reason,
+      _details: {
+        _resolved_by: target_resolution._resolved_by,
+      },
+    };
+  }
+
   if (resolved_task._edit_action === "move-object") {
     const move_position = resolved_task._edit_move_position;
     if (
@@ -3950,7 +4659,7 @@ export function can_apply_deterministic_view_edit(input: {
     const target_resolution =
       resolve_deterministic_view_edit_target({
         _current_view: input._current_view,
-        _target_id: resolved_task._edit_target_id,
+        _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
       });
@@ -4065,6 +4774,102 @@ export function can_apply_deterministic_view_edit(input: {
     };
   }
 
+  if (resolved_task._edit_action === "duplicate-object") {
+    const target_resolution =
+      resolve_deterministic_view_edit_target({
+        _current_view: input._current_view,
+        _target_id: target_id,
+        _target_text: resolved_task._edit_target_text,
+        _target_type: resolved_task._edit_target_type,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_location =
+      find_view_node_location_by_id(input._current_view, target_resolution._target_id);
+    if (!target_location?._parent || !Array.isArray(target_location._children)) {
+      return {
+        _eligible: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: target_resolution._target_id,
+        },
+      };
+    }
+
+    const anchor_id = resolved_task._edit_anchor_id;
+    if (anchor_id) {
+      const anchor_resolution =
+        resolve_deterministic_view_edit_target({
+          _current_view: input._current_view,
+          _target_id: anchor_id,
+        });
+      if (!anchor_resolution._ok) {
+        return {
+          _eligible: false,
+          _reason: anchor_resolution._reason === "target_not_found" ||
+            anchor_resolution._reason === "text_target_not_found" ||
+            anchor_resolution._reason === "missing_target_id"
+            ? "anchor_not_found"
+            : anchor_resolution._reason,
+          ...(anchor_resolution._details !== undefined
+            ? { _details: anchor_resolution._details }
+            : {}),
+        };
+      }
+
+      const anchor_location =
+        find_view_node_location_by_id(input._current_view, anchor_resolution._target_id);
+      if (!anchor_location?._parent || !Array.isArray(anchor_location._children)) {
+        return {
+          _eligible: false,
+          _reason: "anchor_not_found",
+          _details: {
+            _anchor_id: anchor_resolution._target_id,
+          },
+        };
+      }
+
+      if (target_location._parent !== anchor_location._parent) {
+        return {
+          _eligible: false,
+          _reason: "different_parent",
+          _details: {
+            _target_id: target_resolution._target_id,
+            _anchor_id: anchor_resolution._target_id,
+          },
+        };
+      }
+    }
+
+    return {
+      _eligible: true,
+      _action: "duplicate-object",
+      _target_id: target_resolution._target_id,
+      _reason: target_resolution._reason,
+      _details: {
+        _resolved_by: target_resolution._resolved_by,
+        ...(resolved_task._edit_anchor_id
+          ? {
+            _anchor_id: resolved_task._edit_anchor_id,
+            _move_position: resolved_task._edit_move_position,
+          }
+          : {}),
+        _parent_id: typeof target_location._parent._id === "string"
+          ? target_location._parent._id
+          : undefined,
+        _previous_index: target_location._index,
+      },
+    };
+  }
+
   if (
     resolved_task._edit_action === "add-class" ||
     resolved_task._edit_action === "remove-class" ||
@@ -4101,7 +4906,7 @@ export function can_apply_deterministic_view_edit(input: {
     const target_resolution =
       resolve_deterministic_view_edit_target({
         _current_view: input._current_view,
-        _target_id: resolved_task._edit_target_id,
+        _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
       });
@@ -4129,7 +4934,7 @@ export function can_apply_deterministic_view_edit(input: {
   const target_resolution =
     resolve_deterministic_view_edit_target({
       _current_view: input._current_view,
-      _target_id: resolved_task._edit_target_id,
+      _target_id: target_id,
       _target_text: resolved_task._edit_target_text,
       _target_type: resolved_task._edit_target_type,
     });
@@ -4178,14 +4983,320 @@ export function can_apply_deterministic_view_edit(input: {
   };
 }
 
+function deterministic_view_edit_should_search_references(
+  eligibility: XVibeDeterministicViewEditEligibility,
+  resolved_task: XVibeResolvedTask,
+): boolean {
+  if (eligibility._eligible) return false;
+
+  if (
+    resolved_task._edit_action === "set-style-class-rule" ||
+    resolved_task._edit_action === "remove-style-class-rule"
+  ) {
+    return false;
+  }
+
+  return (
+    eligibility._reason === "target_not_found" ||
+    eligibility._reason === "text_target_not_found" ||
+    eligibility._reason === "missing_target_id" ||
+    (
+      resolved_task._edit_action === "move-object" &&
+      eligibility._reason === "anchor_not_found"
+    )
+  );
+}
+
+function deterministic_view_edit_ambiguity_details(input: {
+  _target_view_ids: string[];
+  _ambiguous_view_ids?: string[];
+}): XVibeJsonObject {
+  return {
+    _target_view_ids: Array.from(new Set(input._target_view_ids)),
+    ...(input._ambiguous_view_ids && input._ambiguous_view_ids.length > 0
+      ? { _ambiguous_view_ids: Array.from(new Set(input._ambiguous_view_ids)) }
+      : {}),
+  };
+}
+
+function deterministic_view_edit_is_ambiguous_reason(reason: string): boolean {
+  return reason === "ambiguous_text_target" || reason === "ambiguous_normalized_text_target";
+}
+
+function resolve_deterministic_view_edit_target_sources(input: {
+  _sources: Array<{
+    _view_id: string;
+    _view: unknown;
+    _resolved_via: "current-view" | "xvm-view";
+  }>;
+  _target_id?: string;
+  _target_text?: string;
+  _target_type?: string;
+}): Array<{
+  _view_id: string;
+  _resolved_via: "current-view" | "xvm-view";
+  _target_id: string;
+}> {
+  const matches: Array<{
+    _view_id: string;
+    _resolved_via: "current-view" | "xvm-view";
+    _target_id: string;
+  }> = [];
+
+  for (const source of input._sources) {
+    const resolution =
+      resolve_deterministic_view_edit_target({
+        _current_view: source._view,
+        _target_id: input._target_id,
+        _target_text: input._target_text,
+        _target_type: input._target_type,
+      });
+    if (!resolution._ok) continue;
+
+    matches.push({
+      _view_id: source._view_id,
+      _resolved_via: source._resolved_via,
+      _target_id: resolution._target_id,
+    });
+  }
+
+  return matches;
+}
+
+function resolve_deterministic_view_edit_source(input: {
+  _requested_view_id: string;
+  _current_view: unknown;
+  _referenced_views: XVibeReferencedView[];
+  _reference_warnings: string[];
+  _resolved_task: XVibeResolvedTask;
+  _edit_intent?: XVibeViewEditIntent;
+}): XVibeDeterministicViewEditSourceResolution {
+  const current_eligibility =
+    can_apply_deterministic_view_edit({
+      _resolved_task: input._resolved_task,
+      _current_view: input._current_view,
+      _edit_intent: input._edit_intent,
+    });
+
+  if (current_eligibility._eligible) {
+    return {
+      _eligible: true,
+      _view_id: input._requested_view_id,
+      _view: input._current_view,
+      _resolved_via: "current-view",
+      _eligibility: current_eligibility,
+      _warnings: input._reference_warnings,
+    };
+  }
+
+  if (
+    input._referenced_views.length === 0 ||
+    !deterministic_view_edit_should_search_references(current_eligibility, input._resolved_task)
+  ) {
+    return {
+      _eligible: false,
+      _eligibility: current_eligibility,
+      _warnings: input._reference_warnings,
+    };
+  }
+
+  const current_move_target_with_missing_anchor =
+    input._resolved_task._edit_action === "move-object" &&
+    current_eligibility._reason === "anchor_not_found";
+  const referenced_eligible: Array<{
+    _view_id: string;
+    _view: unknown;
+    _eligibility: XVibeDeterministicViewEditEligibility;
+  }> = [];
+  const ambiguous_view_ids: string[] = [];
+  let first_ambiguous_eligibility: XVibeDeterministicViewEditEligibility | undefined;
+
+  for (const referenced_view of input._referenced_views) {
+    const eligibility =
+      can_apply_deterministic_view_edit({
+        _resolved_task: input._resolved_task,
+        _current_view: referenced_view._view,
+        _edit_intent: input._edit_intent,
+      });
+
+    if (eligibility._eligible) {
+      referenced_eligible.push({
+        _view_id: referenced_view._view_id,
+        _view: referenced_view._view,
+        _eligibility: eligibility,
+      });
+      continue;
+    }
+
+    if (deterministic_view_edit_is_ambiguous_reason(eligibility._reason)) {
+      ambiguous_view_ids.push(referenced_view._view_id);
+      first_ambiguous_eligibility ??= eligibility;
+    }
+  }
+
+  if (
+    !current_move_target_with_missing_anchor &&
+    (referenced_eligible.length > 1 || (referenced_eligible.length > 0 && ambiguous_view_ids.length > 0))
+  ) {
+    return {
+      _eligible: false,
+      _eligibility: {
+        _eligible: false,
+        _reason: "ambiguous_xvm_view_target",
+        _details: deterministic_view_edit_ambiguity_details({
+          _target_view_ids: referenced_eligible.map((item) => item._view_id),
+          _ambiguous_view_ids: ambiguous_view_ids,
+        }),
+      },
+      _warnings: input._reference_warnings,
+    };
+  }
+
+  if (!current_move_target_with_missing_anchor && referenced_eligible.length === 1) {
+    const source = referenced_eligible[0];
+    return {
+      _eligible: true,
+      _view_id: source._view_id,
+      _view: source._view,
+      _resolved_via: "xvm-view",
+      _eligibility: source._eligibility,
+      _warnings: input._reference_warnings,
+    };
+  }
+
+  if (input._resolved_task._edit_action === "move-object") {
+    const sources = [
+      {
+        _view_id: input._requested_view_id,
+        _view: input._current_view,
+        _resolved_via: "current-view" as const,
+      },
+      ...input._referenced_views.map((referenced_view) => ({
+        _view_id: referenced_view._view_id,
+        _view: referenced_view._view,
+        _resolved_via: "xvm-view" as const,
+      })),
+    ];
+    const target_matches =
+      resolve_deterministic_view_edit_target_sources({
+        _sources: sources,
+        _target_id:
+          deterministic_edit_target_id({
+            _resolved_task: input._resolved_task,
+            _edit_intent: input._edit_intent,
+          }),
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+      });
+    const referenced_target_view_ids =
+      target_matches
+        .filter((match) => match._resolved_via === "xvm-view")
+        .map((match) => match._view_id);
+    if (referenced_target_view_ids.length > 1) {
+      return {
+        _eligible: false,
+        _eligibility: {
+          _eligible: false,
+          _reason: "ambiguous_xvm_view_target",
+          _details: deterministic_view_edit_ambiguity_details({
+            _target_view_ids: referenced_target_view_ids,
+          }),
+        },
+        _warnings: input._reference_warnings,
+      };
+    }
+
+    const anchor_matches =
+      resolve_deterministic_view_edit_target_sources({
+        _sources: sources,
+        _target_id: input._resolved_task._edit_anchor_id,
+        _target_text: input._resolved_task._edit_anchor_text,
+        _target_type: input._resolved_task._edit_anchor_type,
+      });
+
+    const target_match_for_source_check =
+      current_move_target_with_missing_anchor
+        ? target_matches.find((match) => match._resolved_via === "current-view")
+        : target_matches.length === 1
+          ? target_matches[0]
+          : undefined;
+
+    if (
+      target_match_for_source_check &&
+      anchor_matches.length === 1 &&
+      target_match_for_source_check._view_id !== anchor_matches[0]._view_id
+    ) {
+      return {
+        _eligible: false,
+        _eligibility: {
+          _eligible: false,
+          _reason: "different_source_view",
+          _details: {
+            _target_view_id: target_match_for_source_check._view_id,
+            _target_id: target_match_for_source_check._target_id,
+            _anchor_view_id: anchor_matches[0]._view_id,
+            _anchor_id: anchor_matches[0]._target_id,
+          },
+        },
+        _warnings: input._reference_warnings,
+      };
+    }
+  }
+
+  if (first_ambiguous_eligibility) {
+    return {
+      _eligible: false,
+      _eligibility: first_ambiguous_eligibility,
+      _warnings: input._reference_warnings,
+    };
+  }
+
+  return {
+    _eligible: false,
+    _eligibility: current_eligibility,
+    _warnings: input._reference_warnings,
+  };
+}
+
+function resolved_task_is_explicit_view_child_edit(
+  resolved_task: XVibeResolvedTask,
+): boolean {
+  if (
+    resolved_task._artifact_type !== "view" ||
+    resolved_task._action !== "update" ||
+    typeof resolved_task._edit_action !== "string" ||
+    resolved_task._edit_action.trim().length === 0
+  ) {
+    return false;
+  }
+
+  return (
+    typeof resolved_task._edit_target_id === "string" ||
+    typeof resolved_task._edit_target_text === "string" ||
+    typeof resolved_task._edit_class_name === "string" ||
+    typeof resolved_task._edit_old_class_name === "string" ||
+    typeof resolved_task._edit_new_class_name === "string" ||
+    typeof resolved_task._edit_style_property === "string" ||
+    typeof resolved_task._edit_style_value === "string" ||
+    typeof resolved_task._edit_property_name === "string" ||
+    Object.prototype.hasOwnProperty.call(resolved_task, "_edit_property_value") ||
+    typeof resolved_task._edit_move_position === "string" ||
+    typeof resolved_task._edit_anchor_id === "string" ||
+    typeof resolved_task._edit_anchor_text === "string" ||
+    typeof resolved_task._edit_anchor_type === "string"
+  );
+}
+
 export function apply_deterministic_view_edit(input: {
   _resolved_task: XVibeResolvedTask;
   _current_view: unknown;
+  _edit_intent?: XVibeViewEditIntent;
 }): XVibeDeterministicViewEditResult {
   const eligibility =
     can_apply_deterministic_view_edit({
       _resolved_task: input._resolved_task,
       _current_view: input._current_view,
+      _edit_intent: input._edit_intent,
     });
   if (!eligibility._eligible) {
     return {
@@ -4214,6 +5325,144 @@ export function apply_deterministic_view_edit(input: {
 
   const next_view =
     clone_deterministic_view_json(input._current_view);
+
+  if (eligibility._action === "duplicate-object") {
+    const target_location =
+      find_view_node_location_by_id(next_view, eligibility._target_id);
+    if (
+      !target_location?._parent ||
+      !Array.isArray(target_location._children) ||
+      typeof target_location._index !== "number"
+    ) {
+      return {
+        _ok: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: eligibility._target_id,
+        },
+      };
+    }
+
+    const siblings = target_location._children;
+    const previous_index = target_location._index;
+    const move_position = input._resolved_task._edit_move_position;
+    const anchor_id = input._resolved_task._edit_anchor_id;
+    let insert_index = previous_index + 1;
+
+    if (anchor_id) {
+      const anchor_location =
+        find_view_node_location_by_id(next_view, anchor_id);
+      if (
+        !anchor_location?._parent ||
+        !Array.isArray(anchor_location._children) ||
+        typeof anchor_location._index !== "number"
+      ) {
+        return {
+          _ok: false,
+          _reason: "anchor_not_found",
+          _details: {
+            _anchor_id: anchor_id,
+          },
+        };
+      }
+
+      if (anchor_location._parent !== target_location._parent) {
+        return {
+          _ok: false,
+          _reason: "different_parent",
+          _details: {
+            _target_id: eligibility._target_id,
+            _anchor_id: anchor_id,
+          },
+        };
+      }
+
+      insert_index =
+        move_position === "before"
+          ? anchor_location._index
+          : anchor_location._index + 1;
+    }
+
+    if (insert_index < 0) insert_index = 0;
+    if (insert_index > siblings.length) insert_index = siblings.length;
+
+    const used_ids = new Set(
+      collect_view_nodes(next_view)
+        .map((node) => typeof node._id === "string" ? node._id.trim() : "")
+        .filter((id) => id.length > 0),
+    );
+    const duplicate_node =
+      clone_deterministic_duplicate_subtree(target_location._node, used_ids);
+    const new_target_id =
+      typeof duplicate_node._id === "string" ? duplicate_node._id : "";
+    siblings.splice(insert_index, 0, duplicate_node);
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "duplicate-object",
+        _target_id: eligibility._target_id,
+        _original_target_id: eligibility._target_id,
+        _new_target_id: new_target_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        ...(move_position === "before" && anchor_id ? { _before_id: anchor_id } : {}),
+        ...(move_position === "after" && anchor_id ? { _after_id: anchor_id } : {}),
+        ...(typeof target_location._parent._id === "string"
+          ? { _parent_id: target_location._parent._id }
+          : {}),
+        _previous_index: previous_index,
+        _next_index: insert_index,
+        _insert_index: insert_index,
+      },
+    };
+  }
+
+  if (eligibility._action === "replace-object") {
+    const object_value = input._edit_intent?._object_value;
+    if (!_xu.is_plain_object(object_value)) {
+      return { _ok: false, _reason: "missing_object_value" };
+    }
+
+    const target_location =
+      find_view_node_location_by_id(next_view, eligibility._target_id);
+    if (
+      !target_location?._parent ||
+      !Array.isArray(target_location._children) ||
+      typeof target_location._index !== "number"
+    ) {
+      return {
+        _ok: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: eligibility._target_id,
+        },
+      };
+    }
+
+    const next_object =
+      clone_deterministic_view_json(object_value) as XVibeJsonObject;
+    target_location._children[target_location._index] = next_object;
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "replace-object",
+        _target_id: eligibility._target_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        ...(typeof target_location._parent._id === "string"
+          ? { _parent_id: target_location._parent._id }
+          : {}),
+        _previous_index: target_location._index,
+        _next_index: target_location._index,
+        _previous_object: target_location._node,
+        _next_object: next_object,
+      },
+    };
+  }
 
   if (eligibility._action === "move-object") {
     const move_position = input._resolved_task._edit_move_position;
@@ -4344,6 +5593,8 @@ export function apply_deterministic_view_edit(input: {
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
         _move_position: move_position,
         ...(anchor_id ? { _anchor_id: anchor_id } : {}),
+        ...(move_position === "before" && anchor_id ? { _before_id: anchor_id } : {}),
+        ...(move_position === "after" && anchor_id ? { _after_id: anchor_id } : {}),
         ...(anchor_resolved_by ? { _anchor_resolved_by: anchor_resolved_by } : {}),
         ...(typeof target_location._parent._id === "string"
           ? { _parent_id: target_location._parent._id }
@@ -4476,9 +5727,17 @@ export function apply_deterministic_view_edit(input: {
       return { _ok: false, _reason: "missing_property_name" };
     }
 
+    const structured_class_property =
+      deterministic_allows_structured_class_property({
+        _property_name: property_name,
+        _edit_intent: input._edit_intent,
+      });
     if (
-      XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
-      !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
+      !structured_class_property &&
+      (
+        XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
+        !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
+      )
     ) {
       return {
         _ok: false,
@@ -4714,9 +5973,9 @@ export function apply_deterministic_view_edit(input: {
   }
 
   if (eligibility._action === "hide-object") {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+    const target_location =
+      find_view_node_location_by_id(next_view, eligibility._target_id);
+    if (!target_location) {
       return {
         _ok: false,
         _reason: "target_not_found",
@@ -4726,7 +5985,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    if (target_node === next_view) {
+    if (target_location._node === next_view) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -4736,6 +5995,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
+    const target_node = target_location._node;
     target_node.style =
       xvibe_deterministic_hide_style(target_node.style);
     target_node._visible = false;
@@ -4749,15 +6009,18 @@ export function apply_deterministic_view_edit(input: {
         _action: "hide-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        ...(typeof target_location._parent?._id === "string"
+          ? { _parent_id: target_location._parent._id }
+          : {}),
         _hide_mechanism: XVIBE_DETERMINISTIC_HIDE_MECHANISM,
       },
     };
   }
 
   if (eligibility._action === "show-object") {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+    const target_location =
+      find_view_node_location_by_id(next_view, eligibility._target_id);
+    if (!target_location) {
       return {
         _ok: false,
         _reason: "target_not_found",
@@ -4767,7 +6030,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    if (target_node === next_view) {
+    if (target_location._node === next_view) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -4777,6 +6040,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
+    const target_node = target_location._node;
     if (typeof target_node.style === "string") {
       const next_style =
         xvibe_style_without_display_none(target_node.style);
@@ -4796,6 +6060,9 @@ export function apply_deterministic_view_edit(input: {
         _action: "show-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        ...(typeof target_location._parent?._id === "string"
+          ? { _parent_id: target_location._parent._id }
+          : {}),
         _show_mechanism: XVIBE_DETERMINISTIC_SHOW_MECHANISM,
       },
     };
@@ -4849,6 +6116,9 @@ export function apply_deterministic_view_edit(input: {
         _action: "remove-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        ...(typeof target_location._parent._id === "string"
+          ? { _parent_id: target_location._parent._id }
+          : {}),
         ...(typeof removed_node._type === "string"
           ? { _removed_type: removed_node._type }
           : {}),
@@ -6131,6 +7401,31 @@ export class XVibeModule extends XModule {
       }
     },
 
+    "apply-view-edit": {
+      _name: "apply-view-edit",
+      _scope: "module",
+      _description:
+        "Apply a structured deterministic view edit and persist it through server-xvm without AI fallback.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _view_id: "Target/source view id.",
+        _edit_action: "set-property, remove-property, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, or duplicate-object.",
+        _target_id: "Target XUI object id.",
+        _target_type: "Optional target XUI type.",
+        _before_id: "Anchor XUI object id for move-object or duplicate-object before placement.",
+        _after_id: "Anchor XUI object id for move-object or duplicate-object after placement.",
+        _property_name: "Property name for property edits.",
+        _property_value: "Property value for set-property.",
+        _style_property: "Style property for style edits.",
+        _style_value: "Style value for set-style.",
+        _class_name: "Class name for add/remove/toggle class edits.",
+        _old_class_name: "Old class name for replace-class.",
+        _new_class_name: "New class name for replace-class.",
+        _object_value: "Replacement object for replace-object."
+      }
+    },
+
     "generate-app": {
       _name: "generate-app",
       _scope: "module",
@@ -6169,6 +7464,17 @@ export class XVibeModule extends XModule {
         _context: "Optional app/runtime context.",
         _debug: "Optional debug flag."
       },
+    },
+    "get-latest-run": {
+      _name: "get-latest-run",
+      _scope: "module",
+      _description:
+        "Return safe diagnostic files for the latest archived vibe-run for an app/env, or a specific generation id.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _generation_id: "Optional generation id. When provided, loads that specific run."
+      }
     },
     "sync-skills": {
       _name: "sync-skills",
@@ -7715,6 +9021,248 @@ export class XVibeModule extends XModule {
     return current_result._view;
   }
 
+  private async load_xvm_view_references_for_refine(input: {
+    _app_id: string;
+    _env: string;
+    _view_id: string;
+    _current_view: unknown;
+  }): Promise<XVibeXVMViewReferenceLoadResult> {
+    const referenced_view_ids =
+      collect_xvm_view_reference_ids(input._current_view)
+        .filter((view_id) => view_id !== input._view_id);
+    const loaded_views: XVibeReferencedView[] = [];
+    const missing_view_ids: string[] = [];
+    const warnings: string[] = [];
+
+    for (const referenced_view_id of referenced_view_ids) {
+      try {
+        const referenced_view =
+          await this.load_current_view_for_refine({
+            _app_id: input._app_id,
+            _env: input._env,
+            _view_id: referenced_view_id,
+          });
+
+        loaded_views.push({
+          _view_id: referenced_view_id,
+          _view: referenced_view,
+        });
+      } catch (error) {
+        missing_view_ids.push(referenced_view_id);
+        warnings.push(`missing_xvm_view_reference:${referenced_view_id}`);
+        _xlog.warn("[xvibe] xvm-view reference missing", {
+          _app_id: input._app_id,
+          _env: input._env,
+          _view_id: input._view_id,
+          _referenced_view_id: referenced_view_id,
+          _error: error_summary(error),
+        });
+      }
+    }
+
+    _xlog.log("[xvibe] xvm-view references resolved", {
+      _view_id: input._view_id,
+      _referenced_view_ids: referenced_view_ids,
+      _loaded_count: loaded_views.length,
+      _missing_view_ids: missing_view_ids,
+    });
+
+    return {
+      _referenced_view_ids: referenced_view_ids,
+      _loaded_views: loaded_views,
+      _missing_view_ids: missing_view_ids,
+      _warnings: warnings,
+    };
+  }
+
+  private async try_apply_deterministic_view_edit_for_refine(input: {
+    app_id: string;
+    env: string;
+    mode: VibeAIMode;
+    prompt: string;
+    runtime_skills: unknown;
+    requested_view_id: string;
+    current_view: XVibeJsonObject;
+    edit_intent: XVibeViewEditIntent;
+    generated_artifacts?: unknown;
+    planned_flow_ids?: string[];
+    runtime_plan?: XVibeRuntimePlan;
+    resolved_task: XVibeResolvedTask;
+    generation_id: string;
+    archive: XVibeRunArchiveData;
+    archive_started_at: number;
+    progress: XVibeGenerationProgressCallback;
+  }): Promise<unknown | undefined> {
+    const xvm_view_references =
+      await this.load_xvm_view_references_for_refine({
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.requested_view_id,
+        _current_view: input.current_view,
+      });
+    const deterministic_source =
+      resolve_deterministic_view_edit_source({
+        _requested_view_id: input.requested_view_id,
+        _current_view: input.current_view,
+        _referenced_views: xvm_view_references._loaded_views,
+        _reference_warnings: xvm_view_references._warnings,
+        _resolved_task: input.resolved_task,
+        _edit_intent: input.edit_intent,
+      });
+
+    if (!deterministic_source._eligible) {
+      const deterministic_eligibility = deterministic_source._eligibility;
+      input.archive._deterministic_mutation = {
+        _eligible: false,
+        _reason: deterministic_eligibility._reason,
+        ...(deterministic_source._warnings.length > 0
+          ? { _warnings: deterministic_source._warnings }
+          : {}),
+        ...(deterministic_eligibility._details !== undefined
+          ? { _details: deterministic_eligibility._details }
+          : {}),
+      };
+      _xlog.log("[xvibe] deterministic view edit not eligible", {
+        _reason: deterministic_eligibility._reason,
+        ...(deterministic_eligibility._details !== undefined
+          ? { _details: deterministic_eligibility._details }
+          : {}),
+      });
+
+      return undefined;
+    }
+
+    const deterministic_eligibility = deterministic_source._eligibility;
+    _xlog.log("[xvibe] deterministic view edit eligible", {
+      _action: deterministic_eligibility._action,
+      _target_id: deterministic_eligibility._target_id,
+      _field: deterministic_eligibility._field,
+      _target_view_id: deterministic_source._view_id,
+      _resolved_via: deterministic_source._resolved_via,
+    });
+    input.progress(
+      "deterministic-mutating",
+      "Applying deterministic view edit...",
+      {
+        _action: deterministic_eligibility._action,
+        _target_id: deterministic_eligibility._target_id,
+        _target_view_id: deterministic_source._view_id,
+      },
+    );
+    const deterministic_result =
+      apply_deterministic_view_edit({
+        _resolved_task: input.resolved_task,
+        _current_view: deterministic_source._view,
+        _edit_intent: input.edit_intent,
+      });
+
+    if (!deterministic_result._ok || !deterministic_result._view || !deterministic_result._mutation) {
+      input.archive._deterministic_mutation = {
+        _eligible: false,
+        _reason: deterministic_result._reason ?? "deterministic_mutation_failed",
+        ...(deterministic_source._warnings.length > 0
+          ? { _warnings: deterministic_source._warnings }
+          : {}),
+        ...(deterministic_result._details !== undefined
+          ? { _details: deterministic_result._details }
+          : {}),
+      };
+      _xlog.warn("[xvibe] deterministic view edit failed after eligibility", {
+        _reason: deterministic_result._reason,
+        ...(deterministic_result._details !== undefined
+          ? { _details: deterministic_result._details }
+          : {}),
+      });
+
+      return undefined;
+    }
+
+    if (deterministic_source._resolved_via === "xvm-view") {
+      const deterministic_view = deterministic_result._view as XVibeJsonObject;
+      const deterministic_view_id =
+        typeof deterministic_view._id === "string" ? deterministic_view._id.trim() : "";
+      if (deterministic_view_id !== deterministic_source._view_id) {
+        input.archive._deterministic_mutation = {
+          _eligible: false,
+          _reason: "source_view_id_mismatch",
+          _details: {
+            _requested_view_id: input.requested_view_id,
+            _source_view_id: deterministic_source._view_id,
+            _view_id: deterministic_view_id,
+          },
+        };
+        _xlog.warn("[xvibe] deterministic referenced view id mismatch", {
+          _requested_view_id: input.requested_view_id,
+          _source_view_id: deterministic_source._view_id,
+          _view_id: deterministic_view_id,
+        });
+
+        return undefined;
+      }
+    }
+
+    input.archive._deterministic_mutation = {
+      _eligible: true,
+      _reason: deterministic_eligibility._reason,
+      ...deterministic_result._mutation,
+      ...(deterministic_source._warnings.length > 0
+        ? { _warnings: deterministic_source._warnings }
+        : {}),
+      ...(deterministic_source._resolved_via === "xvm-view"
+        ? {
+          _target_view_id: deterministic_source._view_id,
+          _source_view_id: deterministic_source._view_id,
+          _requested_view_id: input.requested_view_id,
+          _resolved_via: "xvm-view",
+        }
+        : {}),
+    };
+    if (deterministic_result._mutation._action === "hide-object") {
+      _xlog.log("[xvibe] deterministic hide applied", {
+        _target_id: deterministic_result._mutation._target_id,
+        _hide_mechanism: deterministic_result._mutation._hide_mechanism,
+      });
+    }
+    if (deterministic_result._mutation._action === "show-object") {
+      _xlog.log("[xvibe] deterministic show applied", {
+        _target_id: deterministic_result._mutation._target_id,
+        _show_mechanism: deterministic_result._mutation._show_mechanism,
+      });
+    }
+    if (deterministic_source._resolved_via === "xvm-view") {
+      _xlog.log("[xvibe] deterministic referenced view edit", {
+        _requested_view_id: input.requested_view_id,
+        _target_view_id: deterministic_source._view_id,
+        _action: deterministic_result._mutation._action,
+        _target_id: deterministic_result._mutation._target_id,
+      });
+    }
+
+    return this.persist_view_artifact({
+      app_id: input.app_id,
+      env: input.env,
+      mode: input.mode,
+      prompt: input.prompt,
+      runtime_skills: input.runtime_skills,
+      requested_view_id: input.requested_view_id,
+      ...(deterministic_source._resolved_via === "xvm-view"
+        ? { source_view_id: deterministic_source._view_id }
+        : {}),
+      parsed_view: deterministic_result._view as XVibeViewArtifact,
+      generated_artifacts: input.generated_artifacts,
+      planned_flow_ids: input.planned_flow_ids,
+      runtime_plan: input.runtime_plan,
+      resolved_task: input.resolved_task,
+      generation_id: input.generation_id,
+      deterministic_mutation:
+        input.archive._deterministic_mutation as XVibeDeterministicViewEditResult["_mutation"],
+      include_artifact_type: true,
+      archive: input.archive,
+      archive_started_at: input.archive_started_at,
+      progress: input.progress,
+    });
+  }
+
   private get_view_mutation_prompt_decision(
     prompt: string,
     current_view: unknown
@@ -8912,6 +10460,12 @@ export class XVibeModule extends XModule {
       }
     }
 
+    if (node_type === "xvm-view") {
+      if (!normalize_safe_view_id(node._view_id)) {
+        this.push_validation_error(errors, `${path} xvm-view requires valid _view_id`);
+      }
+    }
+
     if (node_type === "table") {
       if (node._columns !== undefined && !Array.isArray(node._columns)) {
         this.push_validation_error(errors, `${path} table _columns must be an array`);
@@ -9277,6 +10831,10 @@ export class XVibeModule extends XModule {
           _ops: registry._ops,
         };
       }
+      registry = {
+        ...registry,
+        _xui_types: new Set([...registry._xui_types, "xvm-view"]),
+      };
 
       this.validate_view_artifact(
         input._artifact as XVibeViewArtifact,
@@ -10857,12 +12415,53 @@ export class XVibeModule extends XModule {
         _selected_entities: intent_plan._entities,
       };
 
-      const validation_plan =
+      let deterministic_view_edit_attempted = false;
+      if (
+        mode === "refine" &&
+        artifact_type === "view" &&
+        edit_intent &&
+        current_view &&
+        requested_view_id &&
+        resolved_task_is_explicit_view_child_edit(resolved_task)
+      ) {
+        deterministic_view_edit_attempted = true;
+        const deterministic_persist_result =
+          await this.try_apply_deterministic_view_edit_for_refine({
+            app_id,
+            env,
+            mode,
+            prompt,
+            runtime_skills,
+            requested_view_id,
+            current_view,
+            edit_intent,
+            generated_artifacts: params._generated_artifacts,
+            planned_flow_ids,
+            runtime_plan,
+            resolved_task,
+            generation_id: effective_generation_id,
+            archive,
+            archive_started_at,
+            progress: stage,
+          });
+
+        if (deterministic_persist_result) {
+          return deterministic_persist_result;
+        }
+      }
+
+      let validation_plan =
         validate_xvibe_generation_plan({
           resolved_task,
           artifact_plan: inferred_artifact_plan,
           intent_plan,
           runtime_plan,
+        });
+      validation_plan =
+        defer_view_child_edit_validation_leakage({
+          validation_plan,
+          resolved_task,
+          deterministic_attempted: deterministic_view_edit_attempted,
         });
       archive._validation_plan = validation_plan;
       _xlog.log("[xvibe] validation plan", validation_plan);
@@ -10895,102 +12494,31 @@ export class XVibeModule extends XModule {
         artifact_type === "view" &&
         edit_intent &&
         current_view &&
-        requested_view_id
+        requested_view_id &&
+        !deterministic_view_edit_attempted
       ) {
-        const deterministic_eligibility =
-          can_apply_deterministic_view_edit({
-            _resolved_task: resolved_task,
-            _current_view: current_view,
+        const deterministic_persist_result =
+          await this.try_apply_deterministic_view_edit_for_refine({
+            app_id,
+            env,
+            mode,
+            prompt,
+            runtime_skills,
+            requested_view_id,
+            current_view,
+            edit_intent,
+            generated_artifacts: params._generated_artifacts,
+            planned_flow_ids,
+            runtime_plan,
+            resolved_task,
+            generation_id: effective_generation_id,
+            archive,
+            archive_started_at,
+            progress: stage,
           });
 
-        if (deterministic_eligibility._eligible) {
-          _xlog.log("[xvibe] deterministic view edit eligible", {
-            _action: deterministic_eligibility._action,
-            _target_id: deterministic_eligibility._target_id,
-            _field: deterministic_eligibility._field,
-          });
-          view_stage(
-            "deterministic-mutating",
-            "Applying deterministic view edit...",
-            {
-              _action: deterministic_eligibility._action,
-              _target_id: deterministic_eligibility._target_id,
-            },
-          );
-          const deterministic_result =
-            apply_deterministic_view_edit({
-              _resolved_task: resolved_task,
-              _current_view: current_view,
-            });
-
-          if (!deterministic_result._ok || !deterministic_result._view || !deterministic_result._mutation) {
-            archive._deterministic_mutation = {
-              _eligible: false,
-              _reason: deterministic_result._reason ?? "deterministic_mutation_failed",
-              ...(deterministic_result._details !== undefined
-                ? { _details: deterministic_result._details }
-                : {}),
-            };
-            _xlog.warn("[xvibe] deterministic view edit failed after eligibility", {
-              _reason: deterministic_result._reason,
-              ...(deterministic_result._details !== undefined
-                ? { _details: deterministic_result._details }
-                : {}),
-            });
-          } else {
-            archive._deterministic_mutation = {
-              _eligible: true,
-              _reason: deterministic_eligibility._reason,
-              ...deterministic_result._mutation,
-            };
-            if (deterministic_result._mutation._action === "hide-object") {
-              _xlog.log("[xvibe] deterministic hide applied", {
-                _target_id: deterministic_result._mutation._target_id,
-                _hide_mechanism: deterministic_result._mutation._hide_mechanism,
-              });
-            }
-            if (deterministic_result._mutation._action === "show-object") {
-              _xlog.log("[xvibe] deterministic show applied", {
-                _target_id: deterministic_result._mutation._target_id,
-                _show_mechanism: deterministic_result._mutation._show_mechanism,
-              });
-            }
-            const deterministic_persist_result =
-              await this.persist_view_artifact({
-                app_id,
-                env,
-                mode,
-                prompt,
-                runtime_skills,
-                requested_view_id,
-                parsed_view: deterministic_result._view as XVibeViewArtifact,
-                generated_artifacts: params._generated_artifacts,
-                planned_flow_ids,
-                runtime_plan,
-                resolved_task,
-                generation_id: effective_generation_id,
-                deterministic_mutation: deterministic_result._mutation,
-                include_artifact_type: true,
-                archive,
-                archive_started_at,
-                progress: stage,
-              });
-            return deterministic_persist_result;
-          }
-        } else {
-          archive._deterministic_mutation = {
-            _eligible: false,
-            _reason: deterministic_eligibility._reason,
-            ...(deterministic_eligibility._details !== undefined
-              ? { _details: deterministic_eligibility._details }
-              : {}),
-          };
-          _xlog.log("[xvibe] deterministic view edit not eligible", {
-            _reason: deterministic_eligibility._reason,
-            ...(deterministic_eligibility._details !== undefined
-              ? { _details: deterministic_eligibility._details }
-              : {}),
-          });
+        if (deterministic_persist_result) {
+          return deterministic_persist_result;
         }
       }
 
@@ -11421,6 +12949,7 @@ export class XVibeModule extends XModule {
     resolved_task?: XVibeResolvedTask;
     generation_id?: string;
     deterministic_mutation?: XVibeDeterministicViewEditResult["_mutation"];
+    source_view_id?: string;
     include_artifact_type: boolean;
     archive?: XVibeRunArchiveData;
     archive_started_at?: number;
@@ -11430,15 +12959,26 @@ export class XVibeModule extends XModule {
     let runtime_skills = input.runtime_skills;
     let runtime_plan = input.runtime_plan;
     const runtime_mode = input.app_id === "vibe-system" ? "system" : "runtime";
+    const source_view_id = input.source_view_id ?? input.requested_view_id;
+    const source_view_result_fields: XVibeJsonObject =
+      input.source_view_id && input.requested_view_id && input.source_view_id !== input.requested_view_id
+        ? {
+          _source_view_id: input.source_view_id,
+          _requested_view_id: input.requested_view_id,
+        }
+        : {};
 
     if (input.mode === "refine") {
       _xlog.log("[xvibe] refine full-view replacement", {
         _app_id: input.app_id,
         _env: input.env,
         _view_id: input.requested_view_id,
+        ...(source_view_id && source_view_id !== input.requested_view_id
+          ? { _source_view_id: source_view_id }
+          : {}),
       });
-      if (input.requested_view_id) {
-        view_to_persist._id = input.requested_view_id;
+      if (source_view_id) {
+        view_to_persist._id = source_view_id;
       }
     } else {
       normalize_full_view_id(view_to_persist, input.requested_view_id);
@@ -11531,8 +13071,8 @@ export class XVibeModule extends XModule {
           input.archive?._validation as XVibeRunValidationArchive | undefined,
         _progress: input.progress,
       }) as XVibeJsonObject;
-    if (input.mode === "refine" && input.requested_view_id) {
-      view_to_persist._id = input.requested_view_id;
+    if (input.mode === "refine" && source_view_id) {
+      view_to_persist._id = source_view_id;
     } else if (input.mode !== "refine") {
       normalize_full_view_id(view_to_persist, input.requested_view_id);
     }
@@ -11568,6 +13108,43 @@ export class XVibeModule extends XModule {
       _artifact_id: view_id,
     });
 
+    if (input.source_view_id && input.requested_view_id && input.source_view_id !== input.requested_view_id) {
+      const referenced_persist_context = {
+        _requested_view_id: input.requested_view_id,
+        _source_view_id: input.source_view_id,
+        _view_id: view_id,
+        ...(input.deterministic_mutation?._target_id
+          ? { _target_id: input.deterministic_mutation._target_id }
+          : {}),
+        ...(input.deterministic_mutation?._action
+          ? { _action: input.deterministic_mutation._action }
+          : {}),
+      };
+      _xlog.log("[xvibe] deterministic referenced view persist", referenced_persist_context);
+      if (view_id !== input.source_view_id) {
+        _xlog.warn("[xvibe] deterministic referenced view persist mismatch", referenced_persist_context);
+        if (input.archive) {
+          input.archive._result = {
+            _artifact_type: "view",
+            _artifact_id: view_id,
+            _view_id: view_id,
+            ...source_view_result_fields,
+            _success: false,
+            _error: {
+              _code: "E_XVIBE_SOURCE_VIEW_PERSIST_MISMATCH",
+              _message: "Deterministic referenced view edit attempted to persist a non-source view",
+              _details: referenced_persist_context,
+            },
+          };
+        }
+        return explicit_error(
+          "E_XVIBE_SOURCE_VIEW_PERSIST_MISMATCH",
+          "Deterministic referenced view edit attempted to persist a non-source view",
+          referenced_persist_context,
+        );
+      }
+    }
+
     const persist_response = await _x.execute({
       _module: "server-xvm",
       _op: "push_update",
@@ -11583,10 +13160,15 @@ export class XVibeModule extends XModule {
 
     if (input.archive) {
       input.archive._view_id = view_id;
+      if (input.source_view_id && input.requested_view_id && input.source_view_id !== input.requested_view_id) {
+        input.archive._source_view_id = input.source_view_id;
+        input.archive._requested_view_id = input.requested_view_id;
+      }
       input.archive._result = {
         _artifact_type: "view",
         _artifact_id: view_id,
         _view_id: view_id,
+        ...source_view_result_fields,
         _success: true,
         ...(input.deterministic_mutation
           ? {
@@ -11632,6 +13214,7 @@ export class XVibeModule extends XModule {
           _artifact_type: "view",
           _artifact_id: view_id,
           _view_id: view_id,
+          ...source_view_result_fields,
           _deterministic: true,
           _mutation_action: input.deterministic_mutation._action,
           _mutation_target_id: input.deterministic_mutation._target_id,
@@ -11808,6 +13391,585 @@ export class XVibeModule extends XModule {
     };
   }
 
+  private read_structured_view_edit_action(value: unknown): XVibeStructuredViewEditAction {
+    if (
+      value === "set-property" ||
+      value === "remove-property" ||
+      value === "set-style" ||
+      value === "remove-style" ||
+      value === "add-class" ||
+      value === "remove-class" ||
+      value === "replace-class" ||
+      value === "toggle-class" ||
+      value === "remove-object" ||
+      value === "hide-object" ||
+      value === "show-object" ||
+      value === "move-object" ||
+      value === "replace-object" ||
+      value === "duplicate-object"
+    ) {
+      return value;
+    }
+
+    throw new Error("Invalid '_edit_action': unsupported deterministic view edit action");
+  }
+
+  private read_structured_property_value(value: unknown): string | number | boolean | null | undefined {
+    if (
+      value === undefined ||
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      return value;
+    }
+
+    throw new Error("Invalid '_property_value': expected string, number, boolean, or null");
+  }
+
+  private read_structured_object_value(value: unknown): XVibeJsonObject {
+    if (_xu.is_plain_object(value)) {
+      return value;
+    }
+
+    throw new Error("Invalid '_object_value': expected object");
+  }
+
+  private build_structured_view_edit_task(input: {
+    view_id: string;
+    action: XVibeStructuredViewEditAction;
+    target_id: string;
+    target_type?: string;
+    params: XVibeJsonObject;
+  }): {
+    resolved_task: XVibeResolvedTask;
+    edit_intent: XVibeViewEditIntent;
+  } {
+    const deterministic_action =
+      input.action === "remove-object"
+        ? "remove"
+        : input.action === "hide-object"
+          ? "hide"
+          : input.action === "show-object"
+            ? "show"
+            : input.action;
+    const resolved_task: XVibeResolvedTask = {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: input.view_id,
+      _edit_action: deterministic_action,
+      _edit_target_id: input.target_id,
+      ...(input.target_type ? { _edit_target_type: input.target_type } : {}),
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "xvibe.apply-view-edit",
+      _confidence: 1,
+      _warnings: [],
+    };
+    const edit_intent: XVibeViewEditIntent = {
+      _action: deterministic_action,
+      _target_id: input.target_id,
+      ...(input.target_type ? { _target_type: input.target_type } : {}),
+      _structured_apply_view_edit: true,
+    };
+
+    if (
+      input.action === "remove-object" ||
+      input.action === "hide-object" ||
+      input.action === "show-object"
+    ) {
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "duplicate-object") {
+      if (!input.target_type) {
+        throw new Error("Invalid '_target_type': expected non-empty string");
+      }
+
+      const after_id =
+        read_optional_string(input.params._after_id, "_after_id");
+      const before_id =
+        read_optional_string(input.params._before_id, "_before_id");
+      if (after_id) {
+        resolved_task._edit_move_position = "after";
+        resolved_task._edit_anchor_id = after_id;
+        edit_intent._move_position = "after";
+        edit_intent._anchor_id = after_id;
+      } else if (before_id) {
+        resolved_task._edit_move_position = "before";
+        resolved_task._edit_anchor_id = before_id;
+        edit_intent._move_position = "before";
+        edit_intent._anchor_id = before_id;
+      }
+
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "replace-object") {
+      const object_value =
+        this.read_structured_object_value(input.params._object_value);
+      resolved_task._edit_object_value = object_value;
+      edit_intent._object_value = object_value;
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "move-object") {
+      if (!input.target_type) {
+        throw new Error("Invalid '_target_type': expected non-empty string");
+      }
+
+      const before_id =
+        read_optional_string(input.params._before_id, "_before_id");
+      const after_id =
+        read_optional_string(input.params._after_id, "_after_id");
+      if (Boolean(before_id) === Boolean(after_id)) {
+        throw new Error("Invalid move-object anchors: exactly one of '_before_id' or '_after_id' is required");
+      }
+
+      resolved_task._edit_move_position = before_id ? "before" : "after";
+      resolved_task._edit_anchor_id = before_id ?? after_id;
+      edit_intent._move_position = resolved_task._edit_move_position;
+      edit_intent._anchor_id = resolved_task._edit_anchor_id;
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "set-property" || input.action === "remove-property") {
+      const property_name =
+        read_required_string(input.params._property_name, "_property_name");
+      resolved_task._edit_property_name = property_name;
+      edit_intent._property_name = property_name;
+
+      if (input.action === "set-property") {
+        const property_value =
+          this.read_structured_property_value(input.params._property_value);
+        if (property_value === undefined) {
+          throw new Error("Invalid '_property_value': expected value for set-property");
+        }
+        if (property_name === "class" && typeof property_value !== "string") {
+          throw new Error("Invalid '_property_value': class value must be a string");
+        }
+        resolved_task._edit_property_value = property_value;
+        edit_intent._property_value = property_value;
+      }
+
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "set-style" || input.action === "remove-style") {
+      const style_property =
+        read_required_string(input.params._style_property, "_style_property");
+      resolved_task._edit_style_property = style_property;
+      edit_intent._style_property = style_property;
+
+      if (input.action === "set-style") {
+        const style_value =
+          read_required_string(input.params._style_value, "_style_value");
+        resolved_task._edit_style_value = style_value;
+        edit_intent._style_value = style_value;
+      }
+
+      return { resolved_task, edit_intent };
+    }
+
+    if (input.action === "replace-class") {
+      const old_class_name =
+        read_required_string(input.params._old_class_name, "_old_class_name");
+      const new_class_name =
+        read_required_string(input.params._new_class_name, "_new_class_name");
+      resolved_task._edit_old_class_name = old_class_name;
+      resolved_task._edit_new_class_name = new_class_name;
+      edit_intent._old_class_name = old_class_name;
+      edit_intent._new_class_name = new_class_name;
+      return { resolved_task, edit_intent };
+    }
+
+    const class_name =
+      read_required_string(input.params._class_name, "_class_name");
+    resolved_task._edit_class_name = class_name;
+    edit_intent._class_name = class_name;
+    return { resolved_task, edit_intent };
+  }
+
+  private apply_view_edit_failure(input: {
+    code: string;
+    message: string;
+    app_id?: string;
+    env?: string;
+    view_id?: string;
+    action?: string;
+    target_id?: string;
+    reason?: string;
+    details?: unknown;
+    archive?: XVibeRunArchiveData;
+  }) {
+    const details: XVibeJsonObject = {
+      ...(input.app_id ? { _app_id: input.app_id } : {}),
+      ...(input.env ? { _env: input.env } : {}),
+      ...(input.view_id ? { _view_id: input.view_id } : {}),
+      ...(input.action ? { _mutation_action: input.action } : {}),
+      ...(input.target_id ? { _target_id: input.target_id } : {}),
+      ...(input.reason ? { _reason: input.reason } : {}),
+      ...(input.details !== undefined ? { _details: input.details } : {}),
+    };
+
+    if (input.archive) {
+      input.archive._deterministic_mutation = {
+        _eligible: false,
+        ...(input.reason ? { _reason: input.reason } : {}),
+        ...(input.details !== undefined ? { _details: input.details } : {}),
+      };
+      input.archive._result = {
+        _artifact_type: "view",
+        ...(input.view_id ? { _artifact_id: input.view_id, _view_id: input.view_id } : {}),
+        _success: false,
+        _deterministic: true,
+        ...(input.action ? { _mutation_action: input.action } : {}),
+        ...(input.target_id ? { _mutation_target_id: input.target_id } : {}),
+        _error: {
+          _code: input.code,
+          _message: input.message,
+          ...(Object.keys(details).length > 0 ? { _details: details } : {}),
+        },
+      };
+    }
+
+    return {
+      _ok: false,
+      _artifact_type: "view",
+      ...(input.view_id ? { _artifact_id: input.view_id, _view_id: input.view_id } : {}),
+      _deterministic: true,
+      ...(input.action ? { _mutation_action: input.action } : {}),
+      ...(input.target_id ? { _target_id: input.target_id } : {}),
+      ...(input.reason ? { _reason: input.reason } : {}),
+      _error: {
+        _code: input.code,
+        _message: input.message,
+        ...(Object.keys(details).length > 0 ? { _details: details } : {}),
+      },
+    };
+  }
+
+  async _apply_view_edit(xcmd: XCommand) {
+    const archive_started_at = Date.now();
+    const archive_created_at = new Date().toISOString();
+    let archive: XVibeRunArchiveData | undefined;
+
+    try {
+      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+      const app_id = read_required_string(params._app_id, "_app_id");
+      const env = read_required_string(params._env ?? DEFAULT_ENV, "_env");
+      const view_id = read_required_string(params._view_id, "_view_id");
+      const action = this.read_structured_view_edit_action(params._edit_action);
+      const target_id = read_required_string(params._target_id, "_target_id");
+      const target_type = read_optional_string(params._target_type, "_target_type");
+      const generation_id = read_optional_generation_id(params._generation_id) ?? safe_short_id();
+      const task =
+        this.build_structured_view_edit_task({
+          view_id,
+          action,
+          target_id,
+          ...(target_type ? { target_type } : {}),
+          params,
+        });
+
+      archive = {
+        _generation_id: generation_id,
+        _app_id: app_id,
+        _env: env,
+        _view_id: view_id,
+        _mode: "refine",
+        _artifact_type: "view",
+        _created_at: archive_created_at,
+        _resolved_task: task.resolved_task,
+      };
+
+      record_archive_stage(
+        archive,
+        archive_started_at,
+        "loading-view",
+        "Loading current view...",
+        {
+          _view_id: view_id,
+          _mutation_action: action,
+          _target_id: target_id,
+        },
+      );
+
+      const current_view =
+        await this.load_current_view_for_refine({
+          _app_id: app_id,
+          _env: env,
+          _view_id: view_id,
+        });
+
+      const eligibility =
+        can_apply_deterministic_view_edit({
+          _resolved_task: task.resolved_task,
+          _current_view: current_view,
+          _edit_intent: task.edit_intent,
+        });
+
+      if (!eligibility._eligible) {
+        _xlog.log("[xvibe] structured view edit not eligible", {
+          _app_id: app_id,
+          _env: env,
+          _view_id: view_id,
+          _action: action,
+          _target_id: target_id,
+          _reason: eligibility._reason,
+          ...(eligibility._details !== undefined ? { _details: eligibility._details } : {}),
+        });
+
+        return this.apply_view_edit_failure({
+          code: "E_XVIBE_APPLY_VIEW_EDIT_NOT_ELIGIBLE",
+          message: `Deterministic view edit is not eligible: ${eligibility._reason}`,
+          app_id,
+          env,
+          view_id,
+          action,
+          target_id,
+          reason: eligibility._reason,
+          details: eligibility._details,
+          archive,
+        });
+      }
+
+      record_archive_stage(
+        archive,
+        archive_started_at,
+        "deterministic-mutating",
+        "Applying deterministic view edit...",
+        {
+          _view_id: view_id,
+          _action: eligibility._action,
+          _target_id: eligibility._target_id,
+        },
+      );
+
+      const deterministic_result =
+        apply_deterministic_view_edit({
+          _resolved_task: task.resolved_task,
+          _current_view: current_view,
+          _edit_intent: task.edit_intent,
+        });
+
+      if (!deterministic_result._ok || !deterministic_result._view || !deterministic_result._mutation) {
+        return this.apply_view_edit_failure({
+          code: "E_XVIBE_APPLY_VIEW_EDIT_FAILED",
+          message: `Deterministic view edit failed: ${deterministic_result._reason ?? "unknown"}`,
+          app_id,
+          env,
+          view_id,
+          action,
+          target_id,
+          reason: deterministic_result._reason ?? "deterministic_mutation_failed",
+          details: deterministic_result._details,
+          archive,
+        });
+      }
+
+      const view_to_persist = deterministic_result._view as XVibeJsonObject;
+      const mutated_view_id =
+        typeof view_to_persist._id === "string" ? view_to_persist._id.trim() : "";
+      if (mutated_view_id !== view_id) {
+        return this.apply_view_edit_failure({
+          code: "E_XVIBE_SOURCE_VIEW_PERSIST_MISMATCH",
+          message: "Structured view edit attempted to persist a non-source view",
+          app_id,
+          env,
+          view_id,
+          action,
+          target_id,
+          reason: "source_view_id_mismatch",
+          details: {
+            _requested_view_id: view_id,
+            _view_id: mutated_view_id,
+          },
+          archive,
+        });
+      }
+
+      archive._deterministic_mutation = {
+        _eligible: true,
+        _reason: eligibility._reason,
+        ...deterministic_result._mutation,
+      };
+
+      record_archive_stage(
+        archive,
+        archive_started_at,
+        "saving",
+        "Saving view...",
+        {
+          _view_id: view_id,
+          _action: deterministic_result._mutation._action,
+          _target_id: deterministic_result._mutation._target_id,
+        },
+      );
+
+      const persist_response = await _x.execute({
+        _module: "server-xvm",
+        _op: "push_update",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _generation_id: generation_id,
+          _view: view_to_persist,
+        },
+      } as any);
+      const persisted_version =
+        extract_persisted_version(persist_response);
+      const mutation_target_id =
+        deterministic_result._mutation._target_id ?? target_id;
+      const mutation = deterministic_result._mutation;
+      const result_details: XVibeJsonObject = {
+        _ok: true,
+        _artifact_type: "view",
+        _artifact_id: view_id,
+        _view_id: view_id,
+        _deterministic: true,
+        _mutation_action: mutation._action,
+        _target_id: mutation_target_id,
+        ...(typeof mutation._previous_index === "number"
+          ? { _previous_index: mutation._previous_index }
+          : {}),
+        ...(typeof mutation._next_index === "number"
+          ? { _next_index: mutation._next_index }
+          : {}),
+        ...(typeof mutation._insert_index === "number"
+          ? { _insert_index: mutation._insert_index }
+          : {}),
+        ...(typeof mutation._original_target_id === "string"
+          ? { _original_target_id: mutation._original_target_id }
+          : {}),
+        ...(typeof mutation._new_target_id === "string"
+          ? { _new_target_id: mutation._new_target_id }
+          : {}),
+        ...(typeof mutation._parent_id === "string"
+          ? { _parent_id: mutation._parent_id }
+          : {}),
+        ...(typeof mutation._before_id === "string"
+          ? { _before_id: mutation._before_id }
+          : {}),
+        ...(typeof mutation._after_id === "string"
+          ? { _after_id: mutation._after_id }
+          : {}),
+        ...(typeof mutation._removed_type === "string"
+          ? { _removed_type: mutation._removed_type }
+          : {}),
+        ...(typeof mutation._removed_text === "string"
+          ? { _removed_text: mutation._removed_text }
+          : {}),
+        ...(typeof mutation._hide_mechanism === "string"
+          ? { _hide_mechanism: mutation._hide_mechanism }
+          : {}),
+        ...(typeof mutation._show_mechanism === "string"
+          ? { _show_mechanism: mutation._show_mechanism }
+          : {}),
+        _mutation: mutation,
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      };
+
+      archive._result = {
+        _artifact_type: "view",
+        _artifact_id: view_id,
+        _view_id: view_id,
+        _success: true,
+        _deterministic: true,
+        _mutation_action: mutation._action,
+        _mutation_target_id: mutation_target_id,
+        ...(typeof mutation._previous_index === "number"
+          ? { _previous_index: mutation._previous_index }
+          : {}),
+        ...(typeof mutation._next_index === "number"
+          ? { _next_index: mutation._next_index }
+          : {}),
+        ...(typeof mutation._insert_index === "number"
+          ? { _insert_index: mutation._insert_index }
+          : {}),
+        ...(typeof mutation._original_target_id === "string"
+          ? { _original_target_id: mutation._original_target_id }
+          : {}),
+        ...(typeof mutation._new_target_id === "string"
+          ? { _new_target_id: mutation._new_target_id }
+          : {}),
+        ...(typeof mutation._parent_id === "string"
+          ? { _parent_id: mutation._parent_id }
+          : {}),
+        ...(typeof mutation._before_id === "string"
+          ? { _before_id: mutation._before_id }
+          : {}),
+        ...(typeof mutation._after_id === "string"
+          ? { _after_id: mutation._after_id }
+          : {}),
+        ...(typeof mutation._removed_type === "string"
+          ? { _removed_type: mutation._removed_type }
+          : {}),
+        ...(typeof mutation._removed_text === "string"
+          ? { _removed_text: mutation._removed_text }
+          : {}),
+        ...(typeof mutation._hide_mechanism === "string"
+          ? { _hide_mechanism: mutation._hide_mechanism }
+          : {}),
+        ...(typeof mutation._show_mechanism === "string"
+          ? { _show_mechanism: mutation._show_mechanism }
+          : {}),
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      };
+
+      _xem.fire("vibe:view-updated", {
+        _app_id: app_id,
+        _env: env,
+        _view_id: view_id,
+      });
+
+      _xlog.log("[xvibe] structured view edit applied", {
+        _app_id: app_id,
+        _env: env,
+        _view_id: view_id,
+        _action: deterministic_result._mutation._action,
+        _target_id: mutation_target_id,
+      });
+
+      return {
+        ...result_details,
+        _result: result_details,
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] apply_view_edit failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] apply_view_edit failed", error);
+      if (archive) {
+        archive._result = {
+          _artifact_type: "view",
+          ...(archive._view_id ? { _artifact_id: archive._view_id, _view_id: archive._view_id } : {}),
+          _success: false,
+          _deterministic: true,
+          _error: {
+            _code: "E_XVIBE_APPLY_VIEW_EDIT",
+            _message: message,
+          },
+        };
+      }
+      return explicit_error("E_XVIBE_APPLY_VIEW_EDIT", message);
+    } finally {
+      if (archive) {
+        archive._duration_ms = Date.now() - archive_started_at;
+        archive_vibe_run(archive);
+      }
+    }
+  }
 
   async _generate(xcmd: XCommand) {
     const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
@@ -11863,6 +14025,62 @@ export class XVibeModule extends XModule {
           ...(diagnostics ? { _diagnostics: diagnostics } : {}),
         },
       };
+    }
+  }
+
+  async _get_latest_run(xcmd: XCommand) {
+    try {
+      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+      const app_id =
+        read_safe_path_segment(params._app_id, "_app_id", XVIBE_INVALID_APP_ID);
+      const env =
+        read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const generation_id =
+        read_safe_vibe_run_generation_id(params._generation_id);
+      const runs_dir =
+        resolve_vibe_runs_dir({
+          _app_id: app_id,
+          _env: env,
+        });
+      const run =
+        resolve_vibe_run_dir({
+          _runs_dir: runs_dir,
+          ...(generation_id ? { _generation_id: generation_id } : {}),
+        });
+      const diagnostics =
+        read_vibe_run_diagnostic_files(runs_dir, run._run_dir);
+      const summary =
+        summarize_vibe_run_diagnostics({
+          _generation_id: run._generation_id ?? generation_id,
+          _files: diagnostics._files,
+        });
+      const result: XVibeRunDiagnosticResult = {
+        _ok: true,
+        _run_id: run._run_id,
+        _run_dir: relative_vibe_run_dir({
+          _app_id: app_id,
+          _env: env,
+          _run_id: run._run_id,
+        }),
+        ...(summary._generation_id ? { _generation_id: summary._generation_id } : {}),
+        _summary: summary,
+        _files: diagnostics._files,
+        ...(diagnostics._file_errors.length > 0
+          ? { _file_errors: diagnostics._file_errors }
+          : {}),
+      };
+
+      return result;
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] get_latest_run failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] get_latest_run failed", error);
+      return explicit_error("E_XVIBE_GET_LATEST_RUN_FAILED", message);
     }
   }
 

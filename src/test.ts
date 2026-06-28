@@ -7,6 +7,7 @@ import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
 import { XAuthModule } from "./XAuth/index.js";
 import { XDB, XDBStorageFS } from "./XDB/index.js";
 import { XEntityManager } from "./XEntityManager/XEntityManager.js";
+import { XStudioModule } from "./XStudio/XStudioModule.js";
 import { ServerXVMModule } from "./XVM/ServerXVMModule.js";
 import {
   build_generated_module_implementation_prompt,
@@ -1299,6 +1300,56 @@ assert.equal(delete_pause_button_by_text_resolved_task._target_id, "main");
 assert.equal(delete_pause_button_by_text_resolved_task._edit_action, "remove");
 assert.equal(delete_pause_button_by_text_resolved_task._edit_target_text, "Pause");
 assert.equal(delete_pause_button_by_text_resolved_task._edit_target_type, "button");
+const view_child_id_target_cases = [
+  {
+    _prompt: "Update main view only. Remove button id button-1. Do not modify anything else.",
+    _edit_action: "remove",
+    _edit_target_id: "button-1",
+    _edit_target_type: "button",
+  },
+  {
+    _prompt: "Update main view only. Delete button id button-1. Do not modify anything else.",
+    _edit_action: "remove",
+    _edit_target_id: "button-1",
+    _edit_target_type: "button",
+  },
+  {
+    _prompt: "Update main view only. Hide button id button-1. Do not modify anything else.",
+    _edit_action: "hide",
+    _edit_target_id: "button-1",
+    _edit_target_type: "button",
+  },
+  {
+    _prompt: "Update main view only. Show button id button-1. Do not modify anything else.",
+    _edit_action: "show",
+    _edit_target_id: "button-1",
+    _edit_target_type: "button",
+  },
+  {
+    _prompt: "Update main view only. Remove label id label-1. Do not modify anything else.",
+    _edit_action: "remove",
+    _edit_target_id: "label-1",
+    _edit_target_type: "label",
+  },
+  {
+    _prompt: "Update main view only. Remove object id object-1. Do not modify anything else.",
+    _edit_action: "remove",
+    _edit_target_id: "object-1",
+    _edit_target_type: "object",
+  },
+] as const;
+for (const view_child_id_target_case of view_child_id_target_cases) {
+  const resolved_task = resolve_xvibe_task({
+    _prompt: view_child_id_target_case._prompt,
+  });
+  assert.equal(resolved_task._artifact_type, "view");
+  assert.equal(resolved_task._action, "update");
+  assert.equal(resolved_task._target_id, "main");
+  assert.equal(resolved_task._edit_action, view_child_id_target_case._edit_action);
+  assert.equal(resolved_task._edit_target_id, view_child_id_target_case._edit_target_id);
+  assert.equal(resolved_task._edit_target_type, view_child_id_target_case._edit_target_type);
+  assert.equal(resolved_task._edit_target_text, undefined);
+}
 const remove_pause_button_view = {
   _id: "main",
   _type: "view",
@@ -1335,6 +1386,29 @@ assert.deepEqual(
     },
   },
 );
+assert.deepEqual(
+  can_apply_deterministic_view_edit({
+    _resolved_task: {
+      ...remove_pause_button_by_id_resolved_task,
+      _edit_target_id: undefined,
+      _edit_target_text: "button id",
+    },
+    _current_view: remove_pause_button_view,
+    _edit_intent: {
+      _action: "remove",
+      _target_id: "pause-button",
+    },
+  }),
+  {
+    _eligible: true,
+    _action: "remove-object",
+    _target_id: "pause-button",
+    _reason: "eligible",
+    _details: {
+      _resolved_by: "id",
+    },
+  },
+);
 const remove_pause_button_by_id_result =
   apply_deterministic_view_edit({
     _resolved_task: remove_pause_button_by_id_resolved_task,
@@ -1356,6 +1430,7 @@ assert.deepEqual(
     _action: "remove-object",
     _target_id: "pause-button",
     _resolved_by: "id",
+    _parent_id: "main",
     _removed_type: "button",
     _removed_text: "Pause",
   },
@@ -1535,6 +1610,7 @@ assert.deepEqual(
     _action: "hide-object",
     _target_id: "pause-button",
     _resolved_by: "id",
+    _parent_id: "main",
     _hide_mechanism: "style.display:none",
   },
 );
@@ -2712,6 +2788,7 @@ assert.deepEqual(
     _resolved_by: "id",
     _move_position: "before",
     _anchor_id: "play-button",
+    _before_id: "play-button",
     _anchor_resolved_by: "id",
     _parent_id: "main",
     _previous_index: 1,
@@ -2990,6 +3067,7 @@ assert.deepEqual(
     _action: "show-object",
     _target_id: "pause-button",
     _resolved_by: "id",
+    _parent_id: "main",
     _show_mechanism: "remove-style.display:none",
   },
 );
@@ -5526,6 +5604,168 @@ async function read_selected_skill_ids(run_dir: string): Promise<string[]> {
     : [];
 }
 
+const vibe_run_inspector_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-run-inspector-"));
+try {
+  const inspector_xvibe = new XVibeModule();
+  const inspector_runs_dir =
+    path.join(
+      vibe_run_inspector_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      "inspector-app",
+      "vibe-runs",
+    );
+  const deterministic_run_dir =
+    path.join(inspector_runs_dir, "2026-01-01T00-00-00-000Z_gen-1");
+  const fallback_run_dir =
+    path.join(inspector_runs_dir, "2026-01-02T00-00-00-000Z_gen-2");
+  const write_json = async (file_path: string, value: unknown) =>
+    writeFile(file_path, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+
+  await mkdir(deterministic_run_dir, { recursive: true });
+  await mkdir(fallback_run_dir, { recursive: true });
+  await write_json(path.join(deterministic_run_dir, "request.json"), {
+    _generation_id: "gen-1",
+    _app_id: "inspector-app",
+    _env: "test",
+    _mode: "refine",
+    _artifact_type: "view",
+  });
+  await write_json(path.join(deterministic_run_dir, "resolved-task.json"), {
+    _artifact_type: "view",
+    _action: "update",
+  });
+  await write_json(path.join(deterministic_run_dir, "deterministic-mutation.json"), {
+    _eligible: true,
+    _reason: "eligible",
+    _action: "remove-object",
+    _target_id: "button-1",
+  });
+  await write_json(path.join(deterministic_run_dir, "result.json"), {
+    _artifact_type: "view",
+    _view_id: "main",
+    _success: true,
+    _deterministic: true,
+    _mutation_action: "remove-object",
+  });
+  await writeFile(path.join(deterministic_run_dir, "prompt.txt"), "remove button", "utf-8");
+
+  await write_json(path.join(fallback_run_dir, "request.json"), {
+    _generation_id: "gen-2",
+    _app_id: "inspector-app",
+    _env: "test",
+    _mode: "refine",
+    _artifact_type: "view",
+  });
+  await write_json(path.join(fallback_run_dir, "deterministic-mutation.json"), {
+    _eligible: false,
+    _reason: "text_mismatch",
+  });
+  await write_json(path.join(fallback_run_dir, "result.json"), {
+    _artifact_type: "view",
+    _view_id: "main",
+    _success: true,
+  });
+  await write_json(path.join(fallback_run_dir, "runtime-context.json"), {
+    _view_id: "main",
+  });
+  await writeFile(path.join(fallback_run_dir, "final-prompt.txt"), "final prompt", "utf-8");
+
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? { _work_folder: vibe_run_inspector_work_folder }
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+
+  const latest_run = await (inspector_xvibe as any)._get_latest_run({
+    _params: {
+      _app_id: "inspector-app",
+      _env: "test",
+    },
+  });
+  assert.equal(latest_run._ok, true);
+  assert.equal(latest_run._run_id, "2026-01-02T00-00-00-000Z_gen-2");
+  assert.equal(
+    latest_run._run_dir,
+    "xvm/apps/test/inspector-app/vibe-runs/2026-01-02T00-00-00-000Z_gen-2",
+  );
+  assert.equal(path.isAbsolute(latest_run._run_dir), false);
+  assert.equal(latest_run._run_dir.includes(vibe_run_inspector_work_folder), false);
+  assert.equal(latest_run._generation_id, "gen-2");
+  assert.equal(latest_run._files["final-prompt.txt"], "final prompt");
+  assert.equal(latest_run._files["resolved-task.json"], undefined);
+  assert.equal(latest_run._summary._status, "fallback");
+  assert.equal(latest_run._summary._deterministic_eligible, false);
+  assert.equal(latest_run._summary._deterministic_reason, "text_mismatch");
+  assert.equal(latest_run._summary._has_final_prompt, true);
+
+  const deterministic_run = await (inspector_xvibe as any)._get_latest_run({
+    _params: {
+      _app_id: "inspector-app",
+      _env: "test",
+      _generation_id: "gen-1",
+    },
+  });
+  assert.equal(deterministic_run._ok, true);
+  assert.equal(deterministic_run._generation_id, "gen-1");
+  assert.equal(deterministic_run._summary._status, "deterministic");
+  assert.equal(deterministic_run._summary._deterministic_eligible, true);
+  assert.equal(deterministic_run._files["prompt.txt"], "remove button");
+
+  const invalid_generation_run = await (inspector_xvibe as any)._get_latest_run({
+    _params: {
+      _app_id: "inspector-app",
+      _env: "test",
+      _generation_id: "../gen-1",
+    },
+  });
+  assert.equal(invalid_generation_run._ok, false);
+  assert.equal(invalid_generation_run._error._code, "E_XVIBE_INVALID_GENERATION_ID");
+
+  const invalid_app_run = await (inspector_xvibe as any)._get_latest_run({
+    _params: {
+      _app_id: "../inspector-app",
+      _env: "test",
+    },
+  });
+  assert.equal(invalid_app_run._ok, false);
+  assert.equal(invalid_app_run._error._code, "E_XVIBE_INVALID_APP_ID");
+
+  const studio = new XStudioModule();
+  let inspector_command: any;
+  (_x as any).execute = async (command: any) => {
+    inspector_command = command;
+    return latest_run;
+  };
+
+  const studio_inspector = await (studio as any)._inspect_latest_run({
+    _params: {
+      _app_id: "inspector-app",
+      _env: "test",
+      _generation_id: "gen-2",
+    },
+  });
+  assert.equal(inspector_command._module, "xvibe");
+  assert.equal(inspector_command._op, "get-latest-run");
+  assert.equal(inspector_command._params._generation_id, "gen-2");
+  assert.equal(studio_inspector._ok, true);
+  assert.equal(studio_inspector._inspector._button_label, "Inspect Last Run");
+  assert.equal(studio_inspector._inspector._status, "fallback");
+  assert.ok(studio_inspector._inspector._summary_text.includes("generation_id: gen-2"));
+  assert.ok(studio_inspector._inspector._summary_text.includes("deterministic eligible: false"));
+  assert.ok(
+    studio_inspector._inspector._sections
+      .some((section: any) => section._label === "Runtime Context"),
+  );
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getModule = original_get_module;
+  await rm(vibe_run_inspector_work_folder, { recursive: true, force: true });
+}
+
 const view_edit_refine_work_folder =
   await mkdtemp(path.join(tmpdir(), "xvibe-view-edit-refine-"));
 const original_view_edit_log = _xlog.log;
@@ -5565,6 +5805,7 @@ try {
       },
     ],
   };
+  let referenced_views_for_remove: Record<string, any> = {};
   let push_update_count = 0;
   let xai_generate_count = 0;
   let throw_on_xai_generate = false;
@@ -5595,7 +5836,7 @@ try {
       return {
         _ok: true,
         _result: {
-          _view_ids: ["main"],
+          _view_ids: ["main", ...Object.keys(referenced_views_for_remove)],
           _flow_ids: [],
           _entity_ids: [],
         },
@@ -5603,10 +5844,19 @@ try {
     }
 
     if (command?._module === "server-xvm" && command?._op === "get_view") {
+      const view_id = command?._params?._view_id ?? "main";
+      const view =
+        view_id === "main"
+          ? current_view_for_remove
+          : referenced_views_for_remove[view_id];
+      if (!view) {
+        throw new Error(`View not found: ${view_id}`);
+      }
+
       return {
         _ok: true,
         _result: {
-          _view: current_view_for_remove,
+          _view: view,
         },
       };
     }
@@ -5791,6 +6041,67 @@ try {
     _type: "view",
     _children: [
       {
+        _id: "play-button",
+        _type: "button",
+        _text: "Play",
+      },
+      {
+        _id: "button-1",
+        _type: "button",
+        _text: "Pause",
+      },
+      {
+        _id: "next-button",
+        _type: "button",
+        _text: "Next",
+      },
+    ],
+  };
+  const deterministic_remove_button_id_phrase_push_count_before = push_update_count;
+  const deterministic_remove_button_id_phrase_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_remove_button_id_phrase_result = await (xvibe as any).generate_artifact({
+    _prompt: "Update main view only. Remove button id button-1. Do not modify anything else.",
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-remove-button-id-phrase",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_remove_button_id_phrase_result._ok, true);
+  assert.equal(deterministic_remove_button_id_phrase_result._result._deterministic, true);
+  assert.equal(deterministic_remove_button_id_phrase_result._result._mutation_action, "remove-object");
+  assert.equal(deterministic_remove_button_id_phrase_result._result._mutation_target_id, "button-1");
+  assert.equal(xai_generate_count, deterministic_remove_button_id_phrase_xai_count_before);
+  assert.equal(push_update_count, deterministic_remove_button_id_phrase_push_count_before + 1);
+  const deterministic_remove_button_id_phrase_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-remove-button-id-phrase");
+  assert.deepEqual(
+    deterministic_remove_button_id_phrase_pushed_view._children.map((child: any) => child._id),
+    ["play-button", "next-button"],
+  );
+  const deterministic_remove_button_id_phrase_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_remove_button_id_phrase_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_remove_button_id_phrase_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_remove_button_id_phrase_mutation_json._action, "remove-object");
+  assert.equal(deterministic_remove_button_id_phrase_mutation_json._target_id, "button-1");
+  assert.equal(deterministic_remove_button_id_phrase_mutation_json._resolved_by, "id");
+  const deterministic_remove_button_id_phrase_runtime_context = JSON.parse(
+    await readFile(path.join(deterministic_remove_button_id_phrase_run_dir, "runtime-context.json"), "utf-8"),
+  );
+  assert.equal(deterministic_remove_button_id_phrase_runtime_context._edit_intent._action, "remove");
+  assert.equal(deterministic_remove_button_id_phrase_runtime_context._edit_intent._target_id, "button-1");
+  assert.equal(deterministic_remove_button_id_phrase_runtime_context._edit_intent._target_type, "button");
+  await assert.rejects(
+    readFile(path.join(deterministic_remove_button_id_phrase_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
         _id: "pause-button",
         _type: "button",
         _text: "Pause",
@@ -5834,6 +6145,415 @@ try {
   assert.equal(deterministic_remove_by_text_mutation_json._resolved_by, "text");
   await assert.rejects(
     readFile(path.join(deterministic_remove_by_text_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+        {
+          _id: "settings-button",
+          _type: "button",
+          _text: "Settings",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_remove_push_count_before = push_update_count;
+  const deterministic_ref_remove_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_remove_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only. Remove button "Open Studio". Do not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-remove",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_remove_result._ok, true);
+  assert.equal(deterministic_ref_remove_result._result._deterministic, true);
+  assert.equal(deterministic_ref_remove_result._result._artifact_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_result._result._source_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_result._result._requested_view_id, "main");
+  assert.equal(deterministic_ref_remove_result._result._mutation_action, "remove-object");
+  assert.equal(deterministic_ref_remove_result._result._mutation_target_id, "open-studio-button");
+  assert.equal(xai_generate_count, deterministic_ref_remove_xai_count_before);
+  assert.equal(push_update_count, deterministic_ref_remove_push_count_before + 1);
+  const deterministic_ref_remove_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-ref-remove");
+  assert.equal(deterministic_ref_remove_pushed_view._id, "page-toolbar");
+  assert.deepEqual(
+    deterministic_ref_remove_pushed_view._children.map((child: any) => child._id),
+    ["settings-button"],
+  );
+  assert.deepEqual(
+    current_view_for_remove._children.map((child: any) => child._id),
+    ["toolbar-ref"],
+  );
+  const deterministic_ref_remove_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_remove_result_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_remove_run_dir, "result.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_remove_result_json._artifact_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_result_json._source_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_result_json._requested_view_id, "main");
+  const deterministic_ref_remove_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_remove_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_remove_mutation_json._target_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_mutation_json._source_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_remove_mutation_json._requested_view_id, "main");
+  assert.equal(deterministic_ref_remove_mutation_json._resolved_via, "xvm-view");
+  await assert.rejects(
+    readFile(path.join(deterministic_ref_remove_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  referenced_views_for_remove = {
+    toolbar: {
+      _id: "toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "new-record-button",
+          _type: "button",
+          _text: "+ New Record",
+        },
+        {
+          _id: "refresh-button",
+          _type: "button",
+          _text: "Refresh",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_new_record_push_count_before = push_update_count;
+  const deterministic_ref_new_record_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_new_record_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only.\nRemove button "+ New Record".\nDo not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-new-record",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_new_record_result._ok, true);
+  assert.equal(deterministic_ref_new_record_result._result._deterministic, true);
+  assert.equal(deterministic_ref_new_record_result._result._artifact_id, "toolbar");
+  assert.equal(deterministic_ref_new_record_result._result._source_view_id, "toolbar");
+  assert.equal(deterministic_ref_new_record_result._result._requested_view_id, "main");
+  assert.equal(deterministic_ref_new_record_result._result._mutation_action, "remove-object");
+  assert.equal(deterministic_ref_new_record_result._result._mutation_target_id, "new-record-button");
+  assert.equal(xai_generate_count, deterministic_ref_new_record_xai_count_before);
+  assert.equal(push_update_count, deterministic_ref_new_record_push_count_before + 1);
+  const deterministic_ref_new_record_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-ref-new-record");
+  assert.equal(deterministic_ref_new_record_pushed_view._id, "toolbar");
+  assert.deepEqual(
+    deterministic_ref_new_record_pushed_view._children.map((child: any) => child._id),
+    ["refresh-button"],
+  );
+  assert.deepEqual(
+    current_view_for_remove._children.map((child: any) => child._id),
+    ["toolbar-ref"],
+  );
+  const deterministic_ref_new_record_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  await assert.rejects(
+    readFile(path.join(deterministic_ref_new_record_run_dir, "validation-plan.json"), "utf-8"),
+  );
+  const deterministic_ref_new_record_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_new_record_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_new_record_mutation_json._target_view_id, "toolbar");
+  assert.equal(deterministic_ref_new_record_mutation_json._resolved_via, "xvm-view");
+  await assert.rejects(
+    readFile(path.join(deterministic_ref_new_record_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  referenced_views_for_remove = {
+    toolbar: {
+      _id: "toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "refresh-button",
+          _type: "button",
+          _text: "Refresh",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_new_record_missing_xai_count_before = xai_generate_count;
+  const deterministic_ref_new_record_missing_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only.\nRemove button "+ New Record".\nDo not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-new-record-missing",
+  });
+  assert.equal(deterministic_ref_new_record_missing_result._ok, true);
+  assert.equal(deterministic_ref_new_record_missing_result._result._deterministic, undefined);
+  assert.equal(xai_generate_count, deterministic_ref_new_record_missing_xai_count_before + 1);
+  const deterministic_ref_new_record_missing_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_new_record_missing_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_new_record_missing_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_new_record_missing_mutation_json._eligible, false);
+  assert.ok(
+    ["text_target_not_found", "target_not_found"].includes(deterministic_ref_new_record_missing_mutation_json._reason),
+  );
+  const deterministic_ref_new_record_missing_final_prompt =
+    await readFile(path.join(deterministic_ref_new_record_missing_run_dir, "final-prompt.txt"), "utf-8");
+  assert.ok(deterministic_ref_new_record_missing_final_prompt.includes("+ New Record"));
+
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_text_push_count_before = push_update_count;
+  const deterministic_ref_text_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_text_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only. Change "Open Studio" button text to "Launch Studio". Do not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-text",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_text_result._ok, true);
+  assert.equal(deterministic_ref_text_result._result._deterministic, true);
+  assert.equal(deterministic_ref_text_result._result._artifact_id, "page-toolbar");
+  assert.equal(deterministic_ref_text_result._result._mutation_action, "update-text");
+  assert.equal(deterministic_ref_text_result._result._mutation_target_id, "open-studio-button");
+  assert.equal(xai_generate_count, deterministic_ref_text_xai_count_before);
+  assert.equal(push_update_count, deterministic_ref_text_push_count_before + 1);
+  const deterministic_ref_text_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-ref-text");
+  assert.equal(deterministic_ref_text_pushed_view._id, "page-toolbar");
+  assert.equal(deterministic_ref_text_pushed_view._children[0]._text, "Launch Studio");
+  const deterministic_ref_text_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_text_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_text_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_text_mutation_json._target_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_text_mutation_json._resolved_via, "xvm-view");
+  await assert.rejects(
+    readFile(path.join(deterministic_ref_text_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-ref-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "open-studio-main-button",
+        _type: "button",
+        _text: "Open Studio",
+      },
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_main_wins_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_main_wins_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only. Remove button "Open Studio". Do not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-main-wins",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_main_wins_result._ok, true);
+  assert.equal(deterministic_ref_main_wins_result._result._deterministic, true);
+  assert.equal(deterministic_ref_main_wins_result._result._artifact_id, "main");
+  assert.equal(deterministic_ref_main_wins_result._result._source_view_id, undefined);
+  assert.equal(deterministic_ref_main_wins_result._result._mutation_target_id, "open-studio-main-button");
+  assert.equal(xai_generate_count, deterministic_ref_main_wins_xai_count_before);
+  const deterministic_ref_main_wins_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-ref-main-wins");
+  assert.equal(deterministic_ref_main_wins_pushed_view._id, "main");
+  assert.deepEqual(
+    deterministic_ref_main_wins_pushed_view._children.map((child: any) => child._id),
+    ["toolbar-ref"],
+  );
+  assert.equal(referenced_views_for_remove["page-toolbar"]._children[0]._id, "open-studio-ref-button");
+
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-toolbar-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+    "page-footer": {
+      _id: "page-footer",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-footer-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+      {
+        _id: "footer-ref",
+        _type: "xvm-view",
+        _view_id: "page-footer",
+      },
+    ],
+  };
+  const deterministic_ref_ambiguous_xai_count_before = xai_generate_count;
+  const deterministic_ref_ambiguous_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only. Remove button "Open Studio". Do not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-ambiguous",
+  });
+  assert.equal(deterministic_ref_ambiguous_result._ok, true);
+  assert.equal(deterministic_ref_ambiguous_result._result._deterministic, undefined);
+  assert.equal(xai_generate_count, deterministic_ref_ambiguous_xai_count_before + 1);
+  const deterministic_ref_ambiguous_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_ambiguous_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_ambiguous_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_ambiguous_mutation_json._eligible, false);
+  assert.equal(deterministic_ref_ambiguous_mutation_json._reason, "ambiguous_xvm_view_target");
+  assert.deepEqual(
+    deterministic_ref_ambiguous_mutation_json._details._target_view_ids,
+    ["page-toolbar", "page-footer"],
+  );
+
+  referenced_views_for_remove = {};
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "logout-button",
+        _type: "button",
+        _text: "Logout",
+      },
+      {
+        _id: "missing-toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "missing-toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_missing_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_missing_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only. Remove button "Logout". Do not modify anything else.',
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-missing",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_missing_result._ok, true);
+  assert.equal(deterministic_ref_missing_result._result._deterministic, true);
+  assert.equal(deterministic_ref_missing_result._result._artifact_id, "main");
+  assert.equal(xai_generate_count, deterministic_ref_missing_xai_count_before);
+  const deterministic_ref_missing_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_missing_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_missing_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.deepEqual(
+    deterministic_ref_missing_mutation_json._warnings,
+    ["missing_xvm_view_reference:missing-toolbar"],
   );
 
   current_view_for_remove = {
@@ -7099,6 +7819,7 @@ try {
   assert.equal(deterministic_move_before_mutation_json._action, "move-object");
   assert.equal(deterministic_move_before_mutation_json._move_position, "before");
   assert.equal(deterministic_move_before_mutation_json._anchor_id, "play-button");
+  assert.equal(deterministic_move_before_mutation_json._before_id, "play-button");
   assert.equal(deterministic_move_before_mutation_json._previous_index, 1);
   assert.equal(deterministic_move_before_mutation_json._next_index, 0);
   await assert.rejects(
@@ -7319,6 +8040,130 @@ try {
   assert.equal(deterministic_move_anchor_missing_mutation_json._eligible, false);
   assert.equal(deterministic_move_anchor_missing_mutation_json._reason, "anchor_not_found");
 
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "settings-button",
+          _type: "button",
+          _text: "Settings",
+        },
+        {
+          _id: "open-studio-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+    ],
+  };
+  const deterministic_ref_move_inside_xai_count_before = xai_generate_count;
+  throw_on_xai_generate = true;
+  const deterministic_ref_move_inside_result = await (xvibe as any).generate_artifact({
+    _prompt: "Update main view only. Move open-studio-button before settings-button. Do not modify anything else.",
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-move-inside",
+  });
+  throw_on_xai_generate = false;
+  assert.equal(deterministic_ref_move_inside_result._ok, true);
+  assert.equal(deterministic_ref_move_inside_result._result._deterministic, true);
+  assert.equal(deterministic_ref_move_inside_result._result._artifact_id, "page-toolbar");
+  assert.equal(deterministic_ref_move_inside_result._result._mutation_action, "move-object");
+  assert.equal(deterministic_ref_move_inside_result._result._mutation_target_id, "open-studio-button");
+  assert.equal(xai_generate_count, deterministic_ref_move_inside_xai_count_before);
+  const deterministic_ref_move_inside_pushed_view =
+    pushed_views_by_generation_id.get("view-edit-deterministic-ref-move-inside");
+  assert.equal(deterministic_ref_move_inside_pushed_view._id, "page-toolbar");
+  assert.deepEqual(
+    deterministic_ref_move_inside_pushed_view._children.map((child: any) => child._id),
+    ["open-studio-button", "settings-button"],
+  );
+  const deterministic_ref_move_inside_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_move_inside_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_move_inside_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_move_inside_mutation_json._target_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_move_inside_mutation_json._resolved_via, "xvm-view");
+  assert.equal(deterministic_ref_move_inside_mutation_json._anchor_id, "settings-button");
+  await assert.rejects(
+    readFile(path.join(deterministic_ref_move_inside_run_dir, "final-prompt.txt"), "utf-8"),
+  );
+
+  referenced_views_for_remove = {
+    "page-toolbar": {
+      _id: "page-toolbar",
+      _type: "view",
+      _children: [
+        {
+          _id: "open-studio-button",
+          _type: "button",
+          _text: "Open Studio",
+        },
+      ],
+    },
+    "page-footer": {
+      _id: "page-footer",
+      _type: "view",
+      _children: [
+        {
+          _id: "footer-button",
+          _type: "button",
+          _text: "Footer",
+        },
+      ],
+    },
+  };
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+      {
+        _id: "footer-ref",
+        _type: "xvm-view",
+        _view_id: "page-footer",
+      },
+    ],
+  };
+  const deterministic_ref_move_cross_xai_count_before = xai_generate_count;
+  const deterministic_ref_move_cross_result = await (xvibe as any).generate_artifact({
+    _prompt: "Update main view only. Move open-studio-button before footer-button. Do not modify anything else.",
+    _app_id: "view-edit-refine-app",
+    _env: "test",
+    _generation_id: "view-edit-deterministic-ref-move-cross",
+  });
+  assert.equal(deterministic_ref_move_cross_result._ok, true);
+  assert.equal(deterministic_ref_move_cross_result._result._deterministic, undefined);
+  assert.equal(xai_generate_count, deterministic_ref_move_cross_xai_count_before + 1);
+  const deterministic_ref_move_cross_run_dir =
+    await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
+  const deterministic_ref_move_cross_mutation_json = JSON.parse(
+    await readFile(path.join(deterministic_ref_move_cross_run_dir, "deterministic-mutation.json"), "utf-8"),
+  );
+  assert.equal(deterministic_ref_move_cross_mutation_json._eligible, false);
+  assert.equal(deterministic_ref_move_cross_mutation_json._reason, "different_source_view");
+  assert.equal(deterministic_ref_move_cross_mutation_json._details._target_view_id, "page-toolbar");
+  assert.equal(deterministic_ref_move_cross_mutation_json._details._anchor_view_id, "page-footer");
+
+  referenced_views_for_remove = {};
   current_view_for_remove = {
     _id: "main",
     _type: "view",
@@ -7867,6 +8712,1245 @@ try {
   (_x as any).getSkills = original_get_skills;
   (_x as any).getModule = original_get_module;
   await rm(view_edit_refine_work_folder, { recursive: true, force: true });
+}
+
+const referenced_view_persist_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-ref-view-persist-"));
+try {
+  const referenced_view_persist_server_xvm =
+    new ServerXVMModule({ _work_folder: referenced_view_persist_work_folder });
+  const referenced_view_persist_runtime_skills = {
+    _modules: [
+      {
+        _objects: [
+          { _id: "view" },
+          { _id: "button" },
+          { _id: "xvm-view" },
+        ],
+      },
+    ],
+  };
+  const referenced_view_persist_app_id = "referenced-view-persist-app";
+  const referenced_view_persist_env = "test";
+  const referenced_view_persist_main = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "toolbar-ref",
+        _type: "xvm-view",
+        _view_id: "page-toolbar",
+      },
+    ],
+  };
+  const referenced_view_persist_toolbar = {
+    _id: "page-toolbar",
+    _type: "view",
+    _children: [
+      {
+        _id: "new-record-button",
+        _type: "button",
+        _text: "+ New Record",
+      },
+      {
+        _id: "refresh-button",
+        _type: "button",
+        _text: "Refresh",
+      },
+    ],
+  };
+  await (referenced_view_persist_server_xvm as any)._create_app({
+    _params: {
+      _app_id: referenced_view_persist_app_id,
+      _env: referenced_view_persist_env,
+      _entry_view_id: "main",
+    },
+  });
+  await (referenced_view_persist_server_xvm as any)._push_update({
+    _params: {
+      _app_id: referenced_view_persist_app_id,
+      _env: referenced_view_persist_env,
+      _view: referenced_view_persist_main,
+    },
+  });
+  await (referenced_view_persist_server_xvm as any)._push_update({
+    _params: {
+      _app_id: referenced_view_persist_app_id,
+      _env: referenced_view_persist_env,
+      _view: referenced_view_persist_toolbar,
+    },
+  });
+
+  const referenced_view_persist_views_dir =
+    path.join(
+      referenced_view_persist_work_folder,
+      "xvm",
+      "apps",
+      referenced_view_persist_env,
+      referenced_view_persist_app_id,
+      "views",
+    );
+  const referenced_view_persist_main_file =
+    path.join(referenced_view_persist_views_dir, "main.json");
+  const referenced_view_persist_toolbar_file =
+    path.join(referenced_view_persist_views_dir, "page-toolbar.json");
+  const referenced_view_persist_main_before =
+    await readFile(referenced_view_persist_main_file, "utf-8");
+  const referenced_view_persist_toolbar_before =
+    await readFile(referenced_view_persist_toolbar_file, "utf-8");
+  const referenced_view_persist_logs: any[] = [];
+  const referenced_view_persist_original_log = _xlog.log;
+  let referenced_view_persist_xai_generate_count = 0;
+
+  (_xlog as any).log = (message: string, data?: any) => {
+    if (message === "[xvibe] deterministic referenced view persist") {
+      referenced_view_persist_logs.push(data);
+    }
+    return referenced_view_persist_original_log.call(_xlog, message, data);
+  };
+  (xvibe as any).latest_runtime_skills = referenced_view_persist_runtime_skills;
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? referenced_view_persist_server_xvm
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).getSkills = () => referenced_view_persist_runtime_skills;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (referenced_view_persist_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(referenced_view_persist_server_xvm, command);
+      }
+    }
+
+    if (command?._module === "xai" && command?._op === "generate") {
+      referenced_view_persist_xai_generate_count += 1;
+      throw new Error("xai.generate should not be called for deterministic referenced view persistence");
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const referenced_view_persist_result = await (xvibe as any).generate_artifact({
+    _prompt: 'Update main view only.\nRemove button "+ New Record".\nDo not modify anything else.',
+    _app_id: referenced_view_persist_app_id,
+    _env: referenced_view_persist_env,
+    _generation_id: "view-edit-deterministic-ref-persist",
+  });
+  assert.equal(referenced_view_persist_result._ok, true);
+  assert.equal(referenced_view_persist_result._result._deterministic, true);
+  assert.equal(referenced_view_persist_result._result._artifact_id, "page-toolbar");
+  assert.equal(referenced_view_persist_result._result._source_view_id, "page-toolbar");
+  assert.equal(referenced_view_persist_result._result._requested_view_id, "main");
+  assert.equal(referenced_view_persist_result._result._mutation_action, "remove-object");
+  assert.equal(referenced_view_persist_result._result._mutation_target_id, "new-record-button");
+  assert.equal(referenced_view_persist_xai_generate_count, 0);
+  assert.deepEqual(referenced_view_persist_logs, [
+    {
+      _requested_view_id: "main",
+      _source_view_id: "page-toolbar",
+      _view_id: "page-toolbar",
+      _target_id: "new-record-button",
+      _action: "remove-object",
+    },
+  ]);
+
+  const referenced_view_persist_main_after =
+    await readFile(referenced_view_persist_main_file, "utf-8");
+  const referenced_view_persist_toolbar_after =
+    await readFile(referenced_view_persist_toolbar_file, "utf-8");
+  assert.equal(referenced_view_persist_main_after, referenced_view_persist_main_before);
+  assert.notEqual(referenced_view_persist_toolbar_after, referenced_view_persist_toolbar_before);
+  const referenced_view_persist_toolbar_json =
+    JSON.parse(referenced_view_persist_toolbar_after);
+  const referenced_view_persist_main_json =
+    JSON.parse(referenced_view_persist_main_after);
+  assert.equal(xmutator.has_id(referenced_view_persist_toolbar_json, "new-record-button"), false);
+  assert.equal(xmutator.has_id(referenced_view_persist_toolbar_json, "refresh-button"), true);
+  assert.deepEqual(referenced_view_persist_main_json, referenced_view_persist_main);
+
+  const referenced_view_persist_reloaded_server_xvm =
+    new ServerXVMModule({ _work_folder: referenced_view_persist_work_folder });
+  await (referenced_view_persist_reloaded_server_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: referenced_view_persist_app_id,
+      _env: referenced_view_persist_env,
+    },
+  });
+  const referenced_view_persist_reloaded_toolbar =
+    await (referenced_view_persist_reloaded_server_xvm as any)._get_view({
+      _params: {
+        _app_id: referenced_view_persist_app_id,
+        _env: referenced_view_persist_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  const referenced_view_persist_reloaded_main =
+    await (referenced_view_persist_reloaded_server_xvm as any)._get_view({
+      _params: {
+        _app_id: referenced_view_persist_app_id,
+        _env: referenced_view_persist_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    xmutator.has_id(referenced_view_persist_reloaded_toolbar._result._view, "new-record-button"),
+    false,
+  );
+  assert.equal(
+    xmutator.has_id(referenced_view_persist_reloaded_toolbar._result._view, "refresh-button"),
+    true,
+  );
+  assert.deepEqual(
+    referenced_view_persist_reloaded_main._result._view,
+    referenced_view_persist_main,
+  );
+} finally {
+  (_xlog as any).log = original_view_edit_log;
+  (_x as any).execute = original_execute;
+  (_x as any).getSkills = original_get_skills;
+  (_x as any).getModule = original_get_module;
+  await rm(referenced_view_persist_work_folder, { recursive: true, force: true });
+}
+
+const apply_view_edit_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-apply-view-edit-"));
+try {
+  const apply_view_edit_server_xvm =
+    new ServerXVMModule({ _work_folder: apply_view_edit_work_folder });
+  const apply_view_edit_xvibe = new XVibeModule();
+  const apply_view_edit_app_id = "apply-view-edit-app";
+  const apply_view_edit_env = "test";
+  let apply_view_edit_xai_generate_count = 0;
+  let apply_view_edit_push_update_count = 0;
+
+  await (apply_view_edit_server_xvm as any)._create_app({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _entry_view_id: "main",
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "main",
+        _type: "view",
+        _children: [
+          {
+            _id: "main-title",
+            _type: "label",
+            _text: "Original Title",
+            class: "title old",
+          },
+          {
+            _id: "toolbar-ref",
+            _type: "xvm-view",
+            _view_id: "page-toolbar",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "page-toolbar",
+        _type: "view",
+        _children: [
+          {
+            _id: "toolbar-button",
+            _type: "button",
+            _text: "Create",
+            style: "color:red",
+          },
+          {
+            _id: "settings-button",
+            _type: "button",
+            _text: "Settings",
+          },
+          {
+            _id: "export-button",
+            _type: "button",
+            _text: "Export",
+          },
+          {
+            _id: "toolbar-group",
+            _type: "toolbar",
+            _children: [
+              {
+                _id: "nested-action",
+                _type: "button",
+                _text: "Nested",
+              },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? apply_view_edit_server_xvm
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (apply_view_edit_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        if (method_name === "_push_update") apply_view_edit_push_update_count += 1;
+        return method.call(apply_view_edit_server_xvm, command);
+      }
+    }
+
+    if (command?._module === "xai" && command?._op === "generate") {
+      apply_view_edit_xai_generate_count += 1;
+      throw new Error("xai.generate should not be called for xvibe.apply-view-edit");
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const apply_view_edit_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "set-property",
+        _target_id: "main-title",
+        _target_type: "label",
+        _property_name: "_text",
+        _property_value: "Updated Title",
+      },
+    });
+  assert.equal(apply_view_edit_text_result._ok, true);
+  assert.equal(apply_view_edit_text_result._artifact_type, "view");
+  assert.equal(apply_view_edit_text_result._artifact_id, "main");
+  assert.equal(apply_view_edit_text_result._deterministic, true);
+  assert.equal(apply_view_edit_text_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_text_result._target_id, "main-title");
+  assert.equal(apply_view_edit_text_result._result._mutation._property_name, "_text");
+
+  const apply_view_edit_main_after_text =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    apply_view_edit_main_after_text._result._view._children[0]._text,
+    "Updated Title",
+  );
+
+  const apply_view_edit_class_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "set-property",
+        _target_id: "main-title",
+        _target_type: "label",
+        _property_name: "class",
+        _property_value: "title new",
+      },
+    });
+  assert.equal(apply_view_edit_class_result._ok, true);
+  assert.equal(apply_view_edit_class_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_class_result._result._mutation._property_name, "class");
+  const apply_view_edit_main_after_class =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    apply_view_edit_main_after_class._result._view._children[0].class,
+    "title new",
+  );
+
+  const apply_view_edit_hide_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "hide-object",
+        _target_id: "main-title",
+        _target_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_hide_result._ok, true);
+  assert.equal(apply_view_edit_hide_result._mutation_action, "hide-object");
+  assert.equal(apply_view_edit_hide_result._target_id, "main-title");
+  assert.equal(apply_view_edit_hide_result._parent_id, "main");
+  assert.equal(apply_view_edit_hide_result._hide_mechanism, "style.display:none");
+  assert.equal(apply_view_edit_hide_result._result._mutation._hide_mechanism, "style.display:none");
+  const apply_view_edit_main_after_hide =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_main_after_hide._result._view._children.map((child: any) => child._id),
+    ["main-title", "toolbar-ref"],
+  );
+  assert.equal(
+    test_style_has_display_none(apply_view_edit_main_after_hide._result._view._children[0].style),
+    true,
+  );
+  assert.equal(apply_view_edit_main_after_hide._result._view._children[0]._visible, false);
+  assert.equal(apply_view_edit_main_after_hide._result._view._children[0]._id, "main-title");
+
+  const apply_view_edit_show_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "show-object",
+        _target_id: "main-title",
+        _target_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_show_result._ok, true);
+  assert.equal(apply_view_edit_show_result._mutation_action, "show-object");
+  assert.equal(apply_view_edit_show_result._target_id, "main-title");
+  assert.equal(apply_view_edit_show_result._parent_id, "main");
+  assert.equal(apply_view_edit_show_result._show_mechanism, "remove-style.display:none");
+  assert.equal(apply_view_edit_show_result._result._mutation._show_mechanism, "remove-style.display:none");
+  const apply_view_edit_main_after_show =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(apply_view_edit_main_after_show._result._view._children[0].style, undefined);
+  assert.equal(apply_view_edit_main_after_show._result._view._children[0]._visible, true);
+  assert.equal(apply_view_edit_main_after_show._result._view._children[0].class, "title new");
+
+  const apply_view_edit_main_before_source =
+    JSON.stringify(apply_view_edit_main_after_show._result._view);
+  const apply_view_edit_source_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-property",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _property_name: "_text",
+        _property_value: "New Record",
+      },
+    });
+  assert.equal(apply_view_edit_source_result._ok, true);
+  assert.equal(apply_view_edit_source_result._artifact_id, "page-toolbar");
+  assert.equal(apply_view_edit_source_result._target_id, "toolbar-button");
+  const apply_view_edit_toolbar_after_source =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.equal(
+    apply_view_edit_toolbar_after_source._result._view._children[0]._text,
+    "New Record",
+  );
+  const apply_view_edit_main_after_source =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    JSON.stringify(apply_view_edit_main_after_source._result._view),
+    apply_view_edit_main_before_source,
+  );
+
+  const apply_view_edit_source_hide_main_before =
+    JSON.stringify(apply_view_edit_main_after_source._result._view);
+  const apply_view_edit_source_hide_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "hide-object",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_source_hide_result._ok, true);
+  assert.equal(apply_view_edit_source_hide_result._artifact_id, "page-toolbar");
+  assert.equal(apply_view_edit_source_hide_result._mutation_action, "hide-object");
+  assert.equal(apply_view_edit_source_hide_result._target_id, "toolbar-button");
+  assert.equal(apply_view_edit_source_hide_result._parent_id, "page-toolbar");
+  assert.equal(apply_view_edit_source_hide_result._hide_mechanism, "style.display:none");
+  const apply_view_edit_toolbar_after_source_hide =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_source_hide._result._view._children.map((child: any) => child._id),
+    ["toolbar-button", "settings-button", "export-button", "toolbar-group"],
+  );
+  assert.equal(
+    apply_view_edit_toolbar_after_source_hide._result._view._children[0].style,
+    "color:red; display:none",
+  );
+  assert.equal(apply_view_edit_toolbar_after_source_hide._result._view._children[0]._visible, false);
+  const apply_view_edit_main_after_source_hide =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    JSON.stringify(apply_view_edit_main_after_source_hide._result._view),
+    apply_view_edit_source_hide_main_before,
+  );
+
+  const apply_view_edit_source_show_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "show-object",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_source_show_result._ok, true);
+  assert.equal(apply_view_edit_source_show_result._artifact_id, "page-toolbar");
+  assert.equal(apply_view_edit_source_show_result._mutation_action, "show-object");
+  assert.equal(apply_view_edit_source_show_result._target_id, "toolbar-button");
+  assert.equal(apply_view_edit_source_show_result._parent_id, "page-toolbar");
+  assert.equal(apply_view_edit_source_show_result._show_mechanism, "remove-style.display:none");
+  const apply_view_edit_toolbar_after_source_show =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.equal(
+    apply_view_edit_toolbar_after_source_show._result._view._children[0].style,
+    "color:red",
+  );
+  assert.equal(apply_view_edit_toolbar_after_source_show._result._view._children[0]._visible, true);
+
+  const apply_view_edit_move_source_main_before =
+    JSON.stringify(apply_view_edit_main_after_source_hide._result._view);
+  const apply_view_edit_move_after_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "toolbar-group",
+        _target_type: "toolbar",
+        _after_id: "settings-button",
+      },
+    });
+  assert.equal(apply_view_edit_move_after_result._ok, true);
+  assert.equal(apply_view_edit_move_after_result._deterministic, true);
+  assert.equal(apply_view_edit_move_after_result._mutation_action, "move-object");
+  assert.equal(apply_view_edit_move_after_result._target_id, "toolbar-group");
+  assert.equal(apply_view_edit_move_after_result._after_id, "settings-button");
+  assert.equal(apply_view_edit_move_after_result._previous_index, 3);
+  assert.equal(apply_view_edit_move_after_result._next_index, 2);
+  assert.equal(apply_view_edit_move_after_result._parent_id, "page-toolbar");
+  const apply_view_edit_toolbar_after_move_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_move_after._result._view._children.map((child: any) => child._id),
+    ["toolbar-button", "settings-button", "toolbar-group", "export-button"],
+  );
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_move_after._result._view._children[2]._children,
+    [
+      {
+        _id: "nested-action",
+        _type: "button",
+        _text: "Nested",
+      },
+    ],
+  );
+  const apply_view_edit_main_after_move_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    JSON.stringify(apply_view_edit_main_after_move_after._result._view),
+    apply_view_edit_move_source_main_before,
+  );
+
+  const apply_view_edit_move_before_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _before_id: "export-button",
+      },
+    });
+  assert.equal(apply_view_edit_move_before_result._ok, true);
+  assert.equal(apply_view_edit_move_before_result._mutation_action, "move-object");
+  assert.equal(apply_view_edit_move_before_result._target_id, "toolbar-button");
+  assert.equal(apply_view_edit_move_before_result._before_id, "export-button");
+  assert.equal(apply_view_edit_move_before_result._previous_index, 0);
+  assert.equal(apply_view_edit_move_before_result._next_index, 2);
+  assert.equal(apply_view_edit_move_before_result._parent_id, "page-toolbar");
+  const apply_view_edit_toolbar_after_move_before =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_move_before._result._view._children.map((child: any) => child._id),
+    ["settings-button", "toolbar-group", "toolbar-button", "export-button"],
+  );
+
+  const apply_view_edit_remove_source_main_before =
+    JSON.stringify(apply_view_edit_main_after_move_after._result._view);
+  const apply_view_edit_remove_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "remove-object",
+        _target_id: "export-button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_remove_result._ok, true);
+  assert.equal(apply_view_edit_remove_result._deterministic, true);
+  assert.equal(apply_view_edit_remove_result._mutation_action, "remove-object");
+  assert.equal(apply_view_edit_remove_result._target_id, "export-button");
+  assert.equal(apply_view_edit_remove_result._removed_type, "button");
+  assert.equal(apply_view_edit_remove_result._removed_text, "Export");
+  assert.equal(apply_view_edit_remove_result._parent_id, "page-toolbar");
+  assert.equal(apply_view_edit_remove_result._result._mutation._removed_type, "button");
+  assert.equal(apply_view_edit_remove_result._result._mutation._removed_text, "Export");
+  const apply_view_edit_toolbar_after_remove =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_remove._result._view._children.map((child: any) => child._id),
+    ["settings-button", "toolbar-group", "toolbar-button"],
+  );
+  const apply_view_edit_main_after_remove_source =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.equal(
+    JSON.stringify(apply_view_edit_main_after_remove_source._result._view),
+    apply_view_edit_remove_source_main_before,
+  );
+
+  const apply_view_edit_push_count_before_root_remove =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_root_remove_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "remove-object",
+        _target_id: "main",
+        _target_type: "view",
+      },
+    });
+  assert.equal(apply_view_edit_root_remove_result._ok, false);
+  assert.equal(apply_view_edit_root_remove_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_remove,
+  );
+
+  const apply_view_edit_push_count_before_missing_remove =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_remove_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "remove-object",
+        _target_id: "missing-button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_missing_remove_result._ok, false);
+  assert.equal(apply_view_edit_missing_remove_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_remove,
+  );
+
+  const apply_view_edit_push_count_before_root_hide =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_root_hide_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "hide-object",
+        _target_id: "main",
+        _target_type: "view",
+      },
+    });
+  assert.equal(apply_view_edit_root_hide_result._ok, false);
+  assert.equal(apply_view_edit_root_hide_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_hide,
+  );
+
+  const apply_view_edit_push_count_before_root_show =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_root_show_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "show-object",
+        _target_id: "page-toolbar",
+        _target_type: "view",
+      },
+    });
+  assert.equal(apply_view_edit_root_show_result._ok, false);
+  assert.equal(apply_view_edit_root_show_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_show,
+  );
+
+  const apply_view_edit_push_count_before_missing_hide =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_hide_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "hide-object",
+        _target_id: "missing-hide-target",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_missing_hide_result._ok, false);
+  assert.equal(apply_view_edit_missing_hide_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_hide,
+  );
+
+  const apply_view_edit_push_count_before_missing_show =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_show_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "show-object",
+        _target_id: "missing-show-target",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_missing_show_result._ok, false);
+  assert.equal(apply_view_edit_missing_show_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_show,
+  );
+
+  const apply_view_edit_push_count_before_different_parent =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_move_different_parent_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "nested-action",
+        _target_type: "button",
+        _before_id: "settings-button",
+      },
+    });
+  assert.equal(apply_view_edit_move_different_parent_result._ok, false);
+  assert.equal(apply_view_edit_move_different_parent_result._reason, "different_parent");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_different_parent,
+  );
+
+  const apply_view_edit_push_count_before_missing_anchor =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_move_missing_anchor_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _after_id: "missing-anchor",
+      },
+    });
+  assert.equal(apply_view_edit_move_missing_anchor_result._ok, false);
+  assert.equal(apply_view_edit_move_missing_anchor_result._reason, "anchor_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_anchor,
+  );
+
+  const apply_view_edit_push_count_before_root_move =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_move_root_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "page-toolbar",
+        _target_type: "view",
+        _after_id: "settings-button",
+      },
+    });
+  assert.equal(apply_view_edit_move_root_result._ok, false);
+  assert.equal(apply_view_edit_move_root_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_move,
+  );
+
+  const apply_view_edit_style_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "set-style",
+        _target_id: "main-title",
+        _target_type: "label",
+        _style_property: "color",
+        _style_value: "blue",
+      },
+    });
+  assert.equal(apply_view_edit_style_result._ok, true);
+  assert.equal(apply_view_edit_style_result._mutation_action, "set-style");
+  const apply_view_edit_main_after_style =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_main_after_style._result._view._children[0]._style,
+    { color: "blue" },
+  );
+
+  const apply_view_edit_replace_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "replace-object",
+        _target_id: "main-title",
+        _target_type: "label",
+        _object_value: {
+          _id: "main-title",
+          _type: "label",
+          _text: "JSON Title",
+          class: "json-title",
+          _style: {
+            color: "purple",
+          },
+        },
+      },
+    });
+  assert.equal(apply_view_edit_replace_result._ok, true);
+  assert.equal(apply_view_edit_replace_result._mutation_action, "replace-object");
+  assert.equal(apply_view_edit_replace_result._target_id, "main-title");
+  const apply_view_edit_main_after_replace =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_main_after_replace._result._view._children[0],
+    {
+      _id: "main-title",
+      _type: "label",
+      _text: "JSON Title",
+      class: "json-title",
+      _style: {
+        color: "purple",
+      },
+    },
+  );
+  assert.equal(
+    apply_view_edit_main_after_replace._result._view._children[1]._id,
+    "toolbar-ref",
+  );
+
+  const apply_view_edit_duplicate_simple_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "duplicate-object",
+        _target_id: "main-title",
+        _target_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_duplicate_simple_result._ok, true);
+  assert.equal(apply_view_edit_duplicate_simple_result._mutation_action, "duplicate-object");
+  assert.equal(apply_view_edit_duplicate_simple_result._original_target_id, "main-title");
+  assert.equal(apply_view_edit_duplicate_simple_result._new_target_id, "main-title-copy");
+  assert.equal(apply_view_edit_duplicate_simple_result._parent_id, "main");
+  assert.equal(apply_view_edit_duplicate_simple_result._insert_index, 1);
+  assert.equal(apply_view_edit_duplicate_simple_result._result._mutation._new_target_id, "main-title-copy");
+  const apply_view_edit_main_after_duplicate_simple =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_main_after_duplicate_simple._result._view._children.map((child: any) => child._id),
+    ["main-title", "main-title-copy", "toolbar-ref"],
+  );
+  assert.deepEqual(
+    apply_view_edit_main_after_duplicate_simple._result._view._children[1],
+    {
+      _id: "main-title-copy",
+      _type: "label",
+      _text: "JSON Title",
+      class: "json-title",
+      _style: {
+        color: "purple",
+      },
+    },
+  );
+
+  const apply_view_edit_toolbar_before_xvm_duplicate =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  const apply_view_edit_toolbar_before_xvm_duplicate_json =
+    JSON.stringify(apply_view_edit_toolbar_before_xvm_duplicate._result._view);
+  const apply_view_edit_duplicate_xvm_view_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "duplicate-object",
+        _target_id: "toolbar-ref",
+        _target_type: "xvm-view",
+        _before_id: "main-title-copy",
+      },
+    });
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._ok, true);
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._mutation_action, "duplicate-object");
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._original_target_id, "toolbar-ref");
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._new_target_id, "toolbar-ref-copy");
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._before_id, "main-title-copy");
+  assert.equal(apply_view_edit_duplicate_xvm_view_result._insert_index, 1);
+  const apply_view_edit_main_after_duplicate_xvm_view =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_main_after_duplicate_xvm_view._result._view._children.map((child: any) => child._id),
+    ["main-title", "toolbar-ref-copy", "main-title-copy", "toolbar-ref"],
+  );
+  assert.deepEqual(
+    apply_view_edit_main_after_duplicate_xvm_view._result._view._children[1],
+    {
+      _id: "toolbar-ref-copy",
+      _type: "xvm-view",
+      _view_id: "page-toolbar",
+    },
+  );
+  const apply_view_edit_toolbar_after_xvm_duplicate =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.equal(
+    JSON.stringify(apply_view_edit_toolbar_after_xvm_duplicate._result._view),
+    apply_view_edit_toolbar_before_xvm_duplicate_json,
+  );
+
+  const apply_view_edit_duplicate_subtree_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "duplicate-object",
+        _target_id: "toolbar-group",
+        _target_type: "toolbar",
+      },
+    });
+  assert.equal(apply_view_edit_duplicate_subtree_result._ok, true);
+  assert.equal(apply_view_edit_duplicate_subtree_result._mutation_action, "duplicate-object");
+  assert.equal(apply_view_edit_duplicate_subtree_result._original_target_id, "toolbar-group");
+  assert.equal(apply_view_edit_duplicate_subtree_result._new_target_id, "toolbar-group-copy");
+  assert.equal(apply_view_edit_duplicate_subtree_result._insert_index, 2);
+  assert.equal(apply_view_edit_duplicate_subtree_result._parent_id, "page-toolbar");
+  const apply_view_edit_toolbar_after_duplicate_subtree =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_duplicate_subtree._result._view._children.map((child: any) => child._id),
+    ["settings-button", "toolbar-group", "toolbar-group-copy", "toolbar-button"],
+  );
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_duplicate_subtree._result._view._children[2],
+    {
+      _id: "toolbar-group-copy",
+      _type: "toolbar",
+      _children: [
+        {
+          _id: "nested-action-copy",
+          _type: "button",
+          _text: "Nested",
+        },
+      ],
+    },
+  );
+
+  const apply_view_edit_push_count_before_duplicate_different_parent =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_duplicate_different_parent_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "duplicate-object",
+        _target_id: "nested-action",
+        _target_type: "button",
+        _before_id: "settings-button",
+      },
+    });
+  assert.equal(apply_view_edit_duplicate_different_parent_result._ok, false);
+  assert.equal(apply_view_edit_duplicate_different_parent_result._reason, "different_parent");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_duplicate_different_parent,
+  );
+
+  const apply_view_edit_push_count_before_root_duplicate =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_root_duplicate_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "duplicate-object",
+        _target_id: "page-toolbar",
+        _target_type: "view",
+      },
+    });
+  assert.equal(apply_view_edit_root_duplicate_result._ok, false);
+  assert.equal(apply_view_edit_root_duplicate_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_duplicate,
+  );
+
+  const apply_view_edit_push_count_before_missing_duplicate =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_duplicate_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "duplicate-object",
+        _target_id: "missing-duplicate",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_missing_duplicate_result._ok, false);
+  assert.equal(apply_view_edit_missing_duplicate_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_duplicate,
+  );
+
+  const apply_view_edit_push_count_before_root_replace =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_root_replace_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "replace-object",
+        _target_id: "main",
+        _target_type: "view",
+        _object_value: {
+          _id: "main",
+          _type: "view",
+          _children: [],
+        },
+      },
+    });
+  assert.equal(apply_view_edit_root_replace_result._ok, false);
+  assert.equal(apply_view_edit_root_replace_result._reason, "target_is_root");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_root_replace,
+  );
+
+  const apply_view_edit_push_count_before_type_mismatch =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_type_mismatch_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "replace-object",
+        _target_id: "main-title",
+        _target_type: "label",
+        _object_value: {
+          _id: "main-title",
+          _type: "button",
+          _text: "Wrong Type",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_type_mismatch_result._ok, false);
+  assert.equal(apply_view_edit_type_mismatch_result._reason, "object_type_mismatch");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_type_mismatch,
+  );
+
+  const apply_view_edit_push_count_before_unsupported =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_unsupported_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _edit_action: "set-property",
+        _target_id: "missing-title",
+        _target_type: "label",
+        _property_name: "_text",
+        _property_value: "Should Not Persist",
+      },
+    });
+  assert.equal(apply_view_edit_unsupported_result._ok, false);
+  assert.equal(apply_view_edit_unsupported_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_unsupported,
+  );
+  assert.equal(apply_view_edit_xai_generate_count, 0);
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getModule = original_get_module;
+  await rm(apply_view_edit_work_folder, { recursive: true, force: true });
 }
 
 const artifact_delete_archive_work_folder =

@@ -270,7 +270,7 @@ const ARTIFACT_TARGET_PLURALS: Record<string, XVibeArtifactIntentTarget> = {
 };
 const ARTIFACT_INTENT_TOKEN_PATTERN = String.raw`("[^"]+"|'[^']+'|[a-z][a-z0-9_-]*)`;
 const VIEW_EDIT_OBJECT_NOUN_PATTERN =
-  String.raw`(?:button|buttons|input|inputs|label|labels|field|fields|form|forms|card|cards|table|tables|row|rows|column|columns|toolbar|toolbars|sidebar|sidebars|modal|modals|drawer|drawers|section|sections|xsection|xsections|text|title|titles|heading|headings|image|images|icon|icons|link|links)`;
+  String.raw`(?:button|buttons|input|inputs|label|labels|field|fields|form|forms|card|cards|table|tables|row|rows|column|columns|toolbar|toolbars|sidebar|sidebars|modal|modals|drawer|drawers|section|sections|xsection|xsections|text|title|titles|heading|headings|image|images|icon|icons|link|links|object|objects)`;
 const VIEW_EDIT_STYLE_PROPERTY_ALIASES: Array<[string, string]> = [
   ["background color", "background-color"],
   ["border radius", "border-radius"],
@@ -793,12 +793,14 @@ function normalize_view_edit_target_type(value: string | undefined): string | un
   if (normalized === "texts") return "text";
   if (normalized === "titles") return "title";
   if (normalized === "headings") return "heading";
+  if (normalized === "objects") return "object";
   if (
     normalized === "button" ||
     normalized === "label" ||
     normalized === "text" ||
     normalized === "title" ||
-    normalized === "heading"
+    normalized === "heading" ||
+    normalized === "object"
   ) {
     return normalized;
   }
@@ -961,6 +963,39 @@ function extract_move_edit_metadata(
   }
 
   return undefined;
+}
+
+function extract_view_edit_id_target(
+  prompt: string,
+  edit_action: XVibeResolvedTask["_edit_action"],
+): Pick<XVibeResolvedTask, "_edit_target_id" | "_edit_target_type"> | undefined {
+  const verb_pattern =
+    edit_action === "remove"
+      ? String.raw`(?:delete|remove)`
+      : edit_action === "hide"
+        ? String.raw`hide`
+        : edit_action === "show"
+          ? String.raw`(?:show|unhide)`
+          : undefined;
+  if (!verb_pattern) return undefined;
+
+  const match =
+    prompt.match(
+      new RegExp(
+        String.raw`\b${verb_pattern}\s+(?:the\s+)?(${VIEW_EDIT_OBJECT_NOUN_PATTERN})\s+id\s+([a-z][a-z0-9_-]*)\b`,
+        "iu",
+      ),
+    );
+  const target_id =
+    normalize_resolved_task_target_id(match?.[2]);
+  const target_type =
+    normalize_view_edit_target_type(match?.[1]);
+  if (!target_id || !target_type) return undefined;
+
+  return {
+    _edit_target_id: target_id,
+    _edit_target_type: target_type,
+  };
 }
 
 function extract_style_edit_metadata(
@@ -1240,6 +1275,12 @@ function extract_view_edit_metadata(prompt: string): Pick<XVibeResolvedTask, "_e
   const class_edit = extract_class_edit_metadata(prompt, edit_action);
   if (class_edit) {
     Object.assign(metadata, class_edit);
+    return metadata;
+  }
+
+  const explicit_id_target = extract_view_edit_id_target(prompt, edit_action);
+  if (explicit_id_target) {
+    Object.assign(metadata, explicit_id_target);
     return metadata;
   }
 
