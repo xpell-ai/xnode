@@ -1,8 +1,10 @@
 export interface XAIInput {
-
   prompt: string;
   system?: string;
   context?: any;
+  model?: string;
+  _task?: string;
+  _capability?: string;
   response_format?: {
     type: "text" | "json_object";
   };

@@ -72,6 +72,8 @@ export const XAI_OPS: Record<string, XpellSkillCommand> = {
       "Generate text or structured output using the configured AI provider.",
     _params: {
       _prompt: "Primary user prompt.",
+      _task: "Optional generation task hint.",
+      _capability: "Optional provider capability hint.",
       system: "Optional system prompt.",
       context: "Optional contextual data.",
       _provider: "Optional provider override.",
@@ -272,6 +274,14 @@ export class XAIModule extends XModule {
     const result =
       await provider.generate({
         prompt,
+        _task:
+          as_optional_string(
+            params._task
+          ),
+        _capability:
+          as_optional_string(
+            params._capability
+          ),
         system:
           as_optional_string(
             params.system

@@ -1,0 +1,133 @@
+import { _xlog, _xu } from "@xpell/core";
+import type {
+  XVibeIntentEngineRequest,
+  XVibeIntentEngineResponse,
+  XVibeIntentResult,
+} from "./XVibeTypes.js";
+import { DeterministicIntentProcessor } from "./Processors/DeterministicIntentProcessor.js";
+import {
+  SemanticIntentProcessor,
+  type XVibeSemanticIntentGenerateJson,
+} from "./Processors/SemanticIntentProcessor.js";
+import type { XVibeIntentProcessor } from "./Processors/XVibeIntentProcessor.js";
+
+export type XVibeIntentEngineOptions = {
+  _semantic_generate_json?: XVibeSemanticIntentGenerateJson;
+};
+
+export class XVibeIntentEngine {
+  private readonly processors: XVibeIntentProcessor[];
+
+  constructor(options: XVibeIntentEngineOptions = {}) {
+    this.processors = [
+      new DeterministicIntentProcessor(),
+      new SemanticIntentProcessor({
+        _generate_json: options._semantic_generate_json,
+      }),
+    ];
+  }
+
+  async analyze(
+    request: XVibeIntentEngineRequest,
+  ): Promise<XVibeIntentEngineResponse> {
+    const started_at = Date.now();
+    const processor_chain = this.processor_chain();
+    const validation_error = this.validate_request(request);
+    if (validation_error) {
+      return {
+        _ok: false,
+        _error: "invalid_intent_request",
+        _reason: validation_error,
+        _processor_chain: processor_chain,
+        _duration_ms: Date.now() - started_at,
+      };
+    }
+
+    for (const processor of this.processors) {
+      const processor_started_at = Date.now();
+      const processor_name = this.processor_name(processor);
+      const intent = await processor.analyze(request);
+      const processor_duration_ms =
+        Date.now() - processor_started_at;
+      if (intent) {
+        _xlog.log("[xvibe] processor matched", {
+          _processor: processor_name,
+          _duration_ms: processor_duration_ms,
+        });
+        return {
+          _ok: true,
+          _intent: intent,
+          _processor: processor_name,
+          _processor_chain: processor_chain,
+          _duration_ms: Date.now() - started_at,
+        };
+      }
+
+      _xlog.log("[xvibe] processor returned null", {
+        _processor: processor_name,
+        _reason: this.processor_diagnostic_reason(processor),
+        _duration_ms: processor_duration_ms,
+      });
+    }
+
+    _xlog.log("[xvibe] processor fallback", {
+      _processor_chain: processor_chain,
+    });
+    return {
+      _ok: true,
+      _intent: this.stub_conversation_intent(),
+      _processor_chain: processor_chain,
+      _duration_ms: Date.now() - started_at,
+    };
+  }
+
+  private processor_chain(): string[] {
+    return this.processors.map((processor) =>
+      this.processor_name(processor),
+    );
+  }
+
+  private processor_name(processor: XVibeIntentProcessor): string {
+    return processor.constructor?.name || "XVibeIntentProcessor";
+  }
+
+  private processor_diagnostic_reason(processor: XVibeIntentProcessor): string {
+    return processor._diagnostic_reason?.() ?? "processor_returned_null";
+  }
+
+  private stub_conversation_intent(): XVibeIntentResult {
+    return {
+      _message_type: "conversation",
+      _execution_level: "none",
+      _should_mutate: false,
+      _confidence: 0,
+      _reason: "stub_intent_engine",
+      _actions: [],
+      _warnings: [],
+    };
+  }
+
+  private validate_request(request: XVibeIntentEngineRequest): string | null {
+    if (!_xu.is_plain_object(request)) {
+      return "request must be an object";
+    }
+
+    if (typeof request._message !== "string") {
+      return "_message must be string";
+    }
+
+    if (!_xu.is_plain_object(request._runtime_context)) {
+      return "_runtime_context required";
+    }
+
+    if (!_xu.is_non_empty_string(request._runtime_context._app_id)) {
+      return "_runtime_context._app_id required";
+    }
+
+    if (!_xu.is_non_empty_string(request._runtime_context._env)) {
+      return "_runtime_context._env required";
+    }
+
+    return null;
+  }
+}

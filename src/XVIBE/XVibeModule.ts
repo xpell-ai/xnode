@@ -36,6 +36,8 @@ import type {
   XVibeInferredArtifactPlan,
   XVibeInferredArtifactType,
   XVibeResolvedTask,
+  XVibeIntentResult,
+  XVibeIntentRuntimeContext,
   XVibeRuntimeAssetRef,
   XVibeRuntimeAssets,
   XVibeRuntimePlan,
@@ -61,6 +63,7 @@ import {
   VibeBehaviorPlanner,
   type VibeBehaviorIntent,
 } from "./VibeBehaviorPlanner.js";
+import { XVibeIntentEngine } from "./XVibeIntentEngine.js";
 
 type VibeAIMode = "full" | "refine";
 const DEFAULT_ENV = "default";
@@ -80,6 +83,24 @@ const XVIBE_STARTER_COPY_FAILED = "E_XVIBE_STARTER_COPY_FAILED";
 const XVIBE_STARTER_LOAD_FAILED = "E_XVIBE_STARTER_LOAD_FAILED";
 const XVIBE_RUN_NOT_FOUND = "E_XVIBE_RUN_NOT_FOUND";
 const XVIBE_INVALID_GENERATION_ID = "E_XVIBE_INVALID_GENERATION_ID";
+const XVIBE_INVALID_CONVERSATION_ID = "E_XVIBE_INVALID_CONVERSATION_ID";
+const XVIBE_CONVERSATION_NOT_FOUND = "E_XVIBE_CONVERSATION_NOT_FOUND";
+const XVIBE_CONVERSATION_ALREADY_EXISTS = "E_XVIBE_CONVERSATION_ALREADY_EXISTS";
+const XVIBE_INVALID_CONVERSATION_MESSAGE = "E_XVIBE_INVALID_CONVERSATION_MESSAGE";
+const XVIBE_CONVERSATION_MESSAGE_NOT_FOUND = "E_XVIBE_CONVERSATION_MESSAGE_NOT_FOUND";
+const XVIBE_INVALID_CONVERSATION_ACTION = "E_XVIBE_INVALID_CONVERSATION_ACTION";
+const XVIBE_CONVERSATION_ACTION_NOT_FOUND = "E_XVIBE_CONVERSATION_ACTION_NOT_FOUND";
+const XVIBE_INVALID_CONVERSATION_ACTION_STATUS = "E_XVIBE_INVALID_CONVERSATION_ACTION_STATUS";
+const XVIBE_INVALID_INTENT_REQUEST = "E_XVIBE_INVALID_INTENT_REQUEST";
+const XVIBE_CONVERSATION_STORAGE_FAILED = "E_XVIBE_CONVERSATION_STORAGE_FAILED";
+const XVIBE_CONVERSATION_LAST_MESSAGES_MAX_LIMIT = 100;
+const XVIBE_CONVERSATION_ACTION_STATUSES = new Set([
+  "suggested",
+  "running",
+  "done",
+  "failed",
+  "dismissed",
+]);
 const BUILTIN_SERVER_MODULES = new Set([
   "xvm",
   "xd",
@@ -410,6 +431,56 @@ type XVibeRunDiagnosticResult = {
     _file: string;
     _message: string;
   }>;
+};
+
+type XVibeConversationRole = "user" | "assistant" | "system" | "tool";
+
+type XVibeConversationActionStatus =
+  | "suggested"
+  | "running"
+  | "done"
+  | "failed"
+  | "dismissed";
+
+type XVibeConversationMessage = XVibeJsonObject & {
+  _id: string;
+  _role: XVibeConversationRole;
+  _text: string;
+  _created_at: string;
+  _attachments?: unknown;
+  _intent?: unknown;
+  _actions?: unknown;
+  _result?: unknown;
+  _metadata?: unknown;
+};
+
+type XVibeConversationDocument = XVibeJsonObject & {
+  _id: string;
+  _app_id: string;
+  _env: string;
+  _created_at: string;
+  _updated_at: string;
+  _message_count: number;
+  _title?: string;
+  _metadata?: unknown;
+};
+
+type XVibeConversationIndexEntry = XVibeJsonObject & {
+  _id: string;
+  _created_at: string;
+  _updated_at: string;
+  _message_count: number;
+  _last_message_at?: string;
+  _title?: string;
+  _metadata?: unknown;
+};
+
+type XVibeConversationIndex = XVibeJsonObject & {
+  _version: 1;
+  _app_id: string;
+  _env: string;
+  _updated_at: string;
+  _conversations: XVibeConversationIndexEntry[];
 };
 
 type XVibeRuntimeRegistry = {
@@ -2654,6 +2725,22 @@ function resolve_target_app_dir(env: string, app_id: string): string {
   return app_dir;
 }
 
+function resolve_conversations_dir(input: {
+  _app_id: string;
+  _env: string;
+}): string {
+  const app_dir = resolve_target_app_dir(input._env, input._app_id);
+  const conversations_dir = path.resolve(app_dir, "conversations");
+  assert_path_inside(
+    app_dir,
+    conversations_dir,
+    XVIBE_INVALID_APP_ID,
+    "Invalid conversations path",
+  );
+
+  return conversations_dir;
+}
+
 function read_json_object_file(file_path: string, code: string, message: string): XVibeJsonObject {
   try {
     const parsed = JSON.parse(fs.readFileSync(file_path, "utf-8"));
@@ -2672,6 +2759,516 @@ function read_json_object_file(file_path: string, code: string, message: string)
 
 function write_json_object_file(file_path: string, value: XVibeJsonObject): void {
   fs.writeFileSync(file_path, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+}
+
+function conversation_index_path(conversations_dir: string): string {
+  const index_path = path.resolve(conversations_dir, "index.json");
+  assert_path_inside(
+    conversations_dir,
+    index_path,
+    XVIBE_CONVERSATION_STORAGE_FAILED,
+    "Invalid conversation index path",
+  );
+
+  return index_path;
+}
+
+function conversation_dir_path(conversations_dir: string, conversation_id: string): string {
+  const conversation_dir = path.resolve(conversations_dir, conversation_id);
+  assert_path_inside(
+    conversations_dir,
+    conversation_dir,
+    XVIBE_INVALID_CONVERSATION_ID,
+    "Invalid conversation path",
+  );
+
+  return conversation_dir;
+}
+
+function normalize_safe_conversation_id(value: unknown): string {
+  if (value === undefined || value === null) {
+    return `conv-${safe_short_id()}`;
+  }
+
+  return read_safe_path_segment(
+    value,
+    "_conversation_id",
+    XVIBE_INVALID_CONVERSATION_ID,
+  );
+}
+
+function is_json_compatible_value(value: unknown): boolean {
+  if (value === null) return true;
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return Number.isFinite(value as number) || typeof value !== "number";
+  }
+  if (Array.isArray(value)) {
+    return value.every((item) => item !== undefined && is_json_compatible_value(item));
+  }
+  if (_xu.is_plain_object(value)) {
+    return Object.values(value).every((item) => item !== undefined && is_json_compatible_value(item));
+  }
+
+  return false;
+}
+
+function read_optional_json_value(
+  value: unknown,
+  field_name: string,
+  code = XVIBE_INVALID_CONVERSATION_MESSAGE,
+): unknown {
+  if (value === undefined) return undefined;
+  if (!is_json_compatible_value(value)) {
+    throw_explicit_error(
+      code,
+      `Invalid '${field_name}': expected JSON-compatible value`,
+    );
+  }
+
+  return value;
+}
+
+function read_optional_json_object(
+  value: unknown,
+  field_name: string,
+  code: string,
+): XVibeJsonObject | undefined {
+  if (value === undefined) return undefined;
+  if (!_xu.is_plain_object(value) || !is_json_compatible_value(value)) {
+    throw_explicit_error(
+      code,
+      `Invalid '${field_name}': expected JSON-compatible object`,
+    );
+  }
+
+  return value as XVibeJsonObject;
+}
+
+function read_optional_conversation_action_error(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw_explicit_error(
+      XVIBE_INVALID_CONVERSATION_ACTION,
+      "Invalid '_error': expected string",
+    );
+  }
+
+  return value;
+}
+
+function read_conversation_action_status(value: unknown): XVibeConversationActionStatus {
+  if (
+    typeof value !== "string" ||
+    !XVIBE_CONVERSATION_ACTION_STATUSES.has(value)
+  ) {
+    throw_explicit_error(
+      XVIBE_INVALID_CONVERSATION_ACTION_STATUS,
+      "Invalid '_status': expected suggested, running, done, failed, or dismissed",
+    );
+  }
+
+  return value as XVibeConversationActionStatus;
+}
+
+function read_conversation_index(
+  conversations_dir: string,
+  app_id: string,
+  env: string,
+): XVibeConversationIndex {
+  const index_file = conversation_index_path(conversations_dir);
+  if (!fs.existsSync(index_file)) {
+    return {
+      _version: 1,
+      _app_id: app_id,
+      _env: env,
+      _updated_at: new Date().toISOString(),
+      _conversations: [],
+    };
+  }
+
+  const parsed =
+    read_json_object_file(
+      index_file,
+      XVIBE_CONVERSATION_STORAGE_FAILED,
+      "Conversation index is invalid",
+    );
+  const conversations =
+    Array.isArray(parsed._conversations)
+      ? parsed._conversations.filter((item) => _xu.is_plain_object(item)) as XVibeConversationIndexEntry[]
+      : [];
+
+  return {
+    _version: 1,
+    _app_id: typeof parsed._app_id === "string" ? parsed._app_id : app_id,
+    _env: typeof parsed._env === "string" ? parsed._env : env,
+    _updated_at:
+      typeof parsed._updated_at === "string"
+        ? parsed._updated_at
+        : new Date().toISOString(),
+    _conversations: conversations,
+  };
+}
+
+function write_conversation_index(
+  conversations_dir: string,
+  index: XVibeConversationIndex,
+): void {
+  fs.mkdirSync(conversations_dir, { recursive: true });
+  const index_path = conversation_index_path(conversations_dir);
+  const temp_path = path.resolve(
+    conversations_dir,
+    `.index.${Date.now()}-${safe_short_id()}.tmp`,
+  );
+  assert_path_inside(
+    conversations_dir,
+    temp_path,
+    XVIBE_CONVERSATION_STORAGE_FAILED,
+    "Invalid conversation index temp path",
+  );
+  fs.writeFileSync(temp_path, `${JSON.stringify(index, null, 2)}\n`, "utf-8");
+  fs.renameSync(temp_path, index_path);
+}
+
+function read_conversation_index_safe(
+  conversations_dir: string,
+  app_id: string,
+  env: string,
+): { _index: XVibeConversationIndex; _recovered: boolean; _error?: string } {
+  try {
+    return {
+      _index: read_conversation_index(conversations_dir, app_id, env),
+      _recovered: false,
+    };
+  } catch (error) {
+    return {
+      _index: {
+        _version: 1,
+        _app_id: app_id,
+        _env: env,
+        _updated_at: new Date().toISOString(),
+        _conversations: [],
+      },
+      _recovered: true,
+      _error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function conversation_index_entry(
+  conversation: XVibeConversationDocument,
+): XVibeConversationIndexEntry {
+  return {
+    _id: conversation._id,
+    _created_at: conversation._created_at,
+    _updated_at: conversation._updated_at,
+    _message_count: conversation._message_count,
+    ...(typeof conversation._last_message_at === "string"
+      ? { _last_message_at: conversation._last_message_at }
+      : {}),
+    ...(typeof conversation._title === "string" ? { _title: conversation._title } : {}),
+    ...(conversation._metadata !== undefined ? { _metadata: conversation._metadata } : {}),
+  };
+}
+
+function upsert_conversation_index_entry(
+  index: XVibeConversationIndex,
+  conversation: XVibeConversationDocument,
+): XVibeConversationIndex {
+  const entry = conversation_index_entry(conversation);
+  const entries =
+    index._conversations.filter((item) => item._id !== conversation._id);
+  entries.push(entry);
+  entries.sort((a, b) => String(b._updated_at).localeCompare(String(a._updated_at)));
+
+  return {
+    ...index,
+    _updated_at: conversation._updated_at,
+    _conversations: entries,
+  };
+}
+
+function read_conversation_document(
+  conversation_dir: string,
+): XVibeConversationDocument {
+  const conversation =
+    read_json_object_file(
+      path.join(conversation_dir, "conversation.json"),
+      XVIBE_CONVERSATION_NOT_FOUND,
+      "Conversation not found",
+    );
+
+  if (
+    typeof conversation._id !== "string" ||
+    typeof conversation._app_id !== "string" ||
+    typeof conversation._env !== "string" ||
+    typeof conversation._created_at !== "string" ||
+    typeof conversation._updated_at !== "string" ||
+    typeof conversation._message_count !== "number"
+  ) {
+    throw_explicit_error(
+      XVIBE_CONVERSATION_STORAGE_FAILED,
+      "Conversation file is invalid",
+    );
+  }
+
+  return conversation as XVibeConversationDocument;
+}
+
+function read_conversation_messages(
+  conversation_dir: string,
+): XVibeConversationMessage[] {
+  const messages_file = path.join(conversation_dir, "messages.jsonl");
+  if (!fs.existsSync(messages_file)) {
+    return [];
+  }
+
+  const content = fs.readFileSync(messages_file, "utf-8");
+  return content
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line) as XVibeConversationMessage);
+}
+
+function write_conversation_messages(
+  conversation_dir: string,
+  messages: XVibeConversationMessage[],
+): void {
+  const messages_file = path.resolve(conversation_dir, "messages.jsonl");
+  assert_path_inside(
+    conversation_dir,
+    messages_file,
+    XVIBE_CONVERSATION_STORAGE_FAILED,
+    "Invalid conversation messages path",
+  );
+
+  const temp_path = path.resolve(
+    conversation_dir,
+    `.messages.${Date.now()}-${safe_short_id()}.jsonl.tmp`,
+  );
+  assert_path_inside(
+    conversation_dir,
+    temp_path,
+    XVIBE_CONVERSATION_STORAGE_FAILED,
+    "Invalid conversation messages temp path",
+  );
+
+  const content =
+    messages.length > 0
+      ? `${messages.map((message) => JSON.stringify(message)).join("\n")}\n`
+      : "";
+  fs.writeFileSync(temp_path, content, "utf-8");
+  fs.renameSync(temp_path, messages_file);
+}
+
+function normalize_conversation_message(value: unknown): XVibeConversationMessage {
+  const source = _xu.is_plain_object(value) ? value : {};
+  const role = source._role;
+  if (
+    role !== "user" &&
+    role !== "assistant" &&
+    role !== "system" &&
+    role !== "tool"
+  ) {
+    throw_explicit_error(
+      XVIBE_INVALID_CONVERSATION_MESSAGE,
+      "Invalid '_role': expected user, assistant, system, or tool",
+    );
+  }
+
+  if (typeof source._text !== "string") {
+    throw_explicit_error(
+      XVIBE_INVALID_CONVERSATION_MESSAGE,
+      "Invalid '_text': expected string",
+    );
+  }
+
+  const created_at =
+    typeof source._created_at === "string" && source._created_at.trim()
+      ? source._created_at.trim()
+      : new Date().toISOString();
+  const id =
+    typeof source._id === "string" && source._id.trim()
+      ? read_safe_path_segment(source._id, "_id", XVIBE_INVALID_CONVERSATION_MESSAGE)
+      : `msg-${safe_short_id()}`;
+
+  return {
+    _id: id,
+    _role: role,
+    _text: source._text,
+    _created_at: created_at,
+    ...(source._attachments !== undefined
+      ? { _attachments: read_optional_json_value(source._attachments, "_attachments") }
+      : {}),
+    ...(source._intent !== undefined
+      ? { _intent: read_optional_json_value(source._intent, "_intent") }
+      : {}),
+    ...(source._actions !== undefined
+      ? { _actions: read_optional_json_value(source._actions, "_actions") }
+      : {}),
+    ...(source._result !== undefined
+      ? { _result: read_optional_json_value(source._result, "_result") }
+      : {}),
+    ...(source._metadata !== undefined
+      ? { _metadata: read_optional_json_value(source._metadata, "_metadata") }
+      : {}),
+  };
+}
+
+function normalize_intent_action_ids(intent: XVibeIntentResult | undefined): void {
+  if (!intent || !Array.isArray(intent._actions)) {
+    return;
+  }
+
+  let normalized = false;
+  const action_ids: string[] = [];
+  for (const [index, action] of intent._actions.entries()) {
+    if (!_xu.is_plain_object(action)) {
+      continue;
+    }
+
+    if (typeof action._id !== "string" || action._id.trim().length === 0) {
+      action._id = `action-${index + 1}`;
+      normalized = true;
+    }
+
+    action_ids.push(String(action._id));
+  }
+
+  if (normalized) {
+    _xlog.log("[xvibe] intent action ids normalized", {
+      _action_ids: action_ids,
+    });
+  }
+}
+
+function read_optional_intent_context_string(
+  value: unknown,
+  field_name: string,
+): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw_explicit_error(
+      XVIBE_INVALID_INTENT_REQUEST,
+      `Invalid '${field_name}': expected non-empty string`,
+    );
+  }
+
+  return value.trim();
+}
+
+function read_optional_intent_context_string_array(
+  value: unknown,
+  field_name: string,
+): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    throw_explicit_error(
+      XVIBE_INVALID_INTENT_REQUEST,
+      `Invalid '${field_name}': expected string array`,
+    );
+  }
+
+  return value.map((item) => {
+    if (typeof item !== "string" || item.trim().length === 0) {
+      throw_explicit_error(
+        XVIBE_INVALID_INTENT_REQUEST,
+        `Invalid '${field_name}': expected string array`,
+      );
+    }
+
+    return item.trim();
+  });
+}
+
+function normalize_analyze_message_runtime_context(input: {
+  _app_id: string;
+  _env: string;
+  _conversation_id: string;
+  _runtime_context?: unknown;
+}): XVibeIntentRuntimeContext {
+  const context: XVibeIntentRuntimeContext = {
+    _app_id: input._app_id,
+    _env: input._env,
+    _conversation_id: input._conversation_id,
+  };
+
+  if (input._runtime_context === undefined || input._runtime_context === null) {
+    return context;
+  }
+
+  if (!_xu.is_plain_object(input._runtime_context)) {
+    throw_explicit_error(
+      XVIBE_INVALID_INTENT_REQUEST,
+      "Invalid '_runtime_context': expected object",
+    );
+  }
+
+  const active_view_id =
+    read_optional_intent_context_string(
+      input._runtime_context._active_view_id,
+      "_runtime_context._active_view_id",
+    );
+  if (active_view_id) {
+    context._active_view_id = active_view_id;
+  }
+
+  if (input._runtime_context._selected_object !== undefined) {
+    if (!_xu.is_plain_object(input._runtime_context._selected_object)) {
+      throw_explicit_error(
+        XVIBE_INVALID_INTENT_REQUEST,
+        "Invalid '_runtime_context._selected_object': expected object",
+      );
+    }
+
+    context._selected_object = read_optional_json_value(
+      input._runtime_context._selected_object,
+      "_runtime_context._selected_object",
+      XVIBE_INVALID_INTENT_REQUEST,
+    ) as Record<string, any>;
+  }
+
+  if (input._runtime_context._available_artifacts !== undefined) {
+    if (!_xu.is_plain_object(input._runtime_context._available_artifacts)) {
+      throw_explicit_error(
+        XVIBE_INVALID_INTENT_REQUEST,
+        "Invalid '_runtime_context._available_artifacts': expected object",
+      );
+    }
+
+    const available_artifacts: NonNullable<XVibeIntentRuntimeContext["_available_artifacts"]> = {};
+    const views =
+      read_optional_intent_context_string_array(
+        input._runtime_context._available_artifacts._views,
+        "_runtime_context._available_artifacts._views",
+      );
+    const entities =
+      read_optional_intent_context_string_array(
+        input._runtime_context._available_artifacts._entities,
+        "_runtime_context._available_artifacts._entities",
+      );
+    const flows =
+      read_optional_intent_context_string_array(
+        input._runtime_context._available_artifacts._flows,
+        "_runtime_context._available_artifacts._flows",
+      );
+    const modules =
+      read_optional_intent_context_string_array(
+        input._runtime_context._available_artifacts._modules,
+        "_runtime_context._available_artifacts._modules",
+      );
+
+    if (views) available_artifacts._views = views;
+    if (entities) available_artifacts._entities = entities;
+    if (flows) available_artifacts._flows = flows;
+    if (modules) available_artifacts._modules = modules;
+    context._available_artifacts = available_artifacts;
+  }
+
+  return context;
 }
 
 function parser_diagnostic(error: unknown): XVibeParserDiagnostic | undefined {
@@ -7476,6 +8073,95 @@ export class XVibeModule extends XModule {
         _generation_id: "Optional generation id. When provided, loads that specific run."
       }
     },
+    "create-conversation": {
+      _name: "create-conversation",
+      _scope: "module",
+      _description:
+        "Create deterministic JSON/JSONL conversation storage for an app/env without AI routing.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _conversation_id: "Optional safe conversation id.",
+        _title: "Optional conversation title.",
+        _metadata: "Optional JSON-compatible metadata."
+      }
+    },
+    "list-conversations": {
+      _name: "list-conversations",
+      _scope: "module",
+      _description:
+        "List conversation summaries from the app/env conversation index.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default."
+      }
+    },
+    "get-conversation": {
+      _name: "get-conversation",
+      _scope: "module",
+      _description:
+        "Read a conversation document and its JSONL messages.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _conversation_id: "Conversation id."
+      }
+    },
+    "append-message": {
+      _name: "append-message",
+      _scope: "module",
+      _description:
+      "Append one JSON-compatible message line to a conversation messages.jsonl file.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _conversation_id: "Conversation id.",
+        _message: "Message object with _role and _text, or pass message fields at top level."
+      }
+    },
+    "analyze-message": {
+      _name: "analyze-message",
+      _scope: "module",
+      _description:
+        "Analyze one conversation message with the XVibe Intent Engine stub and append the result to the conversation.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _conversation_id: "Conversation id.",
+        _message_id: "Optional source message id.",
+        _message: "Message text to analyze.",
+        _runtime_context: "Optional runtime context for the intent engine."
+      }
+    },
+    "get-last-messages": {
+      _name: "get-last-messages",
+      _scope: "module",
+      _description:
+      "Return the last N messages from a conversation JSONL file.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _conversation_id: "Conversation id.",
+        _limit: "Optional number of messages. Default: 20."
+      }
+    },
+    "update-conversation-action": {
+      _name: "update-conversation-action",
+      _scope: "module",
+      _description:
+        "Persist one conversation intent action execution state in messages.jsonl without XDB.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _conversation_id: "Conversation id.",
+        _message_id: "Message id containing the intent action.",
+        _action_id: "Action id inside message._intent._actions.",
+        _status: "suggested, running, done, failed, or dismissed.",
+        _result: "Optional JSON-compatible action result object.",
+        _error: "Optional action error string.",
+        _metadata: "Optional JSON-compatible action metadata object."
+      }
+    },
     "sync-skills": {
       _name: "sync-skills",
       _scope: "module",
@@ -7496,6 +8182,7 @@ export class XVibeModule extends XModule {
   private readonly planner: XVibePlanner;
   private readonly intent_planner: VibeIntentPlanner;
   private readonly behavior_planner: VibeBehaviorPlanner;
+  private readonly intent_engine: XVibeIntentEngine;
   private readonly runtime_skills_by_scope = new Map<string, any>();
   private latest_runtime_skills: any = null;
 
@@ -7508,6 +8195,7 @@ export class XVibeModule extends XModule {
     this.planner = new XVibePlanner();
     this.intent_planner = new VibeIntentPlanner();
     this.behavior_planner = new VibeBehaviorPlanner();
+    this.intent_engine = new XVibeIntentEngine();
   }
 
   override async onLoad() {
@@ -13436,6 +14124,199 @@ export class XVibeModule extends XModule {
     throw new Error("Invalid '_object_value': expected object");
   }
 
+  private read_structured_source_view_id(params: XVibeJsonObject): string | undefined {
+    const direct_source_view_id =
+      read_optional_string(params._source_view_id, "_source_view_id");
+    if (direct_source_view_id) {
+      return direct_source_view_id;
+    }
+
+    if (_xu.is_plain_object(params._selected_object)) {
+      return read_optional_string(
+        params._selected_object._source_view_id,
+        "_selected_object._source_view_id",
+      );
+    }
+
+    if (_xu.is_plain_object(params._target)) {
+      return read_optional_string(
+        params._target._source_view_id,
+        "_target._source_view_id",
+      );
+    }
+
+    return undefined;
+  }
+
+  private async resolve_structured_view_edit_source(input: {
+    app_id: string;
+    env: string;
+    view_id: string;
+    source_view_id?: string;
+    current_view: XVibeJsonObject;
+    resolved_task: XVibeResolvedTask;
+    edit_intent: XVibeViewEditIntent;
+  }): Promise<XVibeDeterministicViewEditSourceResolution> {
+    if (input.source_view_id) {
+      if (input.source_view_id === input.view_id) {
+        const eligibility =
+          can_apply_deterministic_view_edit({
+            _resolved_task: input.resolved_task,
+            _current_view: input.current_view,
+            _edit_intent: input.edit_intent,
+          });
+
+        if (!eligibility._eligible) {
+          return {
+            _eligible: false,
+            _eligibility: eligibility,
+            _warnings: [],
+          };
+        }
+
+        return {
+          _eligible: true,
+          _view_id: input.view_id,
+          _view: input.current_view,
+          _resolved_via: "current-view",
+          _eligibility: eligibility,
+          _warnings: [],
+        };
+      }
+
+      const references =
+        await this.load_xvm_view_references_for_refine({
+          _app_id: input.app_id,
+          _env: input.env,
+          _view_id: input.view_id,
+          _current_view: input.current_view,
+        });
+      const source_view =
+        references._loaded_views.find((view) => view._view_id === input.source_view_id);
+
+      if (!references._referenced_view_ids.includes(input.source_view_id)) {
+        return {
+          _eligible: false,
+          _eligibility: {
+            _eligible: false,
+            _reason: "source_view_not_referenced",
+            _details: {
+              _view_id: input.view_id,
+              _source_view_id: input.source_view_id,
+              _referenced_view_ids: references._referenced_view_ids,
+            },
+          },
+          _warnings: references._warnings,
+        };
+      }
+
+      if (!source_view) {
+        return {
+          _eligible: false,
+          _eligibility: {
+            _eligible: false,
+            _reason: "source_view_not_loaded",
+            _details: {
+              _view_id: input.view_id,
+              _source_view_id: input.source_view_id,
+            },
+          },
+          _warnings: references._warnings,
+        };
+      }
+
+      const eligibility =
+        can_apply_deterministic_view_edit({
+          _resolved_task: input.resolved_task,
+          _current_view: source_view._view,
+          _edit_intent: input.edit_intent,
+        });
+
+      if (!eligibility._eligible) {
+        return {
+          _eligible: false,
+          _eligibility: eligibility,
+          _warnings: references._warnings,
+        };
+      }
+
+      return {
+        _eligible: true,
+        _view_id: input.source_view_id,
+        _view: source_view._view,
+        _resolved_via: "xvm-view",
+        _eligibility: eligibility,
+        _warnings: references._warnings,
+      };
+    }
+
+    const references =
+      await this.load_xvm_view_references_for_refine({
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _current_view: input.current_view,
+      });
+
+    return resolve_deterministic_view_edit_source({
+      _requested_view_id: input.view_id,
+      _current_view: input.current_view,
+      _referenced_views: references._loaded_views,
+      _reference_warnings: references._warnings,
+      _resolved_task: input.resolved_task,
+      _edit_intent: input.edit_intent,
+    });
+  }
+
+  private push_structured_view_edit_active_view_refresh(input: {
+    app_id: string;
+    env: string;
+    view_id: string;
+    source_view_id: string;
+    current_view: XVibeJsonObject;
+    version?: number;
+    generation_id?: string;
+    target_id: string;
+    edit_action: string;
+  }): void {
+    if (input.source_view_id === input.view_id) {
+      return;
+    }
+
+    try {
+      wsBroadcastScoped(input.app_id, input.env, {
+        _name: "xvm:update",
+        _args: [{
+          _app_id: input.app_id,
+          _env: input.env,
+          _view_id: input.view_id,
+          _view:
+            typeof input.current_view._id === "string"
+              ? input.current_view
+              : { ...input.current_view, _id: input.view_id },
+          ...(input.version !== undefined ? { _version: input.version } : {}),
+          ...(input.generation_id ? { _generation_id: input.generation_id } : {}),
+          _meta: {
+            _source: "xstudio:intent-action-refresh",
+            _force_refresh: true,
+            _source_view_id: input.source_view_id,
+            _persisted_view_id: input.source_view_id,
+            _target_id: input.target_id,
+            _edit_action: input.edit_action,
+          },
+        }],
+      });
+    } catch (error) {
+      _xlog.warn("[xvibe] structured view edit active view refresh failed", {
+        _app_id: input.app_id,
+        _env: input.env,
+        _view_id: input.view_id,
+        _source_view_id: input.source_view_id,
+        _error: error_summary(error),
+      });
+    }
+  }
+
   private build_structured_view_edit_task(input: {
     view_id: string;
     action: XVibeStructuredViewEditAction;
@@ -13664,6 +14545,7 @@ export class XVibeModule extends XModule {
       const action = this.read_structured_view_edit_action(params._edit_action);
       const target_id = read_required_string(params._target_id, "_target_id");
       const target_type = read_optional_string(params._target_type, "_target_type");
+      const requested_source_view_id = this.read_structured_source_view_id(params);
       const generation_id = read_optional_generation_id(params._generation_id) ?? safe_short_id();
       const task =
         this.build_structured_view_edit_task({
@@ -13679,6 +14561,9 @@ export class XVibeModule extends XModule {
         _app_id: app_id,
         _env: env,
         _view_id: view_id,
+        ...(requested_source_view_id && requested_source_view_id !== view_id
+          ? { _source_view_id: requested_source_view_id, _requested_view_id: view_id }
+          : {}),
         _mode: "refine",
         _artifact_type: "view",
         _created_at: archive_created_at,
@@ -13704,18 +14589,26 @@ export class XVibeModule extends XModule {
           _view_id: view_id,
         });
 
-      const eligibility =
-        can_apply_deterministic_view_edit({
-          _resolved_task: task.resolved_task,
-          _current_view: current_view,
-          _edit_intent: task.edit_intent,
+      const deterministic_source =
+        await this.resolve_structured_view_edit_source({
+          app_id,
+          env,
+          view_id,
+          ...(requested_source_view_id ? { source_view_id: requested_source_view_id } : {}),
+          current_view,
+          resolved_task: task.resolved_task,
+          edit_intent: task.edit_intent,
         });
+      const eligibility = deterministic_source._eligibility;
+      const source_view_id =
+        deterministic_source._eligible ? deterministic_source._view_id : requested_source_view_id ?? view_id;
 
       if (!eligibility._eligible) {
         _xlog.log("[xvibe] structured view edit not eligible", {
           _app_id: app_id,
           _env: env,
           _view_id: view_id,
+          ...(source_view_id !== view_id ? { _source_view_id: source_view_id } : {}),
           _action: action,
           _target_id: target_id,
           _reason: eligibility._reason,
@@ -13743,15 +14636,31 @@ export class XVibeModule extends XModule {
         "Applying deterministic view edit...",
         {
           _view_id: view_id,
+          _source_view_id: source_view_id,
           _action: eligibility._action,
           _target_id: eligibility._target_id,
         },
       );
 
+      _xlog.log("[xvibe] structured view edit source resolved", {
+        _app_id: app_id,
+        _env: env,
+        _view_id: view_id,
+        _source_view_id: source_view_id,
+        _persisted_view_id: source_view_id,
+        _target_id: eligibility._target_id ?? target_id,
+        _edit_action: eligibility._action ?? action,
+        ...(deterministic_source._eligible
+          ? { _resolved_via: deterministic_source._resolved_via }
+          : {}),
+      });
+
       const deterministic_result =
         apply_deterministic_view_edit({
           _resolved_task: task.resolved_task,
-          _current_view: current_view,
+          _current_view: deterministic_source._eligible
+            ? deterministic_source._view
+            : current_view,
           _edit_intent: task.edit_intent,
         });
 
@@ -13773,7 +14682,7 @@ export class XVibeModule extends XModule {
       const view_to_persist = deterministic_result._view as XVibeJsonObject;
       const mutated_view_id =
         typeof view_to_persist._id === "string" ? view_to_persist._id.trim() : "";
-      if (mutated_view_id !== view_id) {
+      if (mutated_view_id !== source_view_id) {
         return this.apply_view_edit_failure({
           code: "E_XVIBE_SOURCE_VIEW_PERSIST_MISMATCH",
           message: "Structured view edit attempted to persist a non-source view",
@@ -13785,6 +14694,7 @@ export class XVibeModule extends XModule {
           reason: "source_view_id_mismatch",
           details: {
             _requested_view_id: view_id,
+            _source_view_id: source_view_id,
             _view_id: mutated_view_id,
           },
           archive,
@@ -13795,6 +14705,12 @@ export class XVibeModule extends XModule {
         _eligible: true,
         _reason: eligibility._reason,
         ...deterministic_result._mutation,
+        _target_view_id: source_view_id,
+        _source_view_id: source_view_id,
+        _requested_view_id: view_id,
+        ...(deterministic_source._eligible && deterministic_source._resolved_via === "xvm-view"
+          ? { _resolved_via: "xvm-view" }
+          : {}),
       };
 
       record_archive_stage(
@@ -13804,6 +14720,8 @@ export class XVibeModule extends XModule {
         "Saving view...",
         {
           _view_id: view_id,
+          _source_view_id: source_view_id,
+          _persisted_view_id: source_view_id,
           _action: deterministic_result._mutation._action,
           _target_id: deterministic_result._mutation._target_id,
         },
@@ -13821,15 +14739,43 @@ export class XVibeModule extends XModule {
       } as any);
       const persisted_version =
         extract_persisted_version(persist_response);
+      this.push_structured_view_edit_active_view_refresh({
+        app_id,
+        env,
+        view_id,
+        source_view_id,
+        current_view,
+        ...(typeof persisted_version === "number" ? { version: persisted_version } : {}),
+        generation_id,
+        target_id,
+        edit_action: deterministic_result._mutation._action,
+      });
       const mutation_target_id =
         deterministic_result._mutation._target_id ?? target_id;
       const mutation = deterministic_result._mutation;
+      const persisted_view_id = source_view_id;
+
+      _xlog.log("[xvibe] structured view edit persisted source view", {
+        _app_id: app_id,
+        _env: env,
+        _view_id: view_id,
+        _source_view_id: source_view_id,
+        _persisted_view_id: persisted_view_id,
+        _target_id: mutation_target_id,
+        _edit_action: mutation._action,
+        ...(persisted_version !== undefined
+          ? { _persisted_version: persisted_version }
+          : {}),
+      });
       const result_details: XVibeJsonObject = {
         _ok: true,
         _artifact_type: "view",
-        _artifact_id: view_id,
+        _artifact_id: persisted_view_id,
         _view_id: view_id,
+        _source_view_id: source_view_id,
+        _persisted_view_id: persisted_view_id,
         _deterministic: true,
+        _edit_action: mutation._action,
         _mutation_action: mutation._action,
         _target_id: mutation_target_id,
         ...(typeof mutation._previous_index === "number"
@@ -13876,10 +14822,13 @@ export class XVibeModule extends XModule {
 
       archive._result = {
         _artifact_type: "view",
-        _artifact_id: view_id,
+        _artifact_id: persisted_view_id,
         _view_id: view_id,
+        _source_view_id: source_view_id,
+        _persisted_view_id: persisted_view_id,
         _success: true,
         _deterministic: true,
+        _edit_action: mutation._action,
         _mutation_action: mutation._action,
         _mutation_target_id: mutation_target_id,
         ...(typeof mutation._previous_index === "number"
@@ -13926,13 +14875,17 @@ export class XVibeModule extends XModule {
       _xem.fire("vibe:view-updated", {
         _app_id: app_id,
         _env: env,
-        _view_id: view_id,
+        _view_id: persisted_view_id,
+        _source_view_id: source_view_id,
+        _requested_view_id: view_id,
       });
 
       _xlog.log("[xvibe] structured view edit applied", {
         _app_id: app_id,
         _env: env,
         _view_id: view_id,
+        _source_view_id: source_view_id,
+        _persisted_view_id: persisted_view_id,
         _action: deterministic_result._mutation._action,
         _target_id: mutation_target_id,
       });
@@ -14345,6 +15298,562 @@ export class XVibeModule extends XModule {
       const message = error instanceof Error ? error.message : String(error);
       _xlog.error("[xvibe] create_app_from_starter failed", error);
       return explicit_error("E_XVIBE_CREATE_APP_FROM_STARTER_FAILED", message);
+    }
+  }
+
+
+  async _create_conversation(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_ALREADY_EXISTS,
+          `Conversation already exists: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      const now = new Date().toISOString();
+      const title = read_optional_string(params._title, "_title");
+      const metadata =
+        read_optional_json_value(
+          params._metadata,
+          "_metadata",
+          XVIBE_CONVERSATION_STORAGE_FAILED,
+        );
+      const conversation: XVibeConversationDocument = {
+        _id: conversation_id,
+        _app_id: app_id,
+        _env: env,
+        _created_at: now,
+        _updated_at: now,
+        _message_count: 0,
+        ...(title ? { _title: title } : {}),
+        ...(metadata !== undefined ? { _metadata: metadata } : {}),
+      };
+
+      fs.mkdirSync(path.join(conversation_dir, "attachments"), { recursive: true });
+      write_json_object_file(path.join(conversation_dir, "conversation.json"), conversation);
+      fs.writeFileSync(path.join(conversation_dir, "messages.jsonl"), "", "utf-8");
+
+      const index =
+        upsert_conversation_index_entry(
+          read_conversation_index(conversations_dir, app_id, env),
+          conversation,
+        );
+      write_conversation_index(conversations_dir, index);
+
+      return {
+        _ok: true,
+        _result: {
+          _conversation: conversation,
+          _path: path.posix.join(
+            "xvm",
+            "apps",
+            env,
+            app_id,
+            "conversations",
+            conversation_id,
+          ),
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] create_conversation failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] create_conversation failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  async _list_conversations(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      fs.mkdirSync(conversations_dir, { recursive: true });
+      const index_result = read_conversation_index_safe(conversations_dir, app_id, env);
+      const index = index_result._index;
+      write_conversation_index(conversations_dir, index);
+
+      return {
+        _ok: true,
+        _result: {
+          _app_id: app_id,
+          _env: env,
+          _conversations: index._conversations,
+          _count: index._conversations.length,
+          ...(index_result._recovered
+            ? {
+              _index_recovered: true,
+              _index_error: index_result._error,
+            }
+            : {}),
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] list_conversations failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] list_conversations failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  async _get_conversation(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (!fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_NOT_FOUND,
+          `Conversation not found: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      const conversation = read_conversation_document(conversation_dir);
+      const messages = read_conversation_messages(conversation_dir);
+
+      return {
+        _ok: true,
+        _result: {
+          _conversation: conversation,
+          _messages: messages,
+          _attachments_path: path.posix.join(
+            "xvm",
+            "apps",
+            env,
+            app_id,
+            "conversations",
+            conversation_id,
+            "attachments",
+          ),
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] get_conversation failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] get_conversation failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  async _append_message(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (!fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_NOT_FOUND,
+          `Conversation not found: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      const message =
+        normalize_conversation_message(
+          _xu.is_plain_object(params._message)
+            ? params._message
+            : params,
+        );
+      const conversation = read_conversation_document(conversation_dir);
+      const updated_conversation: XVibeConversationDocument = {
+        ...conversation,
+        _updated_at: message._created_at,
+        _last_message_at: message._created_at,
+        _message_count: conversation._message_count + 1,
+      };
+
+      fs.appendFileSync(
+        path.join(conversation_dir, "messages.jsonl"),
+        `${JSON.stringify(message)}\n`,
+        "utf-8",
+      );
+      write_json_object_file(
+        path.join(conversation_dir, "conversation.json"),
+        updated_conversation,
+      );
+      write_conversation_index(
+        conversations_dir,
+        upsert_conversation_index_entry(
+          read_conversation_index(conversations_dir, app_id, env),
+          updated_conversation,
+        ),
+      );
+
+      return {
+        _ok: true,
+        _result: {
+          _conversation: updated_conversation,
+          _message: message,
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] append_message failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] append_message failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  async _analyze_message(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env, "_env", XVIBE_INVALID_ENV);
+      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
+      if (typeof params._message !== "string") {
+        throw_explicit_error(
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+          "Invalid '_message': expected string",
+        );
+      }
+
+      const message_id =
+        read_optional_intent_context_string(params._message_id, "_message_id");
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (!fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_NOT_FOUND,
+          `Conversation not found: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      _xlog.log("[xvibe] analyze-message", {
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+      });
+
+      const runtime_context =
+        normalize_analyze_message_runtime_context({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _runtime_context: params._runtime_context,
+        });
+      const intent_result =
+        await this.intent_engine.analyze({
+          _message: params._message,
+          _conversation_id: conversation_id,
+          _runtime_context: runtime_context,
+          ...(message_id
+            ? {
+              _metadata: {
+                _message_id: message_id,
+              },
+            }
+            : {}),
+        });
+
+      if (!intent_result._ok) {
+        return explicit_error(
+          XVIBE_INVALID_INTENT_REQUEST,
+          intent_result._reason ?? "Invalid intent request",
+          {
+            _error: intent_result._error ?? "invalid_intent_request",
+          },
+        );
+      }
+
+      normalize_intent_action_ids(intent_result._intent);
+
+      const append_result: any = await this._append_message({
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _message: {
+            _role: "tool",
+            _text: "Intent analyzed.",
+            _intent: intent_result._intent,
+            _metadata: {
+              _source: "xvibe.analyze-message",
+            },
+          },
+        },
+      } as unknown as XCommand);
+      if (!append_result?._ok) {
+        return append_result;
+      }
+
+      return {
+        _ok: true,
+        _intent: intent_result._intent,
+        _result: {
+          _intent: intent_result._intent,
+          _message: append_result._result?._message,
+          _conversation: append_result._result?._conversation,
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] analyze_message failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] analyze_message failed", error);
+      return explicit_error(XVIBE_INVALID_INTENT_REQUEST, message);
+    }
+  }
+
+  async _update_conversation_action(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env, "_env", XVIBE_INVALID_ENV);
+      const conversation_id =
+        read_safe_path_segment(
+          params._conversation_id,
+          "_conversation_id",
+          XVIBE_INVALID_CONVERSATION_ID,
+        );
+      const message_id =
+        read_safe_path_segment(
+          params._message_id,
+          "_message_id",
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+        );
+      const action_id =
+        read_safe_path_segment(
+          params._action_id,
+          "_action_id",
+          XVIBE_INVALID_CONVERSATION_ACTION,
+        );
+      const status = read_conversation_action_status(params._status);
+      const result =
+        read_optional_json_object(
+          params._result,
+          "_result",
+          XVIBE_INVALID_CONVERSATION_ACTION,
+        );
+      const metadata =
+        read_optional_json_object(
+          params._metadata,
+          "_metadata",
+          XVIBE_INVALID_CONVERSATION_ACTION,
+        );
+      const error_message =
+        read_optional_conversation_action_error(params._error);
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (!fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_NOT_FOUND,
+          `Conversation not found: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      read_conversation_document(conversation_dir);
+      const messages = read_conversation_messages(conversation_dir);
+      const message =
+        messages.find((item) => item._id === message_id);
+      if (!message) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_MESSAGE_NOT_FOUND,
+          `Conversation message not found: ${message_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+          },
+        );
+      }
+
+      const intent =
+        _xu.is_plain_object(message._intent)
+          ? message._intent as XVibeJsonObject
+          : undefined;
+      const actions =
+        intent && Array.isArray(intent._actions)
+          ? intent._actions
+          : [];
+      let action: XVibeJsonObject | undefined;
+      for (const candidate of actions) {
+        if (
+          _xu.is_plain_object(candidate) &&
+          candidate._id === action_id
+        ) {
+          action = candidate as XVibeJsonObject;
+          break;
+        }
+      }
+
+      if (!action) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_ACTION_NOT_FOUND,
+          `Conversation action not found: ${action_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+            _action_id: action_id,
+          },
+        );
+      }
+
+      action._status = status;
+      if (result !== undefined) {
+        action._result = result;
+      }
+      if (error_message !== undefined) {
+        action._error = error_message;
+      }
+      if (metadata !== undefined) {
+        action._metadata = metadata;
+      }
+
+      write_conversation_messages(conversation_dir, messages);
+
+      return {
+        _ok: true,
+        _result: {
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _message_id: message_id,
+          _action_id: action_id,
+          _status: status,
+          _message: message,
+          _action: action,
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] update_conversation_action failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] update_conversation_action failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  async _get_last_messages(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
+      const limit =
+        typeof params._limit === "number" && Number.isInteger(params._limit) && params._limit > 0
+          ? Math.min(params._limit, XVIBE_CONVERSATION_LAST_MESSAGES_MAX_LIMIT)
+          : 20;
+      const conversations_dir = resolve_conversations_dir({
+        _app_id: app_id,
+        _env: env,
+      });
+      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
+
+      if (!fs.existsSync(conversation_dir)) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_NOT_FOUND,
+          `Conversation not found: ${conversation_id}`,
+          {
+            _conversation_id: conversation_id,
+          },
+        );
+      }
+
+      const messages = read_conversation_messages(conversation_dir);
+
+      return {
+        _ok: true,
+        _result: {
+          _conversation_id: conversation_id,
+          _messages: messages.slice(-limit),
+          _count: Math.min(messages.length, limit),
+          _total: messages.length,
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] get_last_messages failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] get_last_messages failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
     }
   }
 

@@ -212,4 +212,96 @@ export type VibeCapabilityNode = {
   _anti_patterns?: unknown[];
 };
 
+// XVibe Intent Engine types are contract-only for a future intent layer.
+// They are not connected to the current XVibe prompt generation path yet.
+// Existing XVibe prompt solving remains the active resolver/planner/generator behavior.
+export type XVibeIntentMessageType =
+  | "conversation"
+  | "question"
+  | "inspect"
+  | "edit"
+  | "generate"
+  | "planning"
+  | "debug";
+
+export type XVibeIntentExecutionLevel =
+  | "none"
+  | "deterministic"
+  | "artifact"
+  | "planning"
+  | "model";
+
+export type XVibeIntentActionType =
+  | "apply-view-edit"
+  | "generate-artifact"
+  | "inspect-runtime"
+  | "module-op"
+  | "module-generate"
+  | "module-edit"
+  | "open-panel"
+  | "ask-user"
+  | "reply";
+
+export type XVibeIntentActionStatus =
+  | "suggested"
+  | "approved"
+  | "running"
+  | "done"
+  | "failed"
+  | "rejected";
+
+export interface XVibeIntentAction {
+  _id: string;
+  _title: string;
+  _description?: string;
+  _action_type: XVibeIntentActionType;
+  _status: XVibeIntentActionStatus;
+  _params?: Record<string, any>;
+  _requires_approval?: boolean;
+  _confidence?: number;
+  _reason?: string;
+}
+
+export interface XVibeIntentResult {
+  _message_type: XVibeIntentMessageType;
+  _execution_level: XVibeIntentExecutionLevel;
+  _should_mutate: boolean;
+  _confidence: number;
+  _reason?: string;
+  _actions: XVibeIntentAction[];
+  _warnings?: string[];
+}
+
+export interface XVibeIntentRuntimeContext {
+  _app_id: string;
+  _env: string;
+  _active_view_id?: string;
+  _selected_object?: Record<string, any>;
+  _conversation_id?: string;
+  _available_artifacts?: {
+    _views?: string[];
+    _entities?: string[];
+    _flows?: string[];
+    _modules?: string[];
+  };
+}
+
+export interface XVibeIntentEngineRequest {
+  _message: string;
+  _conversation_id?: string;
+  _runtime_context: XVibeIntentRuntimeContext;
+  _semantic_result?: XVibeIntentResult | null;
+  _metadata?: Record<string, any>;
+}
+
+export interface XVibeIntentEngineResponse {
+  _ok: boolean;
+  _intent?: XVibeIntentResult;
+  _error?: string;
+  _reason?: string;
+  _processor?: string;
+  _processor_chain?: string[];
+  _duration_ms?: number;
+}
+
 export  { type VibeKnowledgeSelection, type VibeSkillDocument } from "./VibeKnowledgeSelector";
