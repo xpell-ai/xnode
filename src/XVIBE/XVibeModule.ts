@@ -24,6 +24,19 @@ import {
 import { _xu } from "../XNUtils/XUtils.js";
 import { VibePromptBuilder } from "./VibePromptBuilder.js";
 import { ensure_view_ids, VibeViewBuilder } from "./VibeViewBuilder.js";
+import {
+  RunArchiveManager,
+  type XVibeRunArchiveData,
+  type XVibeRunDiagnosticSummary,
+} from "./Archive/RunArchiveManager.js";
+import { ConversationManager } from "./Conversation/ConversationManager.js";
+import { GenerationManager } from "./Generation/GenerationManager.js";
+import { IntentConversationBridge } from "./Intent/IntentConversationBridge.js";
+import {
+  RuntimeContextManager,
+  type XVibeRuntimeContextInput,
+} from "./Runtime/RuntimeContextManager.js";
+import { StructuredViewEdit } from "./StructuredEditing/StructuredViewEdit.js";
 import type { VibeArtifactFactoryDiagnostic } from "./VibeArtifactFactory.js";
 
 import type {
@@ -36,8 +49,6 @@ import type {
   XVibeInferredArtifactPlan,
   XVibeInferredArtifactType,
   XVibeResolvedTask,
-  XVibeIntentResult,
-  XVibeIntentRuntimeContext,
   XVibeRuntimeAssetRef,
   XVibeRuntimeAssets,
   XVibeRuntimePlan,
@@ -81,26 +92,6 @@ const XVIBE_STARTER_NOT_FOUND = "E_XVIBE_STARTER_NOT_FOUND";
 const XVIBE_APP_ALREADY_EXISTS = "E_XVIBE_APP_ALREADY_EXISTS";
 const XVIBE_STARTER_COPY_FAILED = "E_XVIBE_STARTER_COPY_FAILED";
 const XVIBE_STARTER_LOAD_FAILED = "E_XVIBE_STARTER_LOAD_FAILED";
-const XVIBE_RUN_NOT_FOUND = "E_XVIBE_RUN_NOT_FOUND";
-const XVIBE_INVALID_GENERATION_ID = "E_XVIBE_INVALID_GENERATION_ID";
-const XVIBE_INVALID_CONVERSATION_ID = "E_XVIBE_INVALID_CONVERSATION_ID";
-const XVIBE_CONVERSATION_NOT_FOUND = "E_XVIBE_CONVERSATION_NOT_FOUND";
-const XVIBE_CONVERSATION_ALREADY_EXISTS = "E_XVIBE_CONVERSATION_ALREADY_EXISTS";
-const XVIBE_INVALID_CONVERSATION_MESSAGE = "E_XVIBE_INVALID_CONVERSATION_MESSAGE";
-const XVIBE_CONVERSATION_MESSAGE_NOT_FOUND = "E_XVIBE_CONVERSATION_MESSAGE_NOT_FOUND";
-const XVIBE_INVALID_CONVERSATION_ACTION = "E_XVIBE_INVALID_CONVERSATION_ACTION";
-const XVIBE_CONVERSATION_ACTION_NOT_FOUND = "E_XVIBE_CONVERSATION_ACTION_NOT_FOUND";
-const XVIBE_INVALID_CONVERSATION_ACTION_STATUS = "E_XVIBE_INVALID_CONVERSATION_ACTION_STATUS";
-const XVIBE_INVALID_INTENT_REQUEST = "E_XVIBE_INVALID_INTENT_REQUEST";
-const XVIBE_CONVERSATION_STORAGE_FAILED = "E_XVIBE_CONVERSATION_STORAGE_FAILED";
-const XVIBE_CONVERSATION_LAST_MESSAGES_MAX_LIMIT = 100;
-const XVIBE_CONVERSATION_ACTION_STATUSES = new Set([
-  "suggested",
-  "running",
-  "done",
-  "failed",
-  "dismissed",
-]);
 const BUILTIN_SERVER_MODULES = new Set([
   "xvm",
   "xd",
@@ -239,22 +230,6 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _warnings?: string[];
 };
 
-type XVibeStructuredViewEditAction =
-  | "set-property"
-  | "remove-property"
-  | "set-style"
-  | "remove-style"
-  | "add-class"
-  | "remove-class"
-  | "replace-class"
-  | "toggle-class"
-  | "remove-object"
-  | "hide-object"
-  | "show-object"
-  | "move-object"
-  | "replace-object"
-  | "duplicate-object";
-
 type XVibeDeterministicViewEditEligibility = {
   _eligible: boolean;
   _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
@@ -369,57 +344,6 @@ type XVibeRunValidationArchive = {
   _implementation_attempts?: XVibeJsonObject[];
 };
 
-type XVibeRunArchiveTimelineItem = {
-  _stage: string;
-  _message?: string;
-  _t_ms: number;
-  _at: string;
-  _details?: Record<string, unknown>;
-};
-
-type XVibeRunArchiveData = {
-  _generation_id?: string;
-  _app_id?: string;
-  _env?: string;
-  _view_id?: string;
-  _requested_view_id?: string;
-  _source_view_id?: string;
-  _mode?: VibeAIMode;
-  _artifact_type?: string;
-  _created_at?: string;
-  _user_prompt?: string;
-  _final_prompt?: string;
-  _resolved_task?: XVibeResolvedTask;
-  _runtime_plan?: XVibeRuntimePlan;
-  _validation_plan?: XVibeValidationPlan;
-  _artifact_plan?: unknown;
-  _module_plan?: unknown;
-  _intent_plan?: unknown;
-  _behavior_intent?: unknown;
-  _scope_lock_warnings?: string[];
-  _selected_skill_ids?: string[];
-  _selected_skills?: unknown;
-  _runtime_context?: unknown;
-  _deterministic_mutation?: unknown;
-  _ai_output?: unknown;
-  _validation?: XVibeRunValidationArchive | XVibeJsonObject;
-  _result?: XVibeJsonObject;
-  _duration_ms?: number;
-  _timeline?: XVibeRunArchiveTimelineItem[];
-};
-
-type XVibeRunDiagnosticSummary = {
-  _generation_id?: string;
-  _artifact_type?: string;
-  _mode?: string;
-  _status: "deterministic" | "fallback" | "failed" | "completed";
-  _deterministic_eligible: boolean;
-  _deterministic_reason?: string;
-  _deterministic_action?: string;
-  _error_code?: string;
-  _has_final_prompt: boolean;
-};
-
 type XVibeRunDiagnosticResult = {
   _ok: true;
   _run_id: string;
@@ -431,56 +355,6 @@ type XVibeRunDiagnosticResult = {
     _file: string;
     _message: string;
   }>;
-};
-
-type XVibeConversationRole = "user" | "assistant" | "system" | "tool";
-
-type XVibeConversationActionStatus =
-  | "suggested"
-  | "running"
-  | "done"
-  | "failed"
-  | "dismissed";
-
-type XVibeConversationMessage = XVibeJsonObject & {
-  _id: string;
-  _role: XVibeConversationRole;
-  _text: string;
-  _created_at: string;
-  _attachments?: unknown;
-  _intent?: unknown;
-  _actions?: unknown;
-  _result?: unknown;
-  _metadata?: unknown;
-};
-
-type XVibeConversationDocument = XVibeJsonObject & {
-  _id: string;
-  _app_id: string;
-  _env: string;
-  _created_at: string;
-  _updated_at: string;
-  _message_count: number;
-  _title?: string;
-  _metadata?: unknown;
-};
-
-type XVibeConversationIndexEntry = XVibeJsonObject & {
-  _id: string;
-  _created_at: string;
-  _updated_at: string;
-  _message_count: number;
-  _last_message_at?: string;
-  _title?: string;
-  _metadata?: unknown;
-};
-
-type XVibeConversationIndex = XVibeJsonObject & {
-  _version: 1;
-  _app_id: string;
-  _env: string;
-  _updated_at: string;
-  _conversations: XVibeConversationIndexEntry[];
 };
 
 type XVibeRuntimeRegistry = {
@@ -613,29 +487,6 @@ const CALC_SAFE_EVALUATION_OPS = new Set([
   "calculate_expression",
   "calculate-expression",
 ]);
-
-const VIBE_RUN_DIAGNOSTIC_FILE_TYPES = {
-  "request.json": "json",
-  "resolved-task.json": "json",
-  "artifact-plan.json": "json",
-  "intent-plan.json": "json",
-  "runtime-plan.json": "json",
-  "runtime-context.json": "json",
-  "selected-skills.json": "json",
-  "deterministic-mutation.json": "json",
-  "validation-plan.json": "json",
-  "result.json": "json",
-  "timeline.json": "json",
-  "summary.json": "json",
-  "module-plan.json": "json",
-  "ai-output.json": "json",
-  "validation.json": "json",
-  "prompt.txt": "text",
-  "final-prompt.txt": "text",
-} as const;
-
-
-
 
 function debug_enabled(): boolean {
   return Boolean((_xlog as unknown as { _debug?: boolean })._debug);
@@ -1754,9 +1605,13 @@ function structured_implementation_attempt_error(input: {
 function structured_error_payload(
   error: unknown
 ): XVibeJsonObject | undefined {
-  return error instanceof XVibeStructuredError
-    ? error._payload
-    : undefined;
+  return (
+    error instanceof XVibeStructuredError
+      ? error._payload
+      : undefined
+  ) ??
+    RunArchiveManager.errorPayload(error) ??
+    RuntimeContextManager.errorPayload(error);
 }
 
 function unsupported_artifact_action_result(input: {
@@ -1820,125 +1675,19 @@ function error_summary(error: unknown): XVibeJsonObject | string {
   return String(error);
 }
 
-function safe_archive_segment(value: unknown, fallback: string): string {
-  const raw =
-    typeof value === "string" && value.trim().length > 0
-      ? value.trim()
-      : fallback;
-  const safe =
-    raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 120);
-
-  return safe.length > 0 ? safe : fallback;
-}
-
-function safe_short_id(): string {
-  return Math.random().toString(36).slice(2, 10);
-}
-
-function archive_timestamp(value?: string): string {
-  const timestamp =
-    value && value.trim()
-      ? value
-      : new Date().toISOString();
-
-  return timestamp.replace(/[:.]/g, "-");
-}
-
-function write_archive_file(file_path: string, content: string): void {
-  const temp_path = `${file_path}.${Date.now()}-${safe_short_id()}.tmp`;
-  fs.writeFileSync(temp_path, content, "utf-8");
-  fs.renameSync(temp_path, file_path);
-}
-
-function write_archive_json(file_path: string, value: unknown): void {
-  write_archive_file(file_path, `${JSON.stringify(value, null, 2)}\n`);
-}
-
-function has_archive_value(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (typeof value === "string") return value.length > 0;
-  if (Array.isArray(value)) return value.length > 0;
-  if (_xu.is_plain_object(value)) return Object.keys(value).length > 0;
-  return true;
-}
-
-function record_archive_stage(
-  archive: XVibeRunArchiveData | undefined,
-  started_at: number | undefined,
-  stage: string,
-  message?: string,
-  details?: Record<string, unknown>,
-): void {
-  try {
-    if (!archive || typeof started_at !== "number") return;
-
-    archive._timeline =
-      archive._timeline ?? [];
-    archive._timeline.push({
-      _stage: stage,
-      ...(message ? { _message: message } : {}),
-      _t_ms: Date.now() - started_at,
-      _at: new Date().toISOString(),
-      ...(details && Object.keys(details).length > 0
-        ? { _details: details }
-        : {}),
-    });
-  } catch (error) {
-    _xlog.warn("[xvibe] run archive failed", {
-      _error: error_summary(error),
-    });
-  }
-}
-
-function compact_view_summary(view: unknown): XVibeJsonObject | undefined {
-  if (!_xu.is_plain_object(view)) return undefined;
-
-  return {
-    ...(typeof view._id === "string" ? { _id: view._id } : {}),
-    ...(typeof view._type === "string" ? { _type: view._type } : {}),
-    ...(typeof view._title === "string" ? { _title: view._title } : {}),
-    ...(typeof view._label === "string" ? { _label: view._label } : {}),
-    _children_count:
-      Array.isArray(view._children)
-        ? view._children.length
-        : 0,
-  };
-}
-
-function runtime_context_archive_payload(
-  runtime_context: unknown,
-): unknown {
-  if (!_xu.is_plain_object(runtime_context)) {
-    return runtime_context;
+function generation_artifact_stage_fields(result: unknown): XVibeJsonObject {
+  if (!_xu.is_plain_object(result) || !_xu.is_plain_object(result._result)) {
+    return {};
   }
 
-  const current_view =
-    runtime_context._current_view;
-
+  const artifact = result._result;
   return {
-    ...runtime_context,
-    ...(_xu.is_plain_object(current_view)
-      ? {
-        _current_view_id:
-          typeof current_view._id === "string"
-            ? current_view._id
-            : runtime_context._view_id,
-        _current_view_summary:
-          compact_view_summary(current_view),
-      }
+    ...(typeof artifact._artifact_type === "string" && artifact._artifact_type.trim()
+      ? { _artifact_type: artifact._artifact_type.trim() }
       : {}),
-  };
-}
-
-function selected_skills_archive_payload(
-  selection?: VibeKnowledgeSelection,
-): XVibeJsonObject | undefined {
-  if (!selection) return undefined;
-
-  return {
-    _selected_skill_ids: selection.skill_ids,
-    _skills: selection.skills,
-    _diagnostics: selection.diagnostics,
+    ...(typeof artifact._artifact_id === "string" && artifact._artifact_id.trim()
+      ? { _artifact_id: artifact._artifact_id.trim() }
+      : {}),
   };
 }
 
@@ -1957,550 +1706,6 @@ function extract_persisted_version(value: unknown): number | string | undefined 
   }
 
   return undefined;
-}
-
-function archive_result_from_response(
-  artifact_type: string,
-  response: unknown,
-): XVibeJsonObject {
-  const result =
-    _xu.is_plain_object(response) && _xu.is_plain_object(response._result)
-      ? response._result
-      : {};
-
-  return {
-    _artifact_type:
-      typeof result._artifact_type === "string"
-        ? result._artifact_type
-        : artifact_type,
-    ...(typeof result._artifact_id === "string"
-      ? { _artifact_id: result._artifact_id }
-      : {}),
-    ...(typeof result._view_id === "string"
-      ? { _view_id: result._view_id }
-      : {}),
-    ...(typeof result._flow_id === "string"
-      ? { _flow_id: result._flow_id }
-      : {}),
-    ...(typeof result._entity_id === "string"
-      ? { _entity_id: result._entity_id }
-      : {}),
-    _success: generation_result_is_ok(response),
-    ...(_xu.is_plain_object(response) && response._ok === false
-      ? { _error: response._error ?? response._result ?? response }
-      : {}),
-  };
-}
-
-function resolve_xvibe_work_folder(): string {
-  const get_module =
-    (_x as unknown as { getModule?: (name: string) => unknown }).getModule;
-
-  if (typeof get_module === "function") {
-    const server_xvm =
-      get_module.call(_x, "server-xvm");
-
-    if (
-      _xu.is_plain_object(server_xvm) &&
-      typeof server_xvm._work_folder === "string" &&
-      server_xvm._work_folder.trim().length > 0
-    ) {
-      return server_xvm._work_folder;
-    }
-  }
-
-  return "./work";
-}
-
-function archive_vibe_run(data: XVibeRunArchiveData): void {
-  try {
-    if (
-      typeof data._app_id !== "string" ||
-      data._app_id.trim().length === 0
-    ) {
-      return;
-    }
-
-    const created_at = data._created_at ?? new Date().toISOString();
-    const generation_id =
-      data._generation_id && data._generation_id.trim()
-        ? data._generation_id.trim()
-        : safe_short_id();
-    const app_id = data._app_id.trim();
-    const env =
-      typeof data._env === "string" && data._env.trim()
-        ? data._env.trim()
-        : DEFAULT_ENV;
-    const run_dir =
-      path.join(
-        resolve_xvibe_work_folder(),
-        "xvm",
-        "apps",
-        safe_archive_segment(env, DEFAULT_ENV),
-        safe_archive_segment(app_id, "app"),
-        "vibe-runs",
-        `${archive_timestamp(created_at)}_${safe_archive_segment(generation_id, "run")}`,
-      );
-
-    fs.mkdirSync(run_dir, { recursive: true });
-
-    const request_payload: XVibeJsonObject = {
-      _generation_id: generation_id,
-      _app_id: app_id,
-      _env: env,
-      ...(data._view_id ? { _view_id: data._view_id } : {}),
-      ...(data._requested_view_id ? { _requested_view_id: data._requested_view_id } : {}),
-      ...(data._source_view_id ? { _source_view_id: data._source_view_id } : {}),
-      ...(data._mode ? { _mode: data._mode } : {}),
-      ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
-      ...(data._resolved_task ? { _resolved_task: data._resolved_task } : {}),
-      ...(data._runtime_plan ? { _runtime_plan: data._runtime_plan } : {}),
-      ...(data._validation_plan ? { _validation_plan: data._validation_plan } : {}),
-      ...(data._deterministic_mutation ? { _deterministic_mutation: data._deterministic_mutation } : {}),
-      _created_at: created_at,
-      ...(data._user_prompt !== undefined ? { _user_prompt: data._user_prompt } : {}),
-    };
-
-    write_archive_json(path.join(run_dir, "request.json"), request_payload);
-
-    if (data._user_prompt !== undefined) {
-      write_archive_file(path.join(run_dir, "prompt.txt"), data._user_prompt);
-    }
-
-    if (data._final_prompt !== undefined) {
-      write_archive_file(path.join(run_dir, "final-prompt.txt"), data._final_prompt);
-    }
-
-    if (has_archive_value(data._resolved_task)) {
-      write_archive_json(path.join(run_dir, "resolved-task.json"), data._resolved_task);
-    }
-
-    if (has_archive_value(data._runtime_plan)) {
-      write_archive_json(path.join(run_dir, "runtime-plan.json"), data._runtime_plan);
-    }
-
-    if (has_archive_value(data._validation_plan)) {
-      write_archive_json(path.join(run_dir, "validation-plan.json"), data._validation_plan);
-    }
-
-    if (has_archive_value(data._artifact_plan)) {
-      write_archive_json(path.join(run_dir, "artifact-plan.json"), data._artifact_plan);
-    }
-
-    if (has_archive_value(data._module_plan)) {
-      write_archive_json(path.join(run_dir, "module-plan.json"), data._module_plan);
-    }
-
-    if (has_archive_value(data._intent_plan)) {
-      write_archive_json(path.join(run_dir, "intent-plan.json"), data._intent_plan);
-    }
-
-    const selected_skills =
-      has_archive_value(data._selected_skills)
-        ? data._selected_skills
-        : has_archive_value(data._selected_skill_ids)
-          ? { _selected_skill_ids: data._selected_skill_ids }
-          : undefined;
-    if (selected_skills !== undefined) {
-      write_archive_json(path.join(run_dir, "selected-skills.json"), selected_skills);
-    }
-
-    if (has_archive_value(data._runtime_context)) {
-      write_archive_json(
-        path.join(run_dir, "runtime-context.json"),
-        runtime_context_archive_payload(data._runtime_context),
-      );
-    }
-
-    if (has_archive_value(data._ai_output)) {
-      write_archive_json(path.join(run_dir, "ai-output.json"), data._ai_output);
-    }
-
-    if (has_archive_value(data._validation)) {
-      write_archive_json(path.join(run_dir, "validation.json"), data._validation);
-    }
-
-    if (has_archive_value(data._deterministic_mutation)) {
-      write_archive_json(path.join(run_dir, "deterministic-mutation.json"), data._deterministic_mutation);
-    }
-
-    if (has_archive_value(data._timeline)) {
-      write_archive_json(path.join(run_dir, "timeline.json"), data._timeline);
-    }
-
-    if (has_archive_value(data._result)) {
-      write_archive_json(path.join(run_dir, "result.json"), data._result);
-    }
-
-    write_archive_json(path.join(run_dir, "summary.json"), {
-      _generation_id: generation_id,
-      _app_id: app_id,
-      _env: env,
-      ...(data._view_id ? { _view_id: data._view_id } : {}),
-      ...(data._requested_view_id ? { _requested_view_id: data._requested_view_id } : {}),
-      ...(data._source_view_id ? { _source_view_id: data._source_view_id } : {}),
-      ...(data._artifact_type ? { _artifact_type: data._artifact_type } : {}),
-      ...(data._mode ? { _mode: data._mode } : {}),
-      ...(data._resolved_task ? { _resolved_task: data._resolved_task } : {}),
-      ...(data._deterministic_mutation ? { _deterministic_mutation: data._deterministic_mutation } : {}),
-      _success: data._result?._success === true,
-      _selected_skill_ids: data._selected_skill_ids ?? [],
-      ...(typeof data._duration_ms === "number" ? { _duration_ms: data._duration_ms } : {}),
-      _created_at: created_at,
-    });
-
-    _xlog.log("[xvibe] run archived", {
-      _app_id: app_id,
-      _env: env,
-      _generation_id: generation_id,
-      _archive_dir: run_dir,
-    });
-  } catch (error) {
-    _xlog.warn("[xvibe] run archive failed", {
-      _error: error_summary(error),
-    });
-  }
-}
-
-function read_safe_vibe_run_generation_id(value: unknown): string | undefined {
-  if (value === undefined || value === null) {
-    return undefined;
-  }
-
-  if (typeof value !== "string") {
-    throw_explicit_error(
-      XVIBE_INVALID_GENERATION_ID,
-      "Invalid '_generation_id': expected safe generation id",
-    );
-  }
-
-  const generation_id = value.trim();
-  if (
-    generation_id.length === 0 ||
-    generation_id.includes("/") ||
-    generation_id.includes("\\") ||
-    generation_id.includes("..") ||
-    !/^[a-zA-Z0-9._-]+$/u.test(generation_id)
-  ) {
-    throw_explicit_error(
-      XVIBE_INVALID_GENERATION_ID,
-      "Invalid '_generation_id': expected safe generation id",
-    );
-  }
-
-  return generation_id;
-}
-
-function resolve_vibe_runs_dir(input: {
-  _app_id: string;
-  _env: string;
-}): string {
-  const apps_root = path.resolve(resolve_xvibe_work_folder(), "xvm", "apps");
-  const runs_dir =
-    path.resolve(apps_root, input._env, input._app_id, "vibe-runs");
-
-  assert_path_inside(
-    apps_root,
-    runs_dir,
-    XVIBE_INVALID_APP_ID,
-    "Invalid vibe-run scope path",
-  );
-
-  return runs_dir;
-}
-
-function relative_vibe_run_dir(input: {
-  _app_id: string;
-  _env: string;
-  _run_id: string;
-}): string {
-  return path.posix.join(
-    "xvm",
-    "apps",
-    input._env,
-    input._app_id,
-    "vibe-runs",
-    input._run_id,
-  );
-}
-
-function list_vibe_run_dirs(runs_dir: string): string[] {
-  if (!fs.existsSync(runs_dir)) {
-    return [];
-  }
-
-  return fs.readdirSync(runs_dir, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => entry.name)
-    .filter((name) =>
-      !name.includes("/") &&
-      !name.includes("\\") &&
-      !name.includes("..")
-    )
-    .sort();
-}
-
-function read_vibe_run_json_file_if_present(
-  file_path: string,
-): XVibeJsonObject | undefined {
-  try {
-    const stat = fs.lstatSync(file_path);
-    if (!stat.isFile() || stat.isSymbolicLink()) return undefined;
-    const parsed = JSON.parse(fs.readFileSync(file_path, "utf-8"));
-    return _xu.is_plain_object(parsed) ? parsed : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function vibe_run_generation_id_from_dir(run_dir: string): string | undefined {
-  const summary =
-    read_vibe_run_json_file_if_present(path.join(run_dir, "summary.json"));
-  if (typeof summary?._generation_id === "string" && summary._generation_id.trim()) {
-    return summary._generation_id.trim();
-  }
-
-  const request =
-    read_vibe_run_json_file_if_present(path.join(run_dir, "request.json"));
-  if (typeof request?._generation_id === "string" && request._generation_id.trim()) {
-    return request._generation_id.trim();
-  }
-
-  return undefined;
-}
-
-function resolve_vibe_run_dir(input: {
-  _runs_dir: string;
-  _generation_id?: string;
-}): { _run_id: string; _run_dir: string; _generation_id?: string } {
-  const run_ids = list_vibe_run_dirs(input._runs_dir);
-  if (run_ids.length === 0) {
-    throw_explicit_error(
-      XVIBE_RUN_NOT_FOUND,
-      "No vibe-runs found for app/env",
-    );
-  }
-
-  if (!input._generation_id) {
-    const run_id = run_ids[run_ids.length - 1];
-    const run_dir = path.join(input._runs_dir, run_id);
-    assert_path_inside(
-      input._runs_dir,
-      run_dir,
-      XVIBE_RUN_NOT_FOUND,
-      "Invalid vibe-run path",
-    );
-
-    return {
-      _run_id: run_id,
-      _run_dir: run_dir,
-      _generation_id: vibe_run_generation_id_from_dir(run_dir),
-    };
-  }
-
-  const safe_generation_segment =
-    safe_archive_segment(input._generation_id, "run");
-
-  for (const run_id of [...run_ids].reverse()) {
-    const run_dir = path.join(input._runs_dir, run_id);
-    assert_path_inside(
-      input._runs_dir,
-      run_dir,
-      XVIBE_RUN_NOT_FOUND,
-      "Invalid vibe-run path",
-    );
-
-    const archived_generation_id =
-      vibe_run_generation_id_from_dir(run_dir);
-
-    if (
-      archived_generation_id === input._generation_id ||
-      run_id.endsWith(`_${safe_generation_segment}`)
-    ) {
-      return {
-        _run_id: run_id,
-        _run_dir: run_dir,
-        _generation_id: archived_generation_id ?? input._generation_id,
-      };
-    }
-  }
-
-  throw_explicit_error(
-    XVIBE_RUN_NOT_FOUND,
-    "Requested vibe-run was not found",
-    {
-      _generation_id: input._generation_id,
-    },
-  );
-}
-
-function read_vibe_run_diagnostic_files(
-  runs_dir: string,
-  run_dir: string,
-): {
-  _files: Record<string, unknown>;
-  _file_errors: Array<{ _file: string; _message: string }>;
-} {
-  assert_path_inside(
-    runs_dir,
-    run_dir,
-    XVIBE_RUN_NOT_FOUND,
-    "Invalid vibe-run path",
-  );
-
-  const files: Record<string, unknown> = {};
-  const file_errors: Array<{ _file: string; _message: string }> = [];
-
-  for (const [file_name, file_type] of Object.entries(VIBE_RUN_DIAGNOSTIC_FILE_TYPES)) {
-    const file_path = path.join(run_dir, file_name);
-    assert_path_inside(
-      run_dir,
-      file_path,
-      XVIBE_RUN_NOT_FOUND,
-      "Invalid vibe-run file path",
-    );
-
-    if (!fs.existsSync(file_path)) {
-      continue;
-    }
-
-    try {
-      const stat = fs.lstatSync(file_path);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        continue;
-      }
-
-      const content = fs.readFileSync(file_path, "utf-8");
-      files[file_name] =
-        file_type === "json"
-          ? JSON.parse(content)
-          : content;
-    } catch (error) {
-      file_errors.push({
-        _file: file_name,
-        _message: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
-  return { _files: files, _file_errors: file_errors };
-}
-
-function diagnostic_file_object(
-  files: Record<string, unknown>,
-  file_name: string,
-): XVibeJsonObject | undefined {
-  const value = files[file_name];
-  return _xu.is_plain_object(value) ? value : undefined;
-}
-
-function first_string_value(
-  ...values: unknown[]
-): string | undefined {
-  for (const value of values) {
-    if (typeof value === "string" && value.trim().length > 0) {
-      return value.trim();
-    }
-  }
-
-  return undefined;
-}
-
-function diagnostic_error_code(value: unknown): string | undefined {
-  if (!_xu.is_plain_object(value)) return undefined;
-
-  const direct =
-    first_string_value(value._code, value.code);
-  if (direct) return direct;
-
-  return (
-    diagnostic_error_code(value._error) ??
-    diagnostic_error_code(value._result) ??
-    diagnostic_error_code(value._details)
-  );
-}
-
-function summarize_vibe_run_diagnostics(input: {
-  _generation_id?: string;
-  _files: Record<string, unknown>;
-}): XVibeRunDiagnosticSummary {
-  const request = diagnostic_file_object(input._files, "request.json");
-  const summary = diagnostic_file_object(input._files, "summary.json");
-  const result = diagnostic_file_object(input._files, "result.json");
-  const resolved_task = diagnostic_file_object(input._files, "resolved-task.json");
-  const deterministic =
-    diagnostic_file_object(input._files, "deterministic-mutation.json");
-  const has_final_prompt =
-    typeof input._files["final-prompt.txt"] === "string";
-  const deterministic_eligible =
-    deterministic?._eligible === true;
-  const error_code =
-    diagnostic_error_code(result?._error) ??
-    diagnostic_error_code(result);
-  const failed =
-    result?._success === false ||
-    result?._ok === false ||
-    Boolean(error_code);
-  const status: XVibeRunDiagnosticSummary["_status"] =
-    failed
-      ? "failed"
-      : deterministic_eligible || result?._deterministic === true
-        ? "deterministic"
-        : deterministic?._eligible === false && has_final_prompt
-          ? "fallback"
-          : "completed";
-
-  return {
-    _generation_id:
-      first_string_value(
-        input._generation_id,
-        request?._generation_id,
-        summary?._generation_id,
-      ),
-    _artifact_type:
-      first_string_value(
-        result?._artifact_type,
-        request?._artifact_type,
-        summary?._artifact_type,
-        resolved_task?._artifact_type,
-      ),
-    _mode:
-      first_string_value(
-        request?._mode,
-        summary?._mode,
-      ),
-    _status: status,
-    _deterministic_eligible: deterministic_eligible,
-    _deterministic_reason:
-      first_string_value(deterministic?._reason),
-    _deterministic_action:
-      first_string_value(
-        deterministic?._action,
-        result?._mutation_action,
-      ),
-    ...(error_code ? { _error_code: error_code } : {}),
-    _has_final_prompt: has_final_prompt,
-  };
-}
-
-function generation_artifact_stage_fields(result: unknown): XVibeJsonObject {
-  if (!_xu.is_plain_object(result) || !_xu.is_plain_object(result._result)) {
-    return {};
-  }
-
-  const artifact = result._result;
-  return {
-    ...(typeof artifact._artifact_type === "string" && artifact._artifact_type.trim()
-      ? { _artifact_type: artifact._artifact_type.trim() }
-      : {}),
-    ...(typeof artifact._artifact_id === "string" && artifact._artifact_id.trim()
-      ? { _artifact_id: artifact._artifact_id.trim() }
-      : {}),
-  };
-}
-
-function generation_result_is_ok(result: unknown): boolean {
-  return !_xu.is_plain_object(result) || result._ok !== false;
 }
 
 function prompt_requests_module_only(prompt: string): boolean {
@@ -2713,32 +1918,7 @@ function assert_path_inside(root: string, candidate: string, code: string, messa
 }
 
 function resolve_target_app_dir(env: string, app_id: string): string {
-  const apps_root = path.resolve(resolve_xvibe_work_folder(), "xvm", "apps");
-  const app_dir = path.resolve(apps_root, env, app_id);
-  assert_path_inside(
-    apps_root,
-    app_dir,
-    XVIBE_INVALID_APP_ID,
-    "Invalid target app path",
-  );
-
-  return app_dir;
-}
-
-function resolve_conversations_dir(input: {
-  _app_id: string;
-  _env: string;
-}): string {
-  const app_dir = resolve_target_app_dir(input._env, input._app_id);
-  const conversations_dir = path.resolve(app_dir, "conversations");
-  assert_path_inside(
-    app_dir,
-    conversations_dir,
-    XVIBE_INVALID_APP_ID,
-    "Invalid conversations path",
-  );
-
-  return conversations_dir;
+  return RuntimeContextManager.resolveTargetAppDir(env, app_id);
 }
 
 function read_json_object_file(file_path: string, code: string, message: string): XVibeJsonObject {
@@ -2761,555 +1941,12 @@ function write_json_object_file(file_path: string, value: XVibeJsonObject): void
   fs.writeFileSync(file_path, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
 }
 
-function conversation_index_path(conversations_dir: string): string {
-  const index_path = path.resolve(conversations_dir, "index.json");
-  assert_path_inside(
-    conversations_dir,
-    index_path,
-    XVIBE_CONVERSATION_STORAGE_FAILED,
-    "Invalid conversation index path",
-  );
-
-  return index_path;
-}
-
-function conversation_dir_path(conversations_dir: string, conversation_id: string): string {
-  const conversation_dir = path.resolve(conversations_dir, conversation_id);
-  assert_path_inside(
-    conversations_dir,
-    conversation_dir,
-    XVIBE_INVALID_CONVERSATION_ID,
-    "Invalid conversation path",
-  );
-
-  return conversation_dir;
-}
-
-function normalize_safe_conversation_id(value: unknown): string {
-  if (value === undefined || value === null) {
-    return `conv-${safe_short_id()}`;
-  }
-
-  return read_safe_path_segment(
-    value,
-    "_conversation_id",
-    XVIBE_INVALID_CONVERSATION_ID,
-  );
-}
-
-function is_json_compatible_value(value: unknown): boolean {
-  if (value === null) return true;
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "boolean"
-  ) {
-    return Number.isFinite(value as number) || typeof value !== "number";
-  }
-  if (Array.isArray(value)) {
-    return value.every((item) => item !== undefined && is_json_compatible_value(item));
-  }
-  if (_xu.is_plain_object(value)) {
-    return Object.values(value).every((item) => item !== undefined && is_json_compatible_value(item));
-  }
-
-  return false;
-}
-
-function read_optional_json_value(
-  value: unknown,
-  field_name: string,
-  code = XVIBE_INVALID_CONVERSATION_MESSAGE,
-): unknown {
-  if (value === undefined) return undefined;
-  if (!is_json_compatible_value(value)) {
-    throw_explicit_error(
-      code,
-      `Invalid '${field_name}': expected JSON-compatible value`,
-    );
-  }
-
-  return value;
-}
-
-function read_optional_json_object(
-  value: unknown,
-  field_name: string,
-  code: string,
-): XVibeJsonObject | undefined {
-  if (value === undefined) return undefined;
-  if (!_xu.is_plain_object(value) || !is_json_compatible_value(value)) {
-    throw_explicit_error(
-      code,
-      `Invalid '${field_name}': expected JSON-compatible object`,
-    );
-  }
-
-  return value as XVibeJsonObject;
-}
-
-function read_optional_conversation_action_error(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== "string") {
-    throw_explicit_error(
-      XVIBE_INVALID_CONVERSATION_ACTION,
-      "Invalid '_error': expected string",
-    );
-  }
-
-  return value;
-}
-
-function read_conversation_action_status(value: unknown): XVibeConversationActionStatus {
-  if (
-    typeof value !== "string" ||
-    !XVIBE_CONVERSATION_ACTION_STATUSES.has(value)
-  ) {
-    throw_explicit_error(
-      XVIBE_INVALID_CONVERSATION_ACTION_STATUS,
-      "Invalid '_status': expected suggested, running, done, failed, or dismissed",
-    );
-  }
-
-  return value as XVibeConversationActionStatus;
-}
-
-function read_conversation_index(
-  conversations_dir: string,
-  app_id: string,
-  env: string,
-): XVibeConversationIndex {
-  const index_file = conversation_index_path(conversations_dir);
-  if (!fs.existsSync(index_file)) {
-    return {
-      _version: 1,
-      _app_id: app_id,
-      _env: env,
-      _updated_at: new Date().toISOString(),
-      _conversations: [],
-    };
-  }
-
-  const parsed =
-    read_json_object_file(
-      index_file,
-      XVIBE_CONVERSATION_STORAGE_FAILED,
-      "Conversation index is invalid",
-    );
-  const conversations =
-    Array.isArray(parsed._conversations)
-      ? parsed._conversations.filter((item) => _xu.is_plain_object(item)) as XVibeConversationIndexEntry[]
-      : [];
-
-  return {
-    _version: 1,
-    _app_id: typeof parsed._app_id === "string" ? parsed._app_id : app_id,
-    _env: typeof parsed._env === "string" ? parsed._env : env,
-    _updated_at:
-      typeof parsed._updated_at === "string"
-        ? parsed._updated_at
-        : new Date().toISOString(),
-    _conversations: conversations,
-  };
-}
-
-function write_conversation_index(
-  conversations_dir: string,
-  index: XVibeConversationIndex,
-): void {
-  fs.mkdirSync(conversations_dir, { recursive: true });
-  const index_path = conversation_index_path(conversations_dir);
-  const temp_path = path.resolve(
-    conversations_dir,
-    `.index.${Date.now()}-${safe_short_id()}.tmp`,
-  );
-  assert_path_inside(
-    conversations_dir,
-    temp_path,
-    XVIBE_CONVERSATION_STORAGE_FAILED,
-    "Invalid conversation index temp path",
-  );
-  fs.writeFileSync(temp_path, `${JSON.stringify(index, null, 2)}\n`, "utf-8");
-  fs.renameSync(temp_path, index_path);
-}
-
-function read_conversation_index_safe(
-  conversations_dir: string,
-  app_id: string,
-  env: string,
-): { _index: XVibeConversationIndex; _recovered: boolean; _error?: string } {
-  try {
-    return {
-      _index: read_conversation_index(conversations_dir, app_id, env),
-      _recovered: false,
-    };
-  } catch (error) {
-    return {
-      _index: {
-        _version: 1,
-        _app_id: app_id,
-        _env: env,
-        _updated_at: new Date().toISOString(),
-        _conversations: [],
-      },
-      _recovered: true,
-      _error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function conversation_index_entry(
-  conversation: XVibeConversationDocument,
-): XVibeConversationIndexEntry {
-  return {
-    _id: conversation._id,
-    _created_at: conversation._created_at,
-    _updated_at: conversation._updated_at,
-    _message_count: conversation._message_count,
-    ...(typeof conversation._last_message_at === "string"
-      ? { _last_message_at: conversation._last_message_at }
-      : {}),
-    ...(typeof conversation._title === "string" ? { _title: conversation._title } : {}),
-    ...(conversation._metadata !== undefined ? { _metadata: conversation._metadata } : {}),
-  };
-}
-
-function upsert_conversation_index_entry(
-  index: XVibeConversationIndex,
-  conversation: XVibeConversationDocument,
-): XVibeConversationIndex {
-  const entry = conversation_index_entry(conversation);
-  const entries =
-    index._conversations.filter((item) => item._id !== conversation._id);
-  entries.push(entry);
-  entries.sort((a, b) => String(b._updated_at).localeCompare(String(a._updated_at)));
-
-  return {
-    ...index,
-    _updated_at: conversation._updated_at,
-    _conversations: entries,
-  };
-}
-
-function read_conversation_document(
-  conversation_dir: string,
-): XVibeConversationDocument {
-  const conversation =
-    read_json_object_file(
-      path.join(conversation_dir, "conversation.json"),
-      XVIBE_CONVERSATION_NOT_FOUND,
-      "Conversation not found",
-    );
-
-  if (
-    typeof conversation._id !== "string" ||
-    typeof conversation._app_id !== "string" ||
-    typeof conversation._env !== "string" ||
-    typeof conversation._created_at !== "string" ||
-    typeof conversation._updated_at !== "string" ||
-    typeof conversation._message_count !== "number"
-  ) {
-    throw_explicit_error(
-      XVIBE_CONVERSATION_STORAGE_FAILED,
-      "Conversation file is invalid",
-    );
-  }
-
-  return conversation as XVibeConversationDocument;
-}
-
-function read_conversation_messages(
-  conversation_dir: string,
-): XVibeConversationMessage[] {
-  const messages_file = path.join(conversation_dir, "messages.jsonl");
-  if (!fs.existsSync(messages_file)) {
-    return [];
-  }
-
-  const content = fs.readFileSync(messages_file, "utf-8");
-  return content
-    .split(/\r?\n/u)
-    .filter((line) => line.trim().length > 0)
-    .map((line) => JSON.parse(line) as XVibeConversationMessage);
-}
-
-function write_conversation_messages(
-  conversation_dir: string,
-  messages: XVibeConversationMessage[],
-): void {
-  const messages_file = path.resolve(conversation_dir, "messages.jsonl");
-  assert_path_inside(
-    conversation_dir,
-    messages_file,
-    XVIBE_CONVERSATION_STORAGE_FAILED,
-    "Invalid conversation messages path",
-  );
-
-  const temp_path = path.resolve(
-    conversation_dir,
-    `.messages.${Date.now()}-${safe_short_id()}.jsonl.tmp`,
-  );
-  assert_path_inside(
-    conversation_dir,
-    temp_path,
-    XVIBE_CONVERSATION_STORAGE_FAILED,
-    "Invalid conversation messages temp path",
-  );
-
-  const content =
-    messages.length > 0
-      ? `${messages.map((message) => JSON.stringify(message)).join("\n")}\n`
-      : "";
-  fs.writeFileSync(temp_path, content, "utf-8");
-  fs.renameSync(temp_path, messages_file);
-}
-
-function normalize_conversation_message(value: unknown): XVibeConversationMessage {
-  const source = _xu.is_plain_object(value) ? value : {};
-  const role = source._role;
-  if (
-    role !== "user" &&
-    role !== "assistant" &&
-    role !== "system" &&
-    role !== "tool"
-  ) {
-    throw_explicit_error(
-      XVIBE_INVALID_CONVERSATION_MESSAGE,
-      "Invalid '_role': expected user, assistant, system, or tool",
-    );
-  }
-
-  if (typeof source._text !== "string") {
-    throw_explicit_error(
-      XVIBE_INVALID_CONVERSATION_MESSAGE,
-      "Invalid '_text': expected string",
-    );
-  }
-
-  const created_at =
-    typeof source._created_at === "string" && source._created_at.trim()
-      ? source._created_at.trim()
-      : new Date().toISOString();
-  const id =
-    typeof source._id === "string" && source._id.trim()
-      ? read_safe_path_segment(source._id, "_id", XVIBE_INVALID_CONVERSATION_MESSAGE)
-      : `msg-${safe_short_id()}`;
-
-  return {
-    _id: id,
-    _role: role,
-    _text: source._text,
-    _created_at: created_at,
-    ...(source._attachments !== undefined
-      ? { _attachments: read_optional_json_value(source._attachments, "_attachments") }
-      : {}),
-    ...(source._intent !== undefined
-      ? { _intent: read_optional_json_value(source._intent, "_intent") }
-      : {}),
-    ...(source._actions !== undefined
-      ? { _actions: read_optional_json_value(source._actions, "_actions") }
-      : {}),
-    ...(source._result !== undefined
-      ? { _result: read_optional_json_value(source._result, "_result") }
-      : {}),
-    ...(source._metadata !== undefined
-      ? { _metadata: read_optional_json_value(source._metadata, "_metadata") }
-      : {}),
-  };
-}
-
-function normalize_intent_action_ids(intent: XVibeIntentResult | undefined): void {
-  if (!intent || !Array.isArray(intent._actions)) {
-    return;
-  }
-
-  let normalized = false;
-  const action_ids: string[] = [];
-  for (const [index, action] of intent._actions.entries()) {
-    if (!_xu.is_plain_object(action)) {
-      continue;
-    }
-
-    if (typeof action._id !== "string" || action._id.trim().length === 0) {
-      action._id = `action-${index + 1}`;
-      normalized = true;
-    }
-
-    action_ids.push(String(action._id));
-  }
-
-  if (normalized) {
-    _xlog.log("[xvibe] intent action ids normalized", {
-      _action_ids: action_ids,
-    });
-  }
-}
-
-function read_optional_intent_context_string(
-  value: unknown,
-  field_name: string,
-): string | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw_explicit_error(
-      XVIBE_INVALID_INTENT_REQUEST,
-      `Invalid '${field_name}': expected non-empty string`,
-    );
-  }
-
-  return value.trim();
-}
-
-function read_optional_intent_context_string_array(
-  value: unknown,
-  field_name: string,
-): string[] | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (!Array.isArray(value)) {
-    throw_explicit_error(
-      XVIBE_INVALID_INTENT_REQUEST,
-      `Invalid '${field_name}': expected string array`,
-    );
-  }
-
-  return value.map((item) => {
-    if (typeof item !== "string" || item.trim().length === 0) {
-      throw_explicit_error(
-        XVIBE_INVALID_INTENT_REQUEST,
-        `Invalid '${field_name}': expected string array`,
-      );
-    }
-
-    return item.trim();
-  });
-}
-
-function normalize_analyze_message_runtime_context(input: {
-  _app_id: string;
-  _env: string;
-  _conversation_id: string;
-  _runtime_context?: unknown;
-}): XVibeIntentRuntimeContext {
-  const context: XVibeIntentRuntimeContext = {
-    _app_id: input._app_id,
-    _env: input._env,
-    _conversation_id: input._conversation_id,
-  };
-
-  if (input._runtime_context === undefined || input._runtime_context === null) {
-    return context;
-  }
-
-  if (!_xu.is_plain_object(input._runtime_context)) {
-    throw_explicit_error(
-      XVIBE_INVALID_INTENT_REQUEST,
-      "Invalid '_runtime_context': expected object",
-    );
-  }
-
-  const active_view_id =
-    read_optional_intent_context_string(
-      input._runtime_context._active_view_id,
-      "_runtime_context._active_view_id",
-    );
-  if (active_view_id) {
-    context._active_view_id = active_view_id;
-  }
-
-  if (input._runtime_context._selected_object !== undefined) {
-    if (!_xu.is_plain_object(input._runtime_context._selected_object)) {
-      throw_explicit_error(
-        XVIBE_INVALID_INTENT_REQUEST,
-        "Invalid '_runtime_context._selected_object': expected object",
-      );
-    }
-
-    context._selected_object = read_optional_json_value(
-      input._runtime_context._selected_object,
-      "_runtime_context._selected_object",
-      XVIBE_INVALID_INTENT_REQUEST,
-    ) as Record<string, any>;
-  }
-
-  if (input._runtime_context._available_artifacts !== undefined) {
-    if (!_xu.is_plain_object(input._runtime_context._available_artifacts)) {
-      throw_explicit_error(
-        XVIBE_INVALID_INTENT_REQUEST,
-        "Invalid '_runtime_context._available_artifacts': expected object",
-      );
-    }
-
-    const available_artifacts: NonNullable<XVibeIntentRuntimeContext["_available_artifacts"]> = {};
-    const views =
-      read_optional_intent_context_string_array(
-        input._runtime_context._available_artifacts._views,
-        "_runtime_context._available_artifacts._views",
-      );
-    const entities =
-      read_optional_intent_context_string_array(
-        input._runtime_context._available_artifacts._entities,
-        "_runtime_context._available_artifacts._entities",
-      );
-    const flows =
-      read_optional_intent_context_string_array(
-        input._runtime_context._available_artifacts._flows,
-        "_runtime_context._available_artifacts._flows",
-      );
-    const modules =
-      read_optional_intent_context_string_array(
-        input._runtime_context._available_artifacts._modules,
-        "_runtime_context._available_artifacts._modules",
-      );
-
-    if (views) available_artifacts._views = views;
-    if (entities) available_artifacts._entities = entities;
-    if (flows) available_artifacts._flows = flows;
-    if (modules) available_artifacts._modules = modules;
-    context._available_artifacts = available_artifacts;
-  }
-
-  return context;
-}
-
 function parser_diagnostic(error: unknown): XVibeParserDiagnostic | undefined {
   return error instanceof VibeOutputParserError ? error._diagnostic : undefined;
 }
 
 function parser_diagnostics(error: unknown): XVibeParserDiagnostic[] | undefined {
   return error instanceof VibeOutputParserError ? error._diagnostics : undefined;
-}
-
-function archive_failure_result(
-  artifact_type: VibeArtifactType,
-  error: unknown,
-  requested_view_id?: string,
-): XVibeJsonObject {
-  const diagnostic = parser_diagnostic(error);
-  const diagnostics = parser_diagnostics(error);
-  const structured = structured_error_payload(error);
-
-  return {
-    _artifact_type: artifact_type,
-    ...(requested_view_id ? { _view_id: requested_view_id } : {}),
-    _success: false,
-    _error: error_summary(error),
-    ...(diagnostic ? { _diagnostic: diagnostic } : {}),
-    ...(diagnostics ? { _diagnostics: diagnostics } : {}),
-    ...(structured ? { _structured_error_payload: structured } : {}),
-  };
-}
-
-function archive_structured_failure_result(input: {
-  artifact_type: string;
-  result: XVibeJsonObject;
-  requested_view_id?: string;
-}): XVibeJsonObject {
-  return {
-    _artifact_type: input.artifact_type,
-    ...(input.requested_view_id ? { _view_id: input.requested_view_id } : {}),
-    _success: false,
-    _error: input.result._error ?? input.result._result ?? input.result,
-  };
 }
 
 function assert_no_duplicate_child_ids(children: unknown, context: string): void {
@@ -7756,89 +6393,6 @@ function extract_prompt_flow_ids(prompt: string): string[] {
   ]));
 }
 
-function normalize_runtime_asset_ids(value: unknown): XVibeRuntimeAssetRef[] {
-  const source =
-    Array.isArray(value)
-      ? value
-      : [];
-
-  return Array.from(
-    new Set(
-      source
-        .map((item) => {
-          if (typeof item === "string") return item.trim();
-          if (_xu.is_plain_object(item) && typeof item._id === "string") {
-            return item._id.trim();
-          }
-          if (_xu.is_plain_object(item) && typeof item._name === "string") {
-            return item._name.trim();
-          }
-          return "";
-        })
-        .filter((id) => id.length > 0)
-    )
-  )
-    .sort()
-    .map((id) => ({ _id: id }));
-}
-
-function collect_generated_module_asset_ids(runtime_skills: unknown): XVibeRuntimeAssetRef[] {
-  const payload = unwrap_runtime_skills_payload(runtime_skills);
-  const ids: string[] = [];
-
-  if (!_xu.is_plain_object(payload)) {
-    return [];
-  }
-
-  const collect_module_id = (module_item: unknown): void => {
-    if (!_xu.is_plain_object(module_item)) return;
-
-    let is_generated = skill_marks_generated_module(module_item);
-    if (Array.isArray(module_item._skills)) {
-      is_generated =
-        is_generated ||
-        module_item._skills.some((skill) => skill_marks_generated_module(skill));
-    }
-
-    if (!is_generated) return;
-
-    if (typeof module_item._id === "string" && module_item._id.trim()) {
-      ids.push(module_item._id.trim());
-    } else if (typeof module_item._name === "string" && module_item._name.trim()) {
-      ids.push(module_item._name.trim());
-    }
-  };
-
-  if (Array.isArray(payload._modules)) {
-    for (const module_item of payload._modules) {
-      collect_module_id(module_item);
-    }
-  }
-
-  if (Array.isArray(payload._skills)) {
-    for (const skill of payload._skills) {
-      if (
-        !skill_marks_generated_module(skill) ||
-        !_xu.is_plain_object(skill) ||
-        !_xu.is_plain_object(skill._exports)
-      ) {
-        continue;
-      }
-      const exported_modules = Array.isArray(skill._exports._modules)
-        ? skill._exports._modules
-        : [];
-      for (const module_item of exported_modules) {
-        collect_module_id({
-          ...(_xu.is_plain_object(module_item) ? module_item : {}),
-          _skills: [skill],
-        });
-      }
-    }
-  }
-
-  return normalize_runtime_asset_ids(ids);
-}
-
 function field_control_requires_name(control_type: string): boolean {
   return ![
     "label",
@@ -7847,15 +6401,6 @@ function field_control_requires_name(control_type: string): boolean {
     "readonly",
   ].includes(control_type);
 }
-
-type XVibeRuntimeContextInput = {
-  _app_id: string;
-  _env: string;
-  _view_id?: string;
-  _current_view?: unknown;
-  _generated_artifacts?: unknown;
-  _runtime_skills?: unknown;
-};
 
 type XVibeGenerateModuleSpecResult = {
   _ok: boolean;
@@ -8183,8 +6728,7 @@ export class XVibeModule extends XModule {
   private readonly intent_planner: VibeIntentPlanner;
   private readonly behavior_planner: VibeBehaviorPlanner;
   private readonly intent_engine: XVibeIntentEngine;
-  private readonly runtime_skills_by_scope = new Map<string, any>();
-  private latest_runtime_skills: any = null;
+  private readonly generation_manager: GenerationManager;
 
   constructor() {
     super({ _name: XVibeModule._name });
@@ -8196,6 +6740,37 @@ export class XVibeModule extends XModule {
     this.intent_planner = new VibeIntentPlanner();
     this.behavior_planner = new VibeBehaviorPlanner();
     this.intent_engine = new XVibeIntentEngine();
+    this.generation_manager = new GenerationManager({
+      _planner: this.planner,
+      _generate_artifact: (params, forced_artifact_type) =>
+        this.generate_artifact(params, forced_artifact_type),
+      _broadcast_generation_failed:
+        this.broadcast_generation_failed.bind(this),
+      _structured_error_payload: structured_error_payload,
+      _parser_diagnostic: parser_diagnostic,
+      _parser_diagnostics: parser_diagnostics,
+      _resolve_prompt: resolve_prompt,
+      _read_optional_string: read_optional_string,
+      _read_safe_path_segment: read_safe_path_segment,
+      _explicit_error: explicit_error,
+      _resolve_xvibe_task: resolve_xvibe_task,
+      _read_existing_resolved_task: read_existing_resolved_task,
+      _push_generation_stage: this.push_generation_stage.bind(this),
+      _build_live_shell_view: this.build_live_shell_view.bind(this),
+      _apply_view_scope_lock_to_app_plan: apply_view_scope_lock_to_app_plan,
+      _apply_view_scope_lock: apply_view_scope_lock,
+      _warn_if_plan_violates_resolved_task: warn_if_plan_violates_resolved_task,
+      _create_intent_plan: this.create_intent_plan.bind(this),
+      _ensure_server_module_for_intent:
+        this.ensure_server_module_for_intent.bind(this),
+      _log_intent_plan: this.log_intent_plan.bind(this),
+      _build_execution_plan_for_intent:
+        this.build_execution_plan_for_intent.bind(this),
+      _build_artifact_generation_context:
+        this.build_artifact_generation_context.bind(this),
+      _generate_planned_artifacts:
+        this.generate_planned_artifacts.bind(this),
+    });
   }
 
   override async onLoad() {
@@ -8203,44 +6778,12 @@ export class XVibeModule extends XModule {
   }
 
 
-  private runtime_skill_scope(
-    app_id: unknown,
-    env: unknown,
-    mode: unknown,
-  ): string {
-    return [
-      typeof env === "string" ? env : "default",
-      typeof app_id === "string" ? app_id : "unknown",
-      typeof mode === "string" ? mode : "runtime"
-    ].join("::");
-  }
-
   get_runtime_skills(
     app_id?: string,
     env?: string,
     mode?: string,
   ) {
-
-    // v1 global fallback
-    if (
-      app_id == null &&
-      env == null &&
-      mode == null
-    ) {
-      return this.latest_runtime_skills;
-    }
-
-    const scope =
-      this.runtime_skill_scope(
-        app_id,
-        env,
-        mode
-      );
-
-    return (
-      this.runtime_skills_by_scope.get(scope)
-      ?? this.latest_runtime_skills
-    );
+    return this.generation_manager.getRuntimeSkills(app_id, env, mode);
   }
 
   private resolve_starters_root(): string {
@@ -8313,46 +6856,11 @@ export class XVibeModule extends XModule {
     env: string,
     mode: string,
   ): unknown {
-    const get_skills =
-      (_x as unknown as { getSkills?: () => unknown }).getSkills;
-
-    if (typeof get_skills !== "function") {
-      return this.get_runtime_skills(app_id, env, mode);
-    }
-
-    const existing =
-      this.get_runtime_skills(app_id, env, mode);
-    const engine_skills =
-      get_skills.call(_x);
-    const merged_skills =
-      merge_runtime_skill_payloads(existing, engine_skills);
-    const scope =
-      this.runtime_skill_scope(app_id, env, mode);
-    const skills_count =
-      Array.isArray(merged_skills._modules)
-        ? merged_skills._modules.length
-        : 0;
-    const snapshot = {
-      _app_id: app_id,
-      _env: env,
-      _mode: mode,
-      _skills: merged_skills,
-      _skills_count: skills_count,
-      _synced_at: new Date().toISOString()
-    };
-
-    this.runtime_skills_by_scope.set(scope, snapshot);
-    this.latest_runtime_skills = snapshot;
-
-    _xlog.log("[xvibe] runtime skills refreshed after module creation", {
-      _scope: scope,
-      _app_id: app_id,
-      _env: env,
-      _mode: mode,
-      _skills_count: skills_count,
-    });
-
-    return snapshot;
+    return this.generation_manager.refreshRuntimeSkillsAfterModuleCreation(
+      app_id,
+      env,
+      mode,
+    );
   }
 
   private module_requirement_from_intent(
@@ -8979,7 +7487,7 @@ export class XVibeModule extends XModule {
     };
     const module_progress: XVibeGenerationProgressCallback =
       (stage_name, message, details = {}) => {
-        record_archive_stage(
+        RunArchiveManager.recordStage(
           archive,
           archive_started_at,
           stage_name,
@@ -9005,7 +7513,7 @@ export class XVibeModule extends XModule {
           _module_ops: module_ops,
           _error: result._error,
         };
-        record_archive_stage(
+        RunArchiveManager.recordStage(
           archive,
           archive_started_at,
           "failed",
@@ -9032,7 +7540,7 @@ export class XVibeModule extends XModule {
           _module_ops: module_ops,
           _error: result._error,
         };
-        record_archive_stage(
+        RunArchiveManager.recordStage(
           archive,
           archive_started_at,
           "failed",
@@ -9087,7 +7595,7 @@ export class XVibeModule extends XModule {
           _module_ops: module_ops,
           _error: result._error,
         };
-        record_archive_stage(
+        RunArchiveManager.recordStage(
           archive,
           archive_started_at,
           "failed",
@@ -9171,7 +7679,7 @@ export class XVibeModule extends XModule {
         _error: error_summary(error),
         _attempts: archive_validation._implementation_attempts ?? [],
       };
-      record_archive_stage(
+      RunArchiveManager.recordStage(
         archive,
         archive_started_at,
         "failed",
@@ -9213,7 +7721,7 @@ export class XVibeModule extends XModule {
       };
     } finally {
       archive._duration_ms = Date.now() - archive_started_at;
-      archive_vibe_run(archive);
+      RunArchiveManager.archiveVibeRun(archive);
     }
   }
 
@@ -9402,7 +7910,7 @@ export class XVibeModule extends XModule {
     generation_id?: string;
     details?: Record<string, unknown>;
   }): void {
-    record_archive_stage(
+    RunArchiveManager.recordStage(
       input.archive,
       input.started_at,
       input.stage,
@@ -9554,7 +8062,7 @@ export class XVibeModule extends XModule {
       ...(input.artifact_plan ? { _artifact_plan: input.artifact_plan } : {}),
       _created_at: new Date().toISOString(),
       _user_prompt: input.prompt,
-      _result: archive_structured_failure_result({
+      _result: RunArchiveManager.structuredFailureResult({
         artifact_type: input.artifact_type,
         result: input.result,
         requested_view_id: input.view_id,
@@ -9570,7 +8078,7 @@ export class XVibeModule extends XModule {
       _error: error_payload,
     };
 
-    record_archive_stage(
+    RunArchiveManager.recordStage(
       archive,
       started_at,
       "failed",
@@ -9578,7 +8086,7 @@ export class XVibeModule extends XModule {
       failure_details,
     );
     archive._duration_ms = Date.now() - started_at;
-    archive_vibe_run(archive);
+    RunArchiveManager.archiveVibeRun(archive);
     this.broadcast_generation_failed(
       {
         ...input.params,
@@ -9595,90 +8103,7 @@ export class XVibeModule extends XModule {
   private async collect_runtime_awareness_context(
     _input: XVibeRuntimeContextInput,
   ): Promise<XVibeJsonObject> {
-    const runtime_assets =
-      await this.collect_runtime_assets({
-        _app_id: _input._app_id,
-        _env: _input._env,
-        _runtime_skills: _input._runtime_skills,
-      });
-
-    _xlog.log("[xvibe] runtime asset awareness", {
-      _views_count: runtime_assets._views.length,
-      _flows_count: runtime_assets._flows.length,
-      _entities_count: runtime_assets._entities.length,
-      _modules_count: runtime_assets._modules.length,
-    });
-
-    return {
-      _app_id: _input._app_id,
-      _env: _input._env,
-      _runtime_assets: runtime_assets,
-
-      ...(_input._view_id
-        ? {
-          _view_id: _input._view_id
-        }
-        : {}),
-
-      ...(_input._current_view
-        ? {
-          _current_view: _input._current_view
-        }
-        : {}),
-
-      ...(_input._generated_artifacts
-        ? {
-          _generated_artifacts:
-            _input._generated_artifacts
-        }
-        : {})
-    };
-  }
-
-  private async collect_runtime_assets(input: {
-    _app_id: string;
-    _env: string;
-    _runtime_skills?: unknown;
-  }): Promise<XVibeRuntimeAssets> {
-    let views: XVibeRuntimeAssetRef[] = [];
-    let flows: XVibeRuntimeAssetRef[] = [];
-    let entities: XVibeRuntimeAssetRef[] = [];
-
-    try {
-      const app_result = unwrap_command_result(
-        await _x.execute({
-          _module: "server-xvm",
-          _op: "get_app",
-          _params: {
-            _app_id: input._app_id,
-            _env: input._env,
-            _include_views: false,
-            _include_flows: false,
-          },
-        } as any),
-      );
-
-      if (_xu.is_plain_object(app_result)) {
-        views = normalize_runtime_asset_ids(app_result._view_ids);
-        flows = normalize_runtime_asset_ids(app_result._flow_ids);
-        entities = normalize_runtime_asset_ids(app_result._entity_ids);
-      }
-    } catch (error) {
-      _xlog.warn("[xvibe] runtime asset collection failed", {
-        _app_id: input._app_id,
-        _env: input._env,
-        _error: error_summary(error),
-      });
-    }
-
-    const assets: XVibeRuntimeAssets = {
-      _views: views,
-      _flows: flows,
-      _entities: entities,
-      _modules: collect_generated_module_asset_ids(input._runtime_skills),
-    };
-
-    return assets;
+    return RuntimeContextManager.collectRuntimeAwarenessContext(_input);
   }
 
   private async load_current_view_for_refine(input: {
@@ -12300,7 +10725,7 @@ export class XVibeModule extends XModule {
       const app_id = read_required_string(params._app_id, "_app_id");
       const env = read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
       const generation_id = read_optional_generation_id(params._generation_id);
-      const effective_generation_id = generation_id ?? safe_short_id();
+      const effective_generation_id = generation_id ?? RunArchiveManager.safeShortId();
       params._generation_id = effective_generation_id;
       if (generation_id) {
         _xlog.log("[xvibe] generation_id received", {
@@ -12417,7 +10842,7 @@ export class XVibeModule extends XModule {
     }
     const capabilities = read_optional_string_array(params._capabilities, "_capabilities");
     const generation_id = read_optional_generation_id(params._generation_id);
-    const effective_generation_id = generation_id ?? safe_short_id();
+    const effective_generation_id = generation_id ?? RunArchiveManager.safeShortId();
     params._generation_id = effective_generation_id;
     if (generation_id) {
       _xlog.log("[xvibe] generation_id received", {
@@ -12977,7 +11402,7 @@ export class XVibeModule extends XModule {
         _skill_ids: final_selection.skill_ids,
       });
       archive._selected_skill_ids = final_selection.skill_ids;
-      archive._selected_skills = selected_skills_archive_payload(final_selection);
+      archive._selected_skills = RunArchiveManager.selectedSkillsPayload(final_selection);
       stage(
         "skills-selected",
         "Skills selected",
@@ -13020,7 +11445,7 @@ export class XVibeModule extends XModule {
             "view",
           );
         archive._selected_skill_ids = final_selection.skill_ids;
-        archive._selected_skills = selected_skills_archive_payload(final_selection);
+        archive._selected_skills = RunArchiveManager.selectedSkillsPayload(final_selection);
       }
       if (edit_intent?._target_type) {
         final_selection =
@@ -13029,7 +11454,7 @@ export class XVibeModule extends XModule {
             edit_intent._target_type,
           );
         archive._selected_skill_ids = final_selection.skill_ids;
-        archive._selected_skills = selected_skills_archive_payload(final_selection);
+        archive._selected_skills = RunArchiveManager.selectedSkillsPayload(final_selection);
       }
       if (mode === "refine" && artifact_type === "view") {
         use_view_mutation =
@@ -13419,7 +11844,7 @@ export class XVibeModule extends XModule {
           throw new XVibeStructuredError(result);
         }
         if (!archive._result) {
-          archive._result = archive_result_from_response("flow", result);
+          archive._result = RunArchiveManager.archiveResultFromResponse("flow", result);
         }
         stage(
           "complete",
@@ -13486,7 +11911,7 @@ export class XVibeModule extends XModule {
           throw new XVibeStructuredError(result);
         }
         if (!archive._result) {
-          archive._result = archive_result_from_response("entity", result);
+          archive._result = RunArchiveManager.archiveResultFromResponse("entity", result);
         }
         stage(
           "complete",
@@ -13552,7 +11977,7 @@ export class XVibeModule extends XModule {
       );
       const result = this.return_command_artifact(app_id, env, command, archive);
       if (!archive._result) {
-        archive._result = archive_result_from_response("command", result);
+        archive._result = RunArchiveManager.archiveResultFromResponse("command", result);
       }
       stage(
         "complete",
@@ -13582,6 +12007,7 @@ export class XVibeModule extends XModule {
     } catch (error) {
       const diagnostic = parser_diagnostic(error);
       const diagnostics = parser_diagnostics(error);
+      const structured = structured_error_payload(error);
       const error_details: Record<string, unknown> = {
         _artifact_type: artifact_type,
         ...(requested_view_id ? { _view_id: requested_view_id } : {}),
@@ -13589,7 +12015,7 @@ export class XVibeModule extends XModule {
         ...(diagnostic ? { _diagnostic: diagnostic } : {}),
         ...(diagnostics ? { _diagnostics: diagnostics } : {}),
       };
-      record_archive_stage(
+      RunArchiveManager.recordStage(
         archive,
         archive_started_at,
         "failed",
@@ -13605,10 +12031,15 @@ export class XVibeModule extends XModule {
         error_details as XVibeJsonObject,
       );
       archive._result =
-        archive_failure_result(
+        RunArchiveManager.failureResult(
           artifact_type,
           error,
           requested_view_id,
+          {
+            ...(diagnostic ? { _diagnostic: diagnostic } : {}),
+            ...(diagnostics ? { _diagnostics: diagnostics } : {}),
+            ...(structured ? { _structured_error_payload: structured } : {}),
+          },
         );
       throw error;
     } finally {
@@ -13619,7 +12050,7 @@ export class XVibeModule extends XModule {
       ) {
         delete archive._validation;
       }
-      archive_vibe_run(archive);
+      RunArchiveManager.archiveVibeRun(archive);
     }
   }
 
@@ -14079,1060 +12510,42 @@ export class XVibeModule extends XModule {
     };
   }
 
-  private read_structured_view_edit_action(value: unknown): XVibeStructuredViewEditAction {
-    if (
-      value === "set-property" ||
-      value === "remove-property" ||
-      value === "set-style" ||
-      value === "remove-style" ||
-      value === "add-class" ||
-      value === "remove-class" ||
-      value === "replace-class" ||
-      value === "toggle-class" ||
-      value === "remove-object" ||
-      value === "hide-object" ||
-      value === "show-object" ||
-      value === "move-object" ||
-      value === "replace-object" ||
-      value === "duplicate-object"
-    ) {
-      return value;
-    }
-
-    throw new Error("Invalid '_edit_action': unsupported deterministic view edit action");
-  }
-
-  private read_structured_property_value(value: unknown): string | number | boolean | null | undefined {
-    if (
-      value === undefined ||
-      value === null ||
-      typeof value === "string" ||
-      typeof value === "number" ||
-      typeof value === "boolean"
-    ) {
-      return value;
-    }
-
-    throw new Error("Invalid '_property_value': expected string, number, boolean, or null");
-  }
-
-  private read_structured_object_value(value: unknown): XVibeJsonObject {
-    if (_xu.is_plain_object(value)) {
-      return value;
-    }
-
-    throw new Error("Invalid '_object_value': expected object");
-  }
-
-  private read_structured_source_view_id(params: XVibeJsonObject): string | undefined {
-    const direct_source_view_id =
-      read_optional_string(params._source_view_id, "_source_view_id");
-    if (direct_source_view_id) {
-      return direct_source_view_id;
-    }
-
-    if (_xu.is_plain_object(params._selected_object)) {
-      return read_optional_string(
-        params._selected_object._source_view_id,
-        "_selected_object._source_view_id",
-      );
-    }
-
-    if (_xu.is_plain_object(params._target)) {
-      return read_optional_string(
-        params._target._source_view_id,
-        "_target._source_view_id",
-      );
-    }
-
-    return undefined;
-  }
-
-  private async resolve_structured_view_edit_source(input: {
-    app_id: string;
-    env: string;
-    view_id: string;
-    source_view_id?: string;
-    current_view: XVibeJsonObject;
-    resolved_task: XVibeResolvedTask;
-    edit_intent: XVibeViewEditIntent;
-  }): Promise<XVibeDeterministicViewEditSourceResolution> {
-    if (input.source_view_id) {
-      if (input.source_view_id === input.view_id) {
-        const eligibility =
-          can_apply_deterministic_view_edit({
-            _resolved_task: input.resolved_task,
-            _current_view: input.current_view,
-            _edit_intent: input.edit_intent,
-          });
-
-        if (!eligibility._eligible) {
-          return {
-            _eligible: false,
-            _eligibility: eligibility,
-            _warnings: [],
-          };
-        }
-
-        return {
-          _eligible: true,
-          _view_id: input.view_id,
-          _view: input.current_view,
-          _resolved_via: "current-view",
-          _eligibility: eligibility,
-          _warnings: [],
-        };
-      }
-
-      const references =
-        await this.load_xvm_view_references_for_refine({
-          _app_id: input.app_id,
-          _env: input.env,
-          _view_id: input.view_id,
-          _current_view: input.current_view,
-        });
-      const source_view =
-        references._loaded_views.find((view) => view._view_id === input.source_view_id);
-
-      if (!references._referenced_view_ids.includes(input.source_view_id)) {
-        return {
-          _eligible: false,
-          _eligibility: {
-            _eligible: false,
-            _reason: "source_view_not_referenced",
-            _details: {
-              _view_id: input.view_id,
-              _source_view_id: input.source_view_id,
-              _referenced_view_ids: references._referenced_view_ids,
-            },
-          },
-          _warnings: references._warnings,
-        };
-      }
-
-      if (!source_view) {
-        return {
-          _eligible: false,
-          _eligibility: {
-            _eligible: false,
-            _reason: "source_view_not_loaded",
-            _details: {
-              _view_id: input.view_id,
-              _source_view_id: input.source_view_id,
-            },
-          },
-          _warnings: references._warnings,
-        };
-      }
-
-      const eligibility =
-        can_apply_deterministic_view_edit({
-          _resolved_task: input.resolved_task,
-          _current_view: source_view._view,
-          _edit_intent: input.edit_intent,
-        });
-
-      if (!eligibility._eligible) {
-        return {
-          _eligible: false,
-          _eligibility: eligibility,
-          _warnings: references._warnings,
-        };
-      }
-
-      return {
-        _eligible: true,
-        _view_id: input.source_view_id,
-        _view: source_view._view,
-        _resolved_via: "xvm-view",
-        _eligibility: eligibility,
-        _warnings: references._warnings,
-      };
-    }
-
-    const references =
-      await this.load_xvm_view_references_for_refine({
-        _app_id: input.app_id,
-        _env: input.env,
-        _view_id: input.view_id,
-        _current_view: input.current_view,
-      });
-
-    return resolve_deterministic_view_edit_source({
-      _requested_view_id: input.view_id,
-      _current_view: input.current_view,
-      _referenced_views: references._loaded_views,
-      _reference_warnings: references._warnings,
-      _resolved_task: input.resolved_task,
-      _edit_intent: input.edit_intent,
+  async _apply_view_edit(xcmd: XCommand) {
+    return StructuredViewEdit.apply({
+      _cmd: xcmd,
+      _deps: {
+        _load_current_view_for_refine:
+          this.load_current_view_for_refine.bind(this),
+        _load_xvm_view_references_for_refine:
+          this.load_xvm_view_references_for_refine.bind(this),
+        _can_apply_deterministic_view_edit: can_apply_deterministic_view_edit,
+        _apply_deterministic_view_edit: apply_deterministic_view_edit,
+        _resolve_deterministic_view_edit_source: resolve_deterministic_view_edit_source,
+        _structured_error_payload: structured_error_payload,
+        _archive_vibe_run: (archive) =>
+          RunArchiveManager.archiveVibeRun(archive as XVibeRunArchiveData),
+      },
     });
   }
 
-  private push_structured_view_edit_active_view_refresh(input: {
-    app_id: string;
-    env: string;
-    view_id: string;
-    source_view_id: string;
-    current_view: XVibeJsonObject;
-    version?: number;
-    generation_id?: string;
-    target_id: string;
-    edit_action: string;
-  }): void {
-    if (input.source_view_id === input.view_id) {
-      return;
-    }
-
-    try {
-      wsBroadcastScoped(input.app_id, input.env, {
-        _name: "xvm:update",
-        _args: [{
-          _app_id: input.app_id,
-          _env: input.env,
-          _view_id: input.view_id,
-          _view:
-            typeof input.current_view._id === "string"
-              ? input.current_view
-              : { ...input.current_view, _id: input.view_id },
-          ...(input.version !== undefined ? { _version: input.version } : {}),
-          ...(input.generation_id ? { _generation_id: input.generation_id } : {}),
-          _meta: {
-            _source: "xstudio:intent-action-refresh",
-            _force_refresh: true,
-            _source_view_id: input.source_view_id,
-            _persisted_view_id: input.source_view_id,
-            _target_id: input.target_id,
-            _edit_action: input.edit_action,
-          },
-        }],
-      });
-    } catch (error) {
-      _xlog.warn("[xvibe] structured view edit active view refresh failed", {
-        _app_id: input.app_id,
-        _env: input.env,
-        _view_id: input.view_id,
-        _source_view_id: input.source_view_id,
-        _error: error_summary(error),
-      });
-    }
-  }
-
-  private build_structured_view_edit_task(input: {
-    view_id: string;
-    action: XVibeStructuredViewEditAction;
-    target_id: string;
-    target_type?: string;
-    params: XVibeJsonObject;
-  }): {
-    resolved_task: XVibeResolvedTask;
-    edit_intent: XVibeViewEditIntent;
-  } {
-    const deterministic_action =
-      input.action === "remove-object"
-        ? "remove"
-        : input.action === "hide-object"
-          ? "hide"
-          : input.action === "show-object"
-            ? "show"
-            : input.action;
-    const resolved_task: XVibeResolvedTask = {
-      _action: "update",
-      _artifact_type: "view",
-      _target_id: input.view_id,
-      _edit_action: deterministic_action,
-      _edit_target_id: input.target_id,
-      ...(input.target_type ? { _edit_target_type: input.target_type } : {}),
-      _explicit_artifact_type: true,
-      _explicit_target_id: true,
-      _module_ops: [],
-      _source: "xvibe.apply-view-edit",
-      _confidence: 1,
-      _warnings: [],
-    };
-    const edit_intent: XVibeViewEditIntent = {
-      _action: deterministic_action,
-      _target_id: input.target_id,
-      ...(input.target_type ? { _target_type: input.target_type } : {}),
-      _structured_apply_view_edit: true,
-    };
-
-    if (
-      input.action === "remove-object" ||
-      input.action === "hide-object" ||
-      input.action === "show-object"
-    ) {
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "duplicate-object") {
-      if (!input.target_type) {
-        throw new Error("Invalid '_target_type': expected non-empty string");
-      }
-
-      const after_id =
-        read_optional_string(input.params._after_id, "_after_id");
-      const before_id =
-        read_optional_string(input.params._before_id, "_before_id");
-      if (after_id) {
-        resolved_task._edit_move_position = "after";
-        resolved_task._edit_anchor_id = after_id;
-        edit_intent._move_position = "after";
-        edit_intent._anchor_id = after_id;
-      } else if (before_id) {
-        resolved_task._edit_move_position = "before";
-        resolved_task._edit_anchor_id = before_id;
-        edit_intent._move_position = "before";
-        edit_intent._anchor_id = before_id;
-      }
-
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "replace-object") {
-      const object_value =
-        this.read_structured_object_value(input.params._object_value);
-      resolved_task._edit_object_value = object_value;
-      edit_intent._object_value = object_value;
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "move-object") {
-      if (!input.target_type) {
-        throw new Error("Invalid '_target_type': expected non-empty string");
-      }
-
-      const before_id =
-        read_optional_string(input.params._before_id, "_before_id");
-      const after_id =
-        read_optional_string(input.params._after_id, "_after_id");
-      if (Boolean(before_id) === Boolean(after_id)) {
-        throw new Error("Invalid move-object anchors: exactly one of '_before_id' or '_after_id' is required");
-      }
-
-      resolved_task._edit_move_position = before_id ? "before" : "after";
-      resolved_task._edit_anchor_id = before_id ?? after_id;
-      edit_intent._move_position = resolved_task._edit_move_position;
-      edit_intent._anchor_id = resolved_task._edit_anchor_id;
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "set-property" || input.action === "remove-property") {
-      const property_name =
-        read_required_string(input.params._property_name, "_property_name");
-      resolved_task._edit_property_name = property_name;
-      edit_intent._property_name = property_name;
-
-      if (input.action === "set-property") {
-        const property_value =
-          this.read_structured_property_value(input.params._property_value);
-        if (property_value === undefined) {
-          throw new Error("Invalid '_property_value': expected value for set-property");
-        }
-        if (property_name === "class" && typeof property_value !== "string") {
-          throw new Error("Invalid '_property_value': class value must be a string");
-        }
-        resolved_task._edit_property_value = property_value;
-        edit_intent._property_value = property_value;
-      }
-
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "set-style" || input.action === "remove-style") {
-      const style_property =
-        read_required_string(input.params._style_property, "_style_property");
-      resolved_task._edit_style_property = style_property;
-      edit_intent._style_property = style_property;
-
-      if (input.action === "set-style") {
-        const style_value =
-          read_required_string(input.params._style_value, "_style_value");
-        resolved_task._edit_style_value = style_value;
-        edit_intent._style_value = style_value;
-      }
-
-      return { resolved_task, edit_intent };
-    }
-
-    if (input.action === "replace-class") {
-      const old_class_name =
-        read_required_string(input.params._old_class_name, "_old_class_name");
-      const new_class_name =
-        read_required_string(input.params._new_class_name, "_new_class_name");
-      resolved_task._edit_old_class_name = old_class_name;
-      resolved_task._edit_new_class_name = new_class_name;
-      edit_intent._old_class_name = old_class_name;
-      edit_intent._new_class_name = new_class_name;
-      return { resolved_task, edit_intent };
-    }
-
-    const class_name =
-      read_required_string(input.params._class_name, "_class_name");
-    resolved_task._edit_class_name = class_name;
-    edit_intent._class_name = class_name;
-    return { resolved_task, edit_intent };
-  }
-
-  private apply_view_edit_failure(input: {
-    code: string;
-    message: string;
-    app_id?: string;
-    env?: string;
-    view_id?: string;
-    action?: string;
-    target_id?: string;
-    reason?: string;
-    details?: unknown;
-    archive?: XVibeRunArchiveData;
-  }) {
-    const details: XVibeJsonObject = {
-      ...(input.app_id ? { _app_id: input.app_id } : {}),
-      ...(input.env ? { _env: input.env } : {}),
-      ...(input.view_id ? { _view_id: input.view_id } : {}),
-      ...(input.action ? { _mutation_action: input.action } : {}),
-      ...(input.target_id ? { _target_id: input.target_id } : {}),
-      ...(input.reason ? { _reason: input.reason } : {}),
-      ...(input.details !== undefined ? { _details: input.details } : {}),
-    };
-
-    if (input.archive) {
-      input.archive._deterministic_mutation = {
-        _eligible: false,
-        ...(input.reason ? { _reason: input.reason } : {}),
-        ...(input.details !== undefined ? { _details: input.details } : {}),
-      };
-      input.archive._result = {
-        _artifact_type: "view",
-        ...(input.view_id ? { _artifact_id: input.view_id, _view_id: input.view_id } : {}),
-        _success: false,
-        _deterministic: true,
-        ...(input.action ? { _mutation_action: input.action } : {}),
-        ...(input.target_id ? { _mutation_target_id: input.target_id } : {}),
-        _error: {
-          _code: input.code,
-          _message: input.message,
-          ...(Object.keys(details).length > 0 ? { _details: details } : {}),
-        },
-      };
-    }
-
-    return {
-      _ok: false,
-      _artifact_type: "view",
-      ...(input.view_id ? { _artifact_id: input.view_id, _view_id: input.view_id } : {}),
-      _deterministic: true,
-      ...(input.action ? { _mutation_action: input.action } : {}),
-      ...(input.target_id ? { _target_id: input.target_id } : {}),
-      ...(input.reason ? { _reason: input.reason } : {}),
-      _error: {
-        _code: input.code,
-        _message: input.message,
-        ...(Object.keys(details).length > 0 ? { _details: details } : {}),
-      },
-    };
-  }
-
-  async _apply_view_edit(xcmd: XCommand) {
-    const archive_started_at = Date.now();
-    const archive_created_at = new Date().toISOString();
-    let archive: XVibeRunArchiveData | undefined;
-
-    try {
-      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-      const app_id = read_required_string(params._app_id, "_app_id");
-      const env = read_required_string(params._env ?? DEFAULT_ENV, "_env");
-      const view_id = read_required_string(params._view_id, "_view_id");
-      const action = this.read_structured_view_edit_action(params._edit_action);
-      const target_id = read_required_string(params._target_id, "_target_id");
-      const target_type = read_optional_string(params._target_type, "_target_type");
-      const requested_source_view_id = this.read_structured_source_view_id(params);
-      const generation_id = read_optional_generation_id(params._generation_id) ?? safe_short_id();
-      const task =
-        this.build_structured_view_edit_task({
-          view_id,
-          action,
-          target_id,
-          ...(target_type ? { target_type } : {}),
-          params,
-        });
-
-      archive = {
-        _generation_id: generation_id,
-        _app_id: app_id,
-        _env: env,
-        _view_id: view_id,
-        ...(requested_source_view_id && requested_source_view_id !== view_id
-          ? { _source_view_id: requested_source_view_id, _requested_view_id: view_id }
-          : {}),
-        _mode: "refine",
-        _artifact_type: "view",
-        _created_at: archive_created_at,
-        _resolved_task: task.resolved_task,
-      };
-
-      record_archive_stage(
-        archive,
-        archive_started_at,
-        "loading-view",
-        "Loading current view...",
-        {
-          _view_id: view_id,
-          _mutation_action: action,
-          _target_id: target_id,
-        },
-      );
-
-      const current_view =
-        await this.load_current_view_for_refine({
-          _app_id: app_id,
-          _env: env,
-          _view_id: view_id,
-        });
-
-      const deterministic_source =
-        await this.resolve_structured_view_edit_source({
-          app_id,
-          env,
-          view_id,
-          ...(requested_source_view_id ? { source_view_id: requested_source_view_id } : {}),
-          current_view,
-          resolved_task: task.resolved_task,
-          edit_intent: task.edit_intent,
-        });
-      const eligibility = deterministic_source._eligibility;
-      const source_view_id =
-        deterministic_source._eligible ? deterministic_source._view_id : requested_source_view_id ?? view_id;
-
-      if (!eligibility._eligible) {
-        _xlog.log("[xvibe] structured view edit not eligible", {
-          _app_id: app_id,
-          _env: env,
-          _view_id: view_id,
-          ...(source_view_id !== view_id ? { _source_view_id: source_view_id } : {}),
-          _action: action,
-          _target_id: target_id,
-          _reason: eligibility._reason,
-          ...(eligibility._details !== undefined ? { _details: eligibility._details } : {}),
-        });
-
-        return this.apply_view_edit_failure({
-          code: "E_XVIBE_APPLY_VIEW_EDIT_NOT_ELIGIBLE",
-          message: `Deterministic view edit is not eligible: ${eligibility._reason}`,
-          app_id,
-          env,
-          view_id,
-          action,
-          target_id,
-          reason: eligibility._reason,
-          details: eligibility._details,
-          archive,
-        });
-      }
-
-      record_archive_stage(
-        archive,
-        archive_started_at,
-        "deterministic-mutating",
-        "Applying deterministic view edit...",
-        {
-          _view_id: view_id,
-          _source_view_id: source_view_id,
-          _action: eligibility._action,
-          _target_id: eligibility._target_id,
-        },
-      );
-
-      _xlog.log("[xvibe] structured view edit source resolved", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: view_id,
-        _source_view_id: source_view_id,
-        _persisted_view_id: source_view_id,
-        _target_id: eligibility._target_id ?? target_id,
-        _edit_action: eligibility._action ?? action,
-        ...(deterministic_source._eligible
-          ? { _resolved_via: deterministic_source._resolved_via }
-          : {}),
-      });
-
-      const deterministic_result =
-        apply_deterministic_view_edit({
-          _resolved_task: task.resolved_task,
-          _current_view: deterministic_source._eligible
-            ? deterministic_source._view
-            : current_view,
-          _edit_intent: task.edit_intent,
-        });
-
-      if (!deterministic_result._ok || !deterministic_result._view || !deterministic_result._mutation) {
-        return this.apply_view_edit_failure({
-          code: "E_XVIBE_APPLY_VIEW_EDIT_FAILED",
-          message: `Deterministic view edit failed: ${deterministic_result._reason ?? "unknown"}`,
-          app_id,
-          env,
-          view_id,
-          action,
-          target_id,
-          reason: deterministic_result._reason ?? "deterministic_mutation_failed",
-          details: deterministic_result._details,
-          archive,
-        });
-      }
-
-      const view_to_persist = deterministic_result._view as XVibeJsonObject;
-      const mutated_view_id =
-        typeof view_to_persist._id === "string" ? view_to_persist._id.trim() : "";
-      if (mutated_view_id !== source_view_id) {
-        return this.apply_view_edit_failure({
-          code: "E_XVIBE_SOURCE_VIEW_PERSIST_MISMATCH",
-          message: "Structured view edit attempted to persist a non-source view",
-          app_id,
-          env,
-          view_id,
-          action,
-          target_id,
-          reason: "source_view_id_mismatch",
-          details: {
-            _requested_view_id: view_id,
-            _source_view_id: source_view_id,
-            _view_id: mutated_view_id,
-          },
-          archive,
-        });
-      }
-
-      archive._deterministic_mutation = {
-        _eligible: true,
-        _reason: eligibility._reason,
-        ...deterministic_result._mutation,
-        _target_view_id: source_view_id,
-        _source_view_id: source_view_id,
-        _requested_view_id: view_id,
-        ...(deterministic_source._eligible && deterministic_source._resolved_via === "xvm-view"
-          ? { _resolved_via: "xvm-view" }
-          : {}),
-      };
-
-      record_archive_stage(
-        archive,
-        archive_started_at,
-        "saving",
-        "Saving view...",
-        {
-          _view_id: view_id,
-          _source_view_id: source_view_id,
-          _persisted_view_id: source_view_id,
-          _action: deterministic_result._mutation._action,
-          _target_id: deterministic_result._mutation._target_id,
-        },
-      );
-
-      const persist_response = await _x.execute({
-        _module: "server-xvm",
-        _op: "push_update",
-        _params: {
-          _app_id: app_id,
-          _env: env,
-          _generation_id: generation_id,
-          _view: view_to_persist,
-        },
-      } as any);
-      const persisted_version =
-        extract_persisted_version(persist_response);
-      this.push_structured_view_edit_active_view_refresh({
-        app_id,
-        env,
-        view_id,
-        source_view_id,
-        current_view,
-        ...(typeof persisted_version === "number" ? { version: persisted_version } : {}),
-        generation_id,
-        target_id,
-        edit_action: deterministic_result._mutation._action,
-      });
-      const mutation_target_id =
-        deterministic_result._mutation._target_id ?? target_id;
-      const mutation = deterministic_result._mutation;
-      const persisted_view_id = source_view_id;
-
-      _xlog.log("[xvibe] structured view edit persisted source view", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: view_id,
-        _source_view_id: source_view_id,
-        _persisted_view_id: persisted_view_id,
-        _target_id: mutation_target_id,
-        _edit_action: mutation._action,
-        ...(persisted_version !== undefined
-          ? { _persisted_version: persisted_version }
-          : {}),
-      });
-      const result_details: XVibeJsonObject = {
-        _ok: true,
-        _artifact_type: "view",
-        _artifact_id: persisted_view_id,
-        _view_id: view_id,
-        _source_view_id: source_view_id,
-        _persisted_view_id: persisted_view_id,
-        _deterministic: true,
-        _edit_action: mutation._action,
-        _mutation_action: mutation._action,
-        _target_id: mutation_target_id,
-        ...(typeof mutation._previous_index === "number"
-          ? { _previous_index: mutation._previous_index }
-          : {}),
-        ...(typeof mutation._next_index === "number"
-          ? { _next_index: mutation._next_index }
-          : {}),
-        ...(typeof mutation._insert_index === "number"
-          ? { _insert_index: mutation._insert_index }
-          : {}),
-        ...(typeof mutation._original_target_id === "string"
-          ? { _original_target_id: mutation._original_target_id }
-          : {}),
-        ...(typeof mutation._new_target_id === "string"
-          ? { _new_target_id: mutation._new_target_id }
-          : {}),
-        ...(typeof mutation._parent_id === "string"
-          ? { _parent_id: mutation._parent_id }
-          : {}),
-        ...(typeof mutation._before_id === "string"
-          ? { _before_id: mutation._before_id }
-          : {}),
-        ...(typeof mutation._after_id === "string"
-          ? { _after_id: mutation._after_id }
-          : {}),
-        ...(typeof mutation._removed_type === "string"
-          ? { _removed_type: mutation._removed_type }
-          : {}),
-        ...(typeof mutation._removed_text === "string"
-          ? { _removed_text: mutation._removed_text }
-          : {}),
-        ...(typeof mutation._hide_mechanism === "string"
-          ? { _hide_mechanism: mutation._hide_mechanism }
-          : {}),
-        ...(typeof mutation._show_mechanism === "string"
-          ? { _show_mechanism: mutation._show_mechanism }
-          : {}),
-        _mutation: mutation,
-        ...(persisted_version !== undefined
-          ? { _persisted_version: persisted_version }
-          : {}),
-      };
-
-      archive._result = {
-        _artifact_type: "view",
-        _artifact_id: persisted_view_id,
-        _view_id: view_id,
-        _source_view_id: source_view_id,
-        _persisted_view_id: persisted_view_id,
-        _success: true,
-        _deterministic: true,
-        _edit_action: mutation._action,
-        _mutation_action: mutation._action,
-        _mutation_target_id: mutation_target_id,
-        ...(typeof mutation._previous_index === "number"
-          ? { _previous_index: mutation._previous_index }
-          : {}),
-        ...(typeof mutation._next_index === "number"
-          ? { _next_index: mutation._next_index }
-          : {}),
-        ...(typeof mutation._insert_index === "number"
-          ? { _insert_index: mutation._insert_index }
-          : {}),
-        ...(typeof mutation._original_target_id === "string"
-          ? { _original_target_id: mutation._original_target_id }
-          : {}),
-        ...(typeof mutation._new_target_id === "string"
-          ? { _new_target_id: mutation._new_target_id }
-          : {}),
-        ...(typeof mutation._parent_id === "string"
-          ? { _parent_id: mutation._parent_id }
-          : {}),
-        ...(typeof mutation._before_id === "string"
-          ? { _before_id: mutation._before_id }
-          : {}),
-        ...(typeof mutation._after_id === "string"
-          ? { _after_id: mutation._after_id }
-          : {}),
-        ...(typeof mutation._removed_type === "string"
-          ? { _removed_type: mutation._removed_type }
-          : {}),
-        ...(typeof mutation._removed_text === "string"
-          ? { _removed_text: mutation._removed_text }
-          : {}),
-        ...(typeof mutation._hide_mechanism === "string"
-          ? { _hide_mechanism: mutation._hide_mechanism }
-          : {}),
-        ...(typeof mutation._show_mechanism === "string"
-          ? { _show_mechanism: mutation._show_mechanism }
-          : {}),
-        ...(persisted_version !== undefined
-          ? { _persisted_version: persisted_version }
-          : {}),
-      };
-
-      _xem.fire("vibe:view-updated", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: persisted_view_id,
-        _source_view_id: source_view_id,
-        _requested_view_id: view_id,
-      });
-
-      _xlog.log("[xvibe] structured view edit applied", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: view_id,
-        _source_view_id: source_view_id,
-        _persisted_view_id: persisted_view_id,
-        _action: deterministic_result._mutation._action,
-        _target_id: mutation_target_id,
-      });
-
-      return {
-        ...result_details,
-        _result: result_details,
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] apply_view_edit failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] apply_view_edit failed", error);
-      if (archive) {
-        archive._result = {
-          _artifact_type: "view",
-          ...(archive._view_id ? { _artifact_id: archive._view_id, _view_id: archive._view_id } : {}),
-          _success: false,
-          _deterministic: true,
-          _error: {
-            _code: "E_XVIBE_APPLY_VIEW_EDIT",
-            _message: message,
-          },
-        };
-      }
-      return explicit_error("E_XVIBE_APPLY_VIEW_EDIT", message);
-    } finally {
-      if (archive) {
-        archive._duration_ms = Date.now() - archive_started_at;
-        archive_vibe_run(archive);
-      }
-    }
-  }
-
   async _generate(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-    try {
-      const result = await this.generate_artifact(params);
-      return result;
-    } catch (error) {
-      this.broadcast_generation_failed(params, error, "E_VIBE_AI_GENERATE");
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] generate failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      const diagnostic = parser_diagnostic(error);
-      const diagnostics = parser_diagnostics(error);
-      _xlog.error("[xvibe] generate failed", error);
-      return {
-        _ok: false,
-        _error: {
-          _code: "E_VIBE_AI_GENERATE",
-          _message: message,
-          ...(diagnostic ? { _diagnostic: diagnostic } : {}),
-          ...(diagnostics ? { _diagnostics: diagnostics } : {}),
-        },
-      };
-    }
+    return this.generation_manager.generate(xcmd);
   }
 
   async _generate_view(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-    try {
-      return await this.generate_artifact(params, "view");
-    } catch (error) {
-      this.broadcast_generation_failed(params, error, "E_VIBE_AI_GENERATE_VIEW");
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] generate_view failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      const diagnostic = parser_diagnostic(error);
-      const diagnostics = parser_diagnostics(error);
-      _xlog.error("[xvibe] generate_view failed", error);
-      return {
-        _ok: false,
-        _error: {
-          _code: "E_VIBE_AI_GENERATE_VIEW",
-          _message: message,
-          ...(diagnostic ? { _diagnostic: diagnostic } : {}),
-          ...(diagnostics ? { _diagnostics: diagnostics } : {}),
-        },
-      };
-    }
+    return this.generation_manager.generateView(xcmd);
   }
 
   async _get_latest_run(xcmd: XCommand) {
-    try {
-      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-      const app_id =
-        read_safe_path_segment(params._app_id, "_app_id", XVIBE_INVALID_APP_ID);
-      const env =
-        read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const generation_id =
-        read_safe_vibe_run_generation_id(params._generation_id);
-      const runs_dir =
-        resolve_vibe_runs_dir({
-          _app_id: app_id,
-          _env: env,
-        });
-      const run =
-        resolve_vibe_run_dir({
-          _runs_dir: runs_dir,
-          ...(generation_id ? { _generation_id: generation_id } : {}),
-        });
-      const diagnostics =
-        read_vibe_run_diagnostic_files(runs_dir, run._run_dir);
-      const summary =
-        summarize_vibe_run_diagnostics({
-          _generation_id: run._generation_id ?? generation_id,
-          _files: diagnostics._files,
-        });
-      const result: XVibeRunDiagnosticResult = {
-        _ok: true,
-        _run_id: run._run_id,
-        _run_dir: relative_vibe_run_dir({
-          _app_id: app_id,
-          _env: env,
-          _run_id: run._run_id,
-        }),
-        ...(summary._generation_id ? { _generation_id: summary._generation_id } : {}),
-        _summary: summary,
-        _files: diagnostics._files,
-        ...(diagnostics._file_errors.length > 0
-          ? { _file_errors: diagnostics._file_errors }
-          : {}),
-      };
-
-      return result;
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] get_latest_run failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] get_latest_run failed", error);
-      return explicit_error("E_XVIBE_GET_LATEST_RUN_FAILED", message);
-    }
+    return this.generation_manager.getLatestRun(xcmd);
   }
 
   async _plan_app(xcmd: XCommand): Promise<XVibePlanAppResult> {
-    try {
-      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-      const prompt = resolve_prompt(params);
-      const plan = this.planner.plan_app(prompt);
-
-      _xlog.log("[xvibe] app plan created", {
-        _app_type: plan._app_type,
-        _logic_level: plan._logic_level,
-        _artifacts: plan._artifacts,
-        ...(plan._flow_ids ? { _flow_ids: plan._flow_ids } : {}),
-        _requires_module: plan._requires_module,
-      });
-
-      return {
-        _ok: true,
-        _result: plan,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] plan_app failed", error);
-      return {
-        _ok: false,
-        _error: {
-          _code: "E_VIBE_PLAN_APP",
-          _message: message,
-        },
-      };
-    }
+    return this.generation_manager.planApp(xcmd) as Promise<XVibePlanAppResult>;
   }
 
   async _generate_module_spec(xcmd: XCommand): Promise<XVibeGenerateModuleSpecResult> {
-    const params = xcmd._params ?? {};
-    const prompt = String(params._prompt ?? "").trim();
-
-    if (!prompt) {
-      return {
-        _ok: false,
-        _needs_module_creator: true,
-        _error: {
-          _code: "E_XVIBE_EMPTY_PROMPT",
-          _message: "Missing _prompt for module spec generation."
-        }
-      };
-    }
-
-    const resolved_task =
-      resolve_xvibe_task({
-        _prompt: prompt,
-      });
-    _xlog.log("[xvibe] resolved task", resolved_task);
-
-    // v1: use LLM only to produce manifest JSON, not code.
-    // module-creator remains responsible for validation/generation/loading.
-
-    const module_id =
-      String(
-        params._module_id ??
-        resolved_task._module_name ??
-        "generated-module",
-      );
-    const module_name =
-      String(
-        params._module_name ??
-        params._module_id ??
-        resolved_task._module_name ??
-        "generated-module",
-      );
-
-    const spec: any = {
-      _id: module_id,
-      _name: module_name,
-      _target: "server" as const,
-      _description: `Generated server module from prompt: ${prompt}`,
-      _version: "0.1.0",
-      _imports: [
-        {
-          _from: "@xpell/node"
-        }
-      ],
-      _permissions: [],
-      _ops:
-        resolved_task._module_ops.map((op_name) => ({
-          _name: op_name,
-          _description: `Generated operation '${op_name}' for module '${module_name}'.`,
-          _params: {
-            _input: "Optional input payload."
-          }
-        }))
-    };
-
-    return {
-      _ok: true,
-      _spec: spec,
-      _needs_module_creator: true
-    };
+    return this.generation_manager.generateModuleSpec(xcmd) as Promise<XVibeGenerateModuleSpecResult>;
   }
 
   async _create_app_from_starter(xcmd: XCommand) {
@@ -15303,558 +12716,35 @@ export class XVibeModule extends XModule {
 
 
   async _create_conversation(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_ALREADY_EXISTS,
-          `Conversation already exists: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      const now = new Date().toISOString();
-      const title = read_optional_string(params._title, "_title");
-      const metadata =
-        read_optional_json_value(
-          params._metadata,
-          "_metadata",
-          XVIBE_CONVERSATION_STORAGE_FAILED,
-        );
-      const conversation: XVibeConversationDocument = {
-        _id: conversation_id,
-        _app_id: app_id,
-        _env: env,
-        _created_at: now,
-        _updated_at: now,
-        _message_count: 0,
-        ...(title ? { _title: title } : {}),
-        ...(metadata !== undefined ? { _metadata: metadata } : {}),
-      };
-
-      fs.mkdirSync(path.join(conversation_dir, "attachments"), { recursive: true });
-      write_json_object_file(path.join(conversation_dir, "conversation.json"), conversation);
-      fs.writeFileSync(path.join(conversation_dir, "messages.jsonl"), "", "utf-8");
-
-      const index =
-        upsert_conversation_index_entry(
-          read_conversation_index(conversations_dir, app_id, env),
-          conversation,
-        );
-      write_conversation_index(conversations_dir, index);
-
-      return {
-        _ok: true,
-        _result: {
-          _conversation: conversation,
-          _path: path.posix.join(
-            "xvm",
-            "apps",
-            env,
-            app_id,
-            "conversations",
-            conversation_id,
-          ),
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] create_conversation failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] create_conversation failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.createConversation(xcmd);
   }
 
   async _list_conversations(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      fs.mkdirSync(conversations_dir, { recursive: true });
-      const index_result = read_conversation_index_safe(conversations_dir, app_id, env);
-      const index = index_result._index;
-      write_conversation_index(conversations_dir, index);
-
-      return {
-        _ok: true,
-        _result: {
-          _app_id: app_id,
-          _env: env,
-          _conversations: index._conversations,
-          _count: index._conversations.length,
-          ...(index_result._recovered
-            ? {
-              _index_recovered: true,
-              _index_error: index_result._error,
-            }
-            : {}),
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] list_conversations failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] list_conversations failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.listConversations(xcmd);
   }
 
   async _get_conversation(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (!fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_NOT_FOUND,
-          `Conversation not found: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      const conversation = read_conversation_document(conversation_dir);
-      const messages = read_conversation_messages(conversation_dir);
-
-      return {
-        _ok: true,
-        _result: {
-          _conversation: conversation,
-          _messages: messages,
-          _attachments_path: path.posix.join(
-            "xvm",
-            "apps",
-            env,
-            app_id,
-            "conversations",
-            conversation_id,
-            "attachments",
-          ),
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] get_conversation failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] get_conversation failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.getConversation(xcmd);
   }
 
   async _append_message(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (!fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_NOT_FOUND,
-          `Conversation not found: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      const message =
-        normalize_conversation_message(
-          _xu.is_plain_object(params._message)
-            ? params._message
-            : params,
-        );
-      const conversation = read_conversation_document(conversation_dir);
-      const updated_conversation: XVibeConversationDocument = {
-        ...conversation,
-        _updated_at: message._created_at,
-        _last_message_at: message._created_at,
-        _message_count: conversation._message_count + 1,
-      };
-
-      fs.appendFileSync(
-        path.join(conversation_dir, "messages.jsonl"),
-        `${JSON.stringify(message)}\n`,
-        "utf-8",
-      );
-      write_json_object_file(
-        path.join(conversation_dir, "conversation.json"),
-        updated_conversation,
-      );
-      write_conversation_index(
-        conversations_dir,
-        upsert_conversation_index_entry(
-          read_conversation_index(conversations_dir, app_id, env),
-          updated_conversation,
-        ),
-      );
-
-      return {
-        _ok: true,
-        _result: {
-          _conversation: updated_conversation,
-          _message: message,
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] append_message failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] append_message failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.appendMessage(xcmd);
   }
 
   async _analyze_message(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env, "_env", XVIBE_INVALID_ENV);
-      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
-      if (typeof params._message !== "string") {
-        throw_explicit_error(
-          XVIBE_INVALID_CONVERSATION_MESSAGE,
-          "Invalid '_message': expected string",
-        );
-      }
-
-      const message_id =
-        read_optional_intent_context_string(params._message_id, "_message_id");
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (!fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_NOT_FOUND,
-          `Conversation not found: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      _xlog.log("[xvibe] analyze-message", {
-        _app_id: app_id,
-        _env: env,
-        _conversation_id: conversation_id,
-      });
-
-      const runtime_context =
-        normalize_analyze_message_runtime_context({
-          _app_id: app_id,
-          _env: env,
-          _conversation_id: conversation_id,
-          _runtime_context: params._runtime_context,
-        });
-      const intent_result =
-        await this.intent_engine.analyze({
-          _message: params._message,
-          _conversation_id: conversation_id,
-          _runtime_context: runtime_context,
-          ...(message_id
-            ? {
-              _metadata: {
-                _message_id: message_id,
-              },
-            }
-            : {}),
-        });
-
-      if (!intent_result._ok) {
-        return explicit_error(
-          XVIBE_INVALID_INTENT_REQUEST,
-          intent_result._reason ?? "Invalid intent request",
-          {
-            _error: intent_result._error ?? "invalid_intent_request",
-          },
-        );
-      }
-
-      normalize_intent_action_ids(intent_result._intent);
-
-      const append_result: any = await this._append_message({
-        _params: {
-          _app_id: app_id,
-          _env: env,
-          _conversation_id: conversation_id,
-          _message: {
-            _role: "tool",
-            _text: "Intent analyzed.",
-            _intent: intent_result._intent,
-            _metadata: {
-              _source: "xvibe.analyze-message",
-            },
-          },
-        },
-      } as unknown as XCommand);
-      if (!append_result?._ok) {
-        return append_result;
-      }
-
-      return {
-        _ok: true,
-        _intent: intent_result._intent,
-        _result: {
-          _intent: intent_result._intent,
-          _message: append_result._result?._message,
-          _conversation: append_result._result?._conversation,
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] analyze_message failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] analyze_message failed", error);
-      return explicit_error(XVIBE_INVALID_INTENT_REQUEST, message);
-    }
+    return IntentConversationBridge.analyze({
+      _cmd: xcmd,
+      _intent_engine: this.intent_engine,
+      _structured_error_payload: structured_error_payload,
+    });
   }
 
   async _update_conversation_action(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env, "_env", XVIBE_INVALID_ENV);
-      const conversation_id =
-        read_safe_path_segment(
-          params._conversation_id,
-          "_conversation_id",
-          XVIBE_INVALID_CONVERSATION_ID,
-        );
-      const message_id =
-        read_safe_path_segment(
-          params._message_id,
-          "_message_id",
-          XVIBE_INVALID_CONVERSATION_MESSAGE,
-        );
-      const action_id =
-        read_safe_path_segment(
-          params._action_id,
-          "_action_id",
-          XVIBE_INVALID_CONVERSATION_ACTION,
-        );
-      const status = read_conversation_action_status(params._status);
-      const result =
-        read_optional_json_object(
-          params._result,
-          "_result",
-          XVIBE_INVALID_CONVERSATION_ACTION,
-        );
-      const metadata =
-        read_optional_json_object(
-          params._metadata,
-          "_metadata",
-          XVIBE_INVALID_CONVERSATION_ACTION,
-        );
-      const error_message =
-        read_optional_conversation_action_error(params._error);
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (!fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_NOT_FOUND,
-          `Conversation not found: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      read_conversation_document(conversation_dir);
-      const messages = read_conversation_messages(conversation_dir);
-      const message =
-        messages.find((item) => item._id === message_id);
-      if (!message) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_MESSAGE_NOT_FOUND,
-          `Conversation message not found: ${message_id}`,
-          {
-            _conversation_id: conversation_id,
-            _message_id: message_id,
-          },
-        );
-      }
-
-      const intent =
-        _xu.is_plain_object(message._intent)
-          ? message._intent as XVibeJsonObject
-          : undefined;
-      const actions =
-        intent && Array.isArray(intent._actions)
-          ? intent._actions
-          : [];
-      let action: XVibeJsonObject | undefined;
-      for (const candidate of actions) {
-        if (
-          _xu.is_plain_object(candidate) &&
-          candidate._id === action_id
-        ) {
-          action = candidate as XVibeJsonObject;
-          break;
-        }
-      }
-
-      if (!action) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_ACTION_NOT_FOUND,
-          `Conversation action not found: ${action_id}`,
-          {
-            _conversation_id: conversation_id,
-            _message_id: message_id,
-            _action_id: action_id,
-          },
-        );
-      }
-
-      action._status = status;
-      if (result !== undefined) {
-        action._result = result;
-      }
-      if (error_message !== undefined) {
-        action._error = error_message;
-      }
-      if (metadata !== undefined) {
-        action._metadata = metadata;
-      }
-
-      write_conversation_messages(conversation_dir, messages);
-
-      return {
-        _ok: true,
-        _result: {
-          _app_id: app_id,
-          _env: env,
-          _conversation_id: conversation_id,
-          _message_id: message_id,
-          _action_id: action_id,
-          _status: status,
-          _message: message,
-          _action: action,
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] update_conversation_action failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] update_conversation_action failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.updateConversationAction(xcmd);
   }
 
   async _get_last_messages(xcmd: XCommand) {
-    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
-
-    try {
-      const app_id = normalize_safe_app_id(params._app_id);
-      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
-      const conversation_id = normalize_safe_conversation_id(params._conversation_id);
-      const limit =
-        typeof params._limit === "number" && Number.isInteger(params._limit) && params._limit > 0
-          ? Math.min(params._limit, XVIBE_CONVERSATION_LAST_MESSAGES_MAX_LIMIT)
-          : 20;
-      const conversations_dir = resolve_conversations_dir({
-        _app_id: app_id,
-        _env: env,
-      });
-      const conversation_dir = conversation_dir_path(conversations_dir, conversation_id);
-
-      if (!fs.existsSync(conversation_dir)) {
-        throw_explicit_error(
-          XVIBE_CONVERSATION_NOT_FOUND,
-          `Conversation not found: ${conversation_id}`,
-          {
-            _conversation_id: conversation_id,
-          },
-        );
-      }
-
-      const messages = read_conversation_messages(conversation_dir);
-
-      return {
-        _ok: true,
-        _result: {
-          _conversation_id: conversation_id,
-          _messages: messages.slice(-limit),
-          _count: Math.min(messages.length, limit),
-          _total: messages.length,
-        },
-      };
-    } catch (error) {
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] get_last_messages failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      _xlog.error("[xvibe] get_last_messages failed", error);
-      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
-    }
+    return ConversationManager.getLastMessages(xcmd);
   }
 
 
@@ -15960,339 +12850,11 @@ export class XVibeModule extends XModule {
   }
 
   async _generate_app(cmd: XCommand) {
-
-    const params =
-      _xu.is_plain_object(cmd?._params)
-        ? cmd._params
-        : {};
-
-    try {
-      const prompt = resolve_prompt(params);
-      const resolved_task =
-        read_existing_resolved_task(params._resolved_task) ??
-        resolve_xvibe_task({
-          _prompt: prompt,
-        });
-      params._resolved_task = resolved_task;
-      _xlog.log("[xvibe] resolved task", resolved_task);
-      const app_id =
-        read_optional_string(params._app_id, "_app_id") ?? "xvibe-app";
-      const env =
-        read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
-      const generation_id = read_optional_string(params._generation_id, "_generation_id");
-      const entry_view_id = "main";
-
-      _xlog.log("[xvibe] generate_app:start", {
-        _prompt: prompt,
-        _app_id: app_id,
-        _env: env,
-      });
-
-      await _x.execute({
-        _module: "server-xvm",
-        _op: "create_app",
-        _params: {
-          _app_id: app_id,
-          _env: env,
-          _name: app_id,
-          _entry_view_id: entry_view_id,
-        }
-      });
-
-      this.push_generation_stage(
-        app_id,
-        env,
-        "shell",
-        "Creating application...",
-        generation_id
-      );
-
-      await _x.execute({
-        _module: "server-xvm",
-        _op: "push_update",
-        _params: {
-          _app_id: app_id,
-          _env: env,
-          ...(generation_id ? { _generation_id: generation_id } : {}),
-          _view: this.build_live_shell_view(app_id, env, entry_view_id),
-        }
-      });
-
-      _xlog.log("[xvibe] live shell pushed", {
-        _app_id: app_id,
-        _env: env,
-        _view_id: entry_view_id,
-      });
-
-      await _x.execute({
-        _module: "server-xvm",
-        _op: "set_active_app",
-        _params: {
-          _app_id: app_id,
-          _env: env
-        }
-      });
-
-      _xlog.log("[xvibe] active app set early", {
-        _app_id: app_id,
-        _env: env,
-      });
-
-      let plan = this.planner.plan_app(prompt);
-      let view_scope_warnings: string[] = [];
-      const app_view_scope_lock =
-        apply_view_scope_lock_to_app_plan({
-          prompt,
-          resolved_task,
-          plan,
-        });
-      plan = app_view_scope_lock._plan;
-      view_scope_warnings = [
-        ...view_scope_warnings,
-        ...app_view_scope_lock._warnings,
-      ];
-      warn_if_plan_violates_resolved_task(resolved_task, plan);
-      _xlog.log("[xvibe] app plan created", {
-        _app_type: plan._app_type,
-        _logic_level: plan._logic_level,
-        _artifacts: plan._artifacts,
-        ...(plan._flow_ids ? { _flow_ids: plan._flow_ids } : {}),
-        _requires_module: plan._requires_module,
-      });
-
-      this.push_generation_stage(
-        app_id,
-        env,
-        "planning",
-        "Planning application...",
-        generation_id
-      );
-
-      let intent_plan = await this.create_intent_plan({
-        prompt,
-        app_plan: plan,
-        app_id,
-        env,
-      });
-      if (resolved_task._artifact_type === "view") {
-        const view_scope_lock =
-          apply_view_scope_lock({
-            prompt,
-            resolved_task,
-            intent_plan,
-          });
-        intent_plan = view_scope_lock._intent_plan ?? intent_plan;
-        view_scope_warnings = [
-          ...view_scope_warnings,
-          ...view_scope_lock._warnings,
-        ];
-      }
-      const module_ensure_result =
-        await this.ensure_server_module_for_intent({
-          app_id,
-          env,
-          runtime_mode:
-            app_id === "vibe-system"
-              ? "system"
-              : "runtime",
-          prompt,
-          intent_plan,
-        });
-      intent_plan = module_ensure_result._intent_plan;
-      if (resolved_task._artifact_type === "view") {
-        const view_scope_lock =
-          apply_view_scope_lock({
-            prompt,
-            resolved_task,
-            intent_plan,
-          });
-        intent_plan = view_scope_lock._intent_plan ?? intent_plan;
-        view_scope_warnings = [
-          ...view_scope_warnings,
-          ...view_scope_lock._warnings,
-        ];
-      }
-      warn_if_plan_violates_resolved_task(resolved_task, intent_plan);
-      if (view_scope_warnings.length > 0) {
-        _xlog.warn("[xvibe] view scope lock warnings", {
-          _warnings: Array.from(new Set(view_scope_warnings)),
-        });
-      }
-
-      this.push_generation_stage(
-        app_id,
-        env,
-        "planned",
-        "Application plan created",
-        generation_id
-      );
-
-      this.log_intent_plan("artifact_type", intent_plan);
-      const execution_plan = this.build_execution_plan_for_intent(plan, intent_plan);
-      warn_if_plan_violates_resolved_task(resolved_task, {
-        _primary_artifact_type: execution_plan[execution_plan.length - 1]?._artifact_type,
-        _artifacts: execution_plan,
-      });
-      _xlog.log("[xvibe] execution plan created", {
-        _app_id: app_id,
-        _execution_plan: execution_plan,
-      });
-
-      this.push_generation_stage(
-        app_id,
-        env,
-        "generating",
-        "Generating artifacts...",
-        generation_id
-      );
-      const context = this.build_artifact_generation_context({
-        _plan: plan,
-        _intent_plan: intent_plan,
-        _resolved_task: resolved_task,
-        _app_id: app_id,
-        _env: env,
-        ...(generation_id ? { _generation_id: generation_id } : {}),
-      });
-
-      const generated_artifacts =
-        await this.generate_planned_artifacts({
-          _prompt: prompt,
-          _entry_view_id: entry_view_id,
-          _execution_plan: execution_plan,
-          _context: context,
-        });
-
-
-
-      await _x.execute({
-        _module: "server-xvm",
-        _op: "set_active_app",
-        _params: {
-          _app_id: app_id,
-          _env: env
-        }
-      });
-
-      _xlog.log("[xvibe] app orchestration completed", {
-        _app_id: app_id,
-        _env: env,
-        _generated_artifacts: generated_artifacts,
-      });
-
-      this.push_generation_stage(
-        app_id,
-        env,
-        "complete",
-        "Application ready",
-        generation_id
-      );
-
-      return {
-        _ok: true,
-        _result: {
-          _app_id: app_id,
-          _env: env,
-          _entry_view_id: entry_view_id,
-          _plan: plan,
-          _intent_plan: intent_plan,
-          _generated_artifacts: generated_artifacts,
-        }
-      };
-    } catch (error) {
-      this.broadcast_generation_failed(
-        {
-          ...params,
-          _app_id:
-            typeof params._app_id === "string" && params._app_id.trim()
-              ? params._app_id.trim()
-              : "xvibe-app",
-          _env:
-            typeof params._env === "string" && params._env.trim()
-              ? params._env.trim()
-              : DEFAULT_ENV,
-        },
-        error,
-        "E_VIBE_AI_GENERATE_APP",
-      );
-      const structured = structured_error_payload(error);
-      if (structured) {
-        _xlog.error("[xvibe] generate_app failed", error);
-        return structured;
-      }
-
-      const message = error instanceof Error ? error.message : String(error);
-      const diagnostic = parser_diagnostic(error);
-      const diagnostics = parser_diagnostics(error);
-      _xlog.error("[xvibe] generate_app failed", error);
-      return {
-        _ok: false,
-        _error: {
-          _code: "E_VIBE_AI_GENERATE_APP",
-          _message: message,
-          ...(diagnostic ? { _diagnostic: diagnostic } : {}),
-          ...(diagnostics ? { _diagnostics: diagnostics } : {}),
-        },
-      };
-    }
+    return this.generation_manager.generateApp(cmd);
   }
 
   async _sync_skills(xcmd: XCommand) {
-    const params =
-      _xu.is_plain_object(xcmd?._params)
-        ? xcmd._params
-        : {};
-
-    const skills =
-      _xu.is_plain_object(params._skills)
-        ? params._skills
-        : {};
-
-    const skills_count =
-      Array.isArray((skills as any)._modules)
-        ? (skills as any)._modules.length
-        : 0;
-
-    const scope =
-      this.runtime_skill_scope(
-        params._app_id,
-        params._env,
-        params._mode
-      );
-
-    this.runtime_skills_by_scope.set(scope, {
-      _app_id: params._app_id,
-      _env: params._env,
-      _mode: params._mode,
-      _skills: skills,
-      _skills_count: skills_count,
-      _synced_at: new Date().toISOString()
-    });
-
-    this.latest_runtime_skills = {
-      _app_id: params._app_id,
-      _env: params._env,
-      _mode: params._mode,
-      _skills: skills,
-      _skills_count: skills_count,
-      _synced_at: new Date().toISOString()
-    };
-
-    _xlog.log("[xvibe] runtime skills synced", {
-      _scope: scope,
-      _app_id: params._app_id,
-      _env: params._env,
-      _mode: params._mode,
-      _skills_count: skills_count
-    });
-
-    return {
-      _ok: true,
-      _result: {
-        _synced: true,
-        _scope: scope,
-        _skills_count: skills_count
-      }
-    };
+    return this.generation_manager.syncSkills(xcmd);
   }
 
 
