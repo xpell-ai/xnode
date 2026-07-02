@@ -78,6 +78,13 @@ type ServerXvmPushUpdateResult = {
   _notified_subscribers: string[];
 };
 
+type XStudioArtifactSummary = {
+  _id: string;
+  _title?: string;
+  _path?: string;
+  _enabled?: boolean;
+};
+
 function is_plain_object(_value: unknown): _value is Record<string, unknown> {
   return typeof _value === "object" && _value !== null && !Array.isArray(_value);
 }
@@ -116,6 +123,22 @@ function read_optional_string(
 
   const _trimmed = _value.trim();
   return _trimmed.length > 0 ? _trimmed : undefined;
+}
+
+function read_safe_segment(
+  _value: unknown,
+  _field_name: string,
+  _code: string,
+): string {
+  const _segment = read_required_string(_value, _field_name);
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u.test(_segment)) {
+    throw create_error_result(
+      _code,
+      `Invalid '${_field_name}': expected safe path segment`,
+    );
+  }
+
+  return _segment;
 }
 
 function clone_view(_view: XStudioViewData): XStudioViewData {
@@ -405,6 +428,17 @@ export const XSTUDIO_OPS: Record<string, XpellSkillCommand> = {
       _app_id: "Target XVM app id.",
       _env: "Optional environment. Defaults to default.",
       _generation_id: "Optional generation id. Defaults to the latest vibe-run."
+    }
+  },
+
+  "list-app-artifacts": {
+    _name: "list-app-artifacts",
+    _scope: "module",
+    _description:
+      "Return read-only XVM app artifact summaries for Studio App Explorer.",
+    _params: {
+      _app_id: "Target XVM app id.",
+      _env: "Target environment."
     }
   },
 
@@ -813,6 +847,63 @@ export class XStudioModule extends XModule {
     return this._op_inspect_latest_run(xcmd);
   }
 
+  async _list_app_artifacts(xcmd: XCommand) {
+    return this._op_list_app_artifacts(xcmd);
+  }
+
+  async _op_list_app_artifacts(xcmd: XCommand) {
+    try {
+      const _params = this.parse_list_app_artifacts_params(xcmd?._params);
+
+      _xlog.log("[xstudio] list app artifacts", {
+        _app_id: _params._app_id,
+        _env: _params._env,
+      });
+
+      const [_views, _flows, _entities, _modules] = await Promise.all([
+        this.read_server_xvm_artifact_list(
+          "list_views",
+          "_views",
+          _params,
+        ),
+        this.read_server_xvm_artifact_list(
+          "list_flows",
+          "_flows",
+          _params,
+        ),
+        this.read_server_xvm_artifact_list(
+          "list_entities",
+          "_entities",
+          _params,
+        ),
+        this.read_server_xvm_artifact_list(
+          "list_generated_modules",
+          "_modules",
+          _params,
+        ),
+      ]);
+
+      return {
+        _ok: true,
+        _app_id: _params._app_id,
+        _env: _params._env,
+        _artifacts: {
+          _views: this.normalize_artifact_summaries(_views, "views"),
+          _flows: this.normalize_artifact_summaries(_flows, "flows"),
+          _entities: this.normalize_artifact_summaries(_entities, "entities"),
+          _modules: this.normalize_artifact_summaries(_modules, "modules"),
+        },
+      };
+    } catch (_error) {
+      _xlog.error("[xstudio] list app artifacts failed", _error);
+      return this.normalize_error(
+        _error,
+        "E_STUDIO_LIST_APP_ARTIFACTS",
+        "Failed to list app artifacts",
+      );
+    }
+  }
+
   async _op_inspect_latest_run(xcmd: XCommand) {
     try {
       const _params = this.parse_inspect_latest_run_params(xcmd?._params);
@@ -850,6 +941,117 @@ export class XStudioModule extends XModule {
         "Failed to inspect the latest XVibe run",
       );
     }
+  }
+
+  private parse_list_app_artifacts_params(
+    _params: unknown,
+  ): { _app_id: string; _env: string } {
+    if (!is_plain_object(_params)) {
+      throw new Error("Invalid '_params': expected object");
+    }
+
+    return {
+      _app_id: read_safe_segment(
+        _params._app_id,
+        "_app_id",
+        "E_STUDIO_INVALID_APP_ID",
+      ),
+      _env: read_safe_segment(
+        _params._env,
+        "_env",
+        "E_STUDIO_INVALID_ENV",
+      ),
+    };
+  }
+
+  private async read_server_xvm_artifact_list(
+    _op: string,
+    _result_key: "_views" | "_flows" | "_entities" | "_modules",
+    _params: { _app_id: string; _env: string },
+  ): Promise<unknown[]> {
+    const _response = await _x.execute({
+      _module: "server-xvm",
+      _op,
+      _params,
+    } as any);
+
+    const _command_error = extract_command_error_result(_response);
+    if (_command_error) {
+      throw _command_error;
+    }
+
+    if (
+      !is_plain_object(_response) ||
+      _response._ok !== true ||
+      !is_plain_object(_response._result) ||
+      !Array.isArray(_response._result[_result_key])
+    ) {
+      throw create_error_result(
+        "E_STUDIO_INVALID_ARTIFACT_LIST_RESPONSE",
+        "server-xvm returned an invalid artifact list response",
+        {
+          _op,
+          _result_key,
+          _app_id: _params._app_id,
+          _env: _params._env,
+        },
+      );
+    }
+
+    return _response._result[_result_key] as unknown[];
+  }
+
+  private normalize_artifact_summaries(
+    _items: unknown[],
+    _kind: "views" | "flows" | "entities" | "modules",
+  ): XStudioArtifactSummary[] {
+    return _items
+      .map((_item): XStudioArtifactSummary | undefined => {
+        if (typeof _item === "string") {
+          return {
+            _id: _item,
+            _path: `${_kind}/${_item}.json`,
+          };
+        }
+
+        if (!is_plain_object(_item)) {
+          return undefined;
+        }
+
+        const _id_value =
+          typeof _item._id === "string" && _item._id.trim().length > 0
+            ? _item._id.trim()
+            : typeof _item._name === "string" && _item._name.trim().length > 0
+              ? _item._name.trim()
+              : undefined;
+
+        if (!_id_value) {
+          return undefined;
+        }
+
+        const _title =
+          typeof _item._title === "string" && _item._title.trim().length > 0
+            ? _item._title.trim()
+            : typeof _item._name === "string" && _item._name.trim().length > 0
+              ? _item._name.trim()
+              : undefined;
+        const _path =
+          typeof _item._path === "string" && _item._path.trim().length > 0
+            ? _item._path.trim()
+            : typeof _item._artifact_path === "string" && _item._artifact_path.trim().length > 0
+              ? _item._artifact_path.trim()
+              : _kind === "modules"
+                ? undefined
+                : `${_kind}/${_id_value}.json`;
+
+        return {
+          _id: _id_value,
+          ...(_title ? { _title } : {}),
+          ...(_path ? { _path } : {}),
+          ...(typeof _item._enabled === "boolean" ? { _enabled: _item._enabled } : {}),
+        };
+      })
+      .filter((_item): _item is XStudioArtifactSummary => _item !== undefined);
   }
 
   private parse_generate_view_params(

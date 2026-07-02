@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { XModule, type XCommand, _xlog, _x, XError, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 import { _xu } from "../XNUtils/XUtils.js";
@@ -48,6 +49,8 @@ const DEFAULT_ENV = "default";
 const DEFAULT_WORK_FOLDER = "./work";
 const XVM_FOLDER = "xvm/apps";
 const GENERATED_MODULE_REGISTRY_FILE = "generated/xmodules/registry.json";
+const XNODE_PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const ALLOWED_VIEW_STARTER_TEMPLATES = new Set(["blank", "page", "component"]);
 
 const EVT_UPDATE = "server-xvm:update";
 
@@ -99,6 +102,12 @@ export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
     _name: "get_view",
     _scope: "module",
     _description: "Load view artifact."
+  },
+
+  create_view: {
+    _name: "create_view",
+    _scope: "module",
+    _description: "Create a deterministic persisted view artifact."
   },
 
   push_update: {
@@ -234,6 +243,7 @@ export class ServerXVMModule extends XModule {
   private _apps: Map<string, XVMAppBundle> = new Map();
   private _active_app_by_env: Map<string, string> = new Map();
   private _system_xapps_path?: string;
+  private _package_system_xapps_path: string;
 
   constructor(opts: any = {}) {
     super({ _name: ServerXVMModule._name });
@@ -244,6 +254,11 @@ export class ServerXVMModule extends XModule {
     this._system_xapps_path = typeof opts._system_xapps_path === "string" && opts._system_xapps_path
       ? path.resolve(opts._system_xapps_path)
       : undefined;
+    this._package_system_xapps_path =
+      typeof opts._package_system_xapps_path === "string" &&
+      opts._package_system_xapps_path
+      ? path.resolve(opts._package_system_xapps_path)
+      : path.resolve(XNODE_PACKAGE_ROOT, "system-xapps");
   }
 
   /* ------------------------------------------------------------------------ */
@@ -479,6 +494,88 @@ export class ServerXVMModule extends XModule {
             : 0
         })),
       },
+    };
+  }
+
+  async _create_view(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+
+    const app_id = this.resolve_safe_segment(
+      params._app_id,
+      "_app_id",
+      "E_XVM_INVALID_APP_ID"
+    );
+    const env = this.resolve_safe_segment(
+      params._env,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const view_id = this.resolve_safe_view_id(params._view_id);
+    const template = this.resolve_view_template(params._template);
+    const title = typeof params._title === "string" && params._title.trim()
+      ? params._title.trim()
+      : undefined;
+
+    _xlog.log("[xstudio] create view requested", {
+      _app_id: app_id,
+      _env: env,
+      _view_id: view_id,
+      _template: template
+    });
+
+    const bundle = this.get_bundle(app_id, env);
+    this.assert_mutable_bundle(bundle);
+
+    const app_dir = this.resolve_user_app_dir(env, app_id);
+    const views_dir = path.join(app_dir, "views");
+    const view_file = this.resolve_view_file_path(views_dir, view_id);
+
+    if (bundle._views[view_id] || fs.existsSync(view_file)) {
+      throw new XError("E_XVM_VIEW_ALREADY_EXISTS", `View already exists: ${view_id}`);
+    }
+
+    const view = this.load_view_starter_template(view_id, title ?? view_id, template);
+    const next_app: XVMAppFile = {
+      ...bundle._app,
+      _meta: {
+        ...bundle._app._meta,
+        _version: bundle._app._meta._version + 1,
+        _updated_at: _xu.to_iso_now()
+      }
+    };
+
+    fs.mkdirSync(views_dir, { recursive: true });
+    this.write_new_json_file(view_file, view);
+
+    try {
+      this.write_json_file_atomic(
+        path.join(app_dir, "app.json"),
+        next_app
+      );
+    } catch (err) {
+      try {
+        fs.unlinkSync(view_file);
+      } catch {
+      }
+
+      throw err;
+    }
+
+    bundle._app = next_app;
+    bundle._views[view_id] = view;
+
+    _xlog.log("[xstudio] create view created", {
+      _app_id: app_id,
+      _env: env,
+      _view_id: view_id,
+      _path: view_file
+    });
+
+    return {
+      _ok: true,
+      _view_id: view_id,
+      _path: view_file,
+      _view: view
     };
   }
 
@@ -1136,9 +1233,23 @@ export class ServerXVMModule extends XModule {
     return Object.values(modules)
       .filter((entry): entry is Record<string, any> => _xu.is_plain_object(entry))
       .map((entry) => ({
+        _id: typeof entry._id === "string"
+          ? entry._id
+          : typeof entry._name === "string"
+            ? entry._name
+            : "",
         _name: typeof entry._name === "string"
           ? entry._name
           : "",
+        _title: typeof entry._title === "string"
+          ? entry._title
+          : typeof entry._name === "string"
+            ? entry._name
+            : undefined,
+        _path: typeof entry._artifact_path === "string"
+          ? entry._artifact_path
+          : undefined,
+        _enabled: entry._autoload === true && registry_entry_state(entry) !== "disabled",
         _state: registry_entry_state(entry),
         _autoload: entry._autoload === true,
         _ops: registry_entry_ops(entry)
@@ -1169,6 +1280,123 @@ export class ServerXVMModule extends XModule {
     return segment;
   }
 
+  private resolve_safe_view_id(value: unknown): string {
+    if (typeof value !== "string") {
+      throw new XError("E_XVM_INVALID_VIEW_ID", "Invalid _view_id");
+    }
+
+    const view_id = value.trim();
+    if (!/^[a-z0-9][a-z0-9_-]*$/u.test(view_id)) {
+      throw new XError("E_XVM_INVALID_VIEW_ID", "Invalid _view_id");
+    }
+
+    return view_id;
+  }
+
+  private resolve_view_template(value: unknown): "blank" | "page" | "component" {
+    if (value === undefined || value === null || value === "") {
+      return "blank";
+    }
+
+    if (
+      typeof value === "string" &&
+      ALLOWED_VIEW_STARTER_TEMPLATES.has(value)
+    ) {
+      return value as "blank" | "page" | "component";
+    }
+
+    throw new XError("E_XVM_INVALID_VIEW_TEMPLATE", "Invalid _template");
+  }
+
+  private resolve_work_system_xapps_root(): string {
+    return path.resolve(this._work_folder, "system-xapps");
+  }
+
+  private resolve_package_system_xapps_root(): string {
+    return path.resolve(this._package_system_xapps_path);
+  }
+
+  private resolve_view_starter_candidate(
+    system_xapps_root: string,
+    template: string
+  ): string {
+    const starters_root =
+      path.resolve(system_xapps_root, "view-starters");
+    const starter_file =
+      path.resolve(starters_root, template, "view.json");
+    const relative =
+      path.relative(starters_root, starter_file);
+
+    if (
+      relative.startsWith("..") ||
+      path.isAbsolute(relative)
+    ) {
+      throw new XError("E_XVM_INVALID_VIEW_TEMPLATE", "Invalid _template");
+    }
+
+    return starter_file;
+  }
+
+  private resolve_view_starter_file(template: string): {
+    _path: string;
+    _source: "work" | "package";
+    _work_path: string;
+    _package_path: string;
+  } {
+    const work_path =
+      this.resolve_view_starter_candidate(
+        this.resolve_work_system_xapps_root(),
+        template
+      );
+    const package_path =
+      this.resolve_view_starter_candidate(
+        this.resolve_package_system_xapps_root(),
+        template
+      );
+
+    if (fs.existsSync(work_path)) {
+      _xlog.log("[xstudio] view starter resolved", {
+        _template: template,
+        _source: "work",
+        _path: work_path
+      });
+
+      return {
+        _path: work_path,
+        _source: "work",
+        _work_path: work_path,
+        _package_path: package_path
+      };
+    }
+
+    if (fs.existsSync(package_path)) {
+      _xlog.log("[xstudio] view starter resolved", {
+        _template: template,
+        _source: "package",
+        _path: package_path
+      });
+
+      return {
+        _path: package_path,
+        _source: "package",
+        _work_path: work_path,
+        _package_path: package_path
+      };
+    }
+
+    throw new XError(
+      "E_XVM_VIEW_STARTER_NOT_FOUND",
+      `View starter not found: ${template}`,
+      {
+        _meta: {
+          _template: template,
+          _work_path: work_path,
+          _package_path: package_path
+        }
+      }
+    );
+  }
+
   private resolve_user_app_dir(env: string, app_id: string): string {
     const root = path.resolve(this._apps_root);
     const app_dir = path.resolve(root, env, app_id);
@@ -1182,6 +1410,128 @@ export class ServerXVMModule extends XModule {
     }
 
     return app_dir;
+  }
+
+  private resolve_view_file_path(views_dir: string, view_id: string): string {
+    const root = path.resolve(views_dir);
+    const view_file = path.resolve(root, `${view_id}.json`);
+    const relative = path.relative(root, view_file);
+
+    if (
+      relative.startsWith("..") ||
+      path.isAbsolute(relative)
+    ) {
+      throw new XError("E_XVM_INVALID_VIEW_PATH", "Invalid view path");
+    }
+
+    return view_file;
+  }
+
+  private load_view_starter_template(
+    view_id: string,
+    title: string,
+    template: "blank" | "page" | "component"
+  ): XVMView {
+    const starter =
+      this.resolve_view_starter_file(template);
+
+    let raw: unknown;
+    try {
+      raw = JSON.parse(
+        fs.readFileSync(starter._path, "utf-8")
+      );
+    } catch (err) {
+      throw new XError(
+        "E_XVM_VIEW_STARTER_INVALID",
+        `Invalid view starter JSON: ${template}`,
+        {
+          _meta: {
+            _template: template,
+            _path: starter._path,
+            _source: starter._source,
+            _error: err instanceof Error ? err.message : String(err)
+          }
+        }
+      );
+    }
+
+    const view =
+      this.replace_view_starter_placeholders(raw, {
+        view_id,
+        title
+      });
+
+    if (
+      !_xu.is_plain_object(view) ||
+      view._id !== view_id ||
+      view._type !== "view"
+    ) {
+      throw new XError(
+        "E_XVM_VIEW_STARTER_INVALID",
+        `Invalid view starter shape: ${template}`,
+        {
+          _meta: {
+            _template: template,
+            _path: starter._path,
+            _source: starter._source
+          }
+        }
+      );
+    }
+
+    return view as XVMView;
+  }
+
+  private replace_view_starter_placeholders(
+    value: unknown,
+    replacements: {
+      view_id: string;
+      title: string;
+    }
+  ): unknown {
+    if (typeof value === "string") {
+      return value
+        .replaceAll("{{view_id}}", replacements.view_id)
+        .replaceAll("{{title}}", replacements.title);
+    }
+
+    if (Array.isArray(value)) {
+      return value.map(item =>
+        this.replace_view_starter_placeholders(item, replacements)
+      );
+    }
+
+    if (_xu.is_plain_object(value)) {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value)) {
+        out[key] =
+          this.replace_view_starter_placeholders(item, replacements);
+      }
+
+      return out;
+    }
+
+    return value;
+  }
+
+  private write_new_json_file(file_path: string, data: unknown) {
+    const file = fs.openSync(file_path, "wx");
+    try {
+      fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    } finally {
+      fs.closeSync(file);
+    }
+  }
+
+  private write_json_file_atomic(file_path: string, data: unknown) {
+    const temp_file =
+      `${file_path}.${process.pid}.${Date.now()}.tmp`;
+
+    fs.writeFileSync(
+      temp_file,
+      JSON.stringify(data, null, 2)
+    );
+    fs.renameSync(temp_file, file_path);
   }
 
 

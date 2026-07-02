@@ -2,8 +2,16 @@ import fs from "node:fs";
 import path from "node:path";
 import { _x, _xlog, type XCommand } from "@xpell/core";
 import { _xu } from "../../XNUtils/XUtils.js";
+import {
+  IntentMemoryStore,
+  normalize_learned_intent_prompt,
+  validate_learned_intent_result,
+} from "../IntentMemory/IntentMemoryStore.js";
 import type { XVibeJsonObject } from "../VibeOutputParser.js";
-import type { XVibeIntentRuntimeContext } from "../XVibeTypes.js";
+import type {
+  XVibeIntentResult,
+  XVibeIntentRuntimeContext,
+} from "../XVibeTypes.js";
 
 const DEFAULT_ENV = "default";
 const XVIBE_INVALID_APP_ID = "E_XVIBE_INVALID_APP_ID";
@@ -375,6 +383,329 @@ function read_conversation_action_status(value: unknown): XVibeConversationActio
   }
 
   return value as XVibeConversationActionStatus;
+}
+
+function clone_json<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function read_trimmed_string(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function derive_verified_learned_action_title(action: XVibeJsonObject): string {
+  const title = read_trimmed_string(action._title);
+  if (title) {
+    return title;
+  }
+
+  const params = _xu.is_plain_object(action._params)
+    ? action._params
+    : {};
+  switch (read_trimmed_string(params._edit_action)) {
+    case "hide-object":
+      return "Hide selected object";
+    case "show-object":
+      return "Show selected object";
+    case "remove-object":
+      return "Delete selected object";
+    case "duplicate-object":
+      return "Duplicate selected object";
+    case "move-object":
+      return "Move selected object";
+    default:
+      return "Apply view edit";
+  }
+}
+
+type XVibeConversationLearningMetadata = {
+  _processor?: string;
+  _normalized_prompt?: string;
+  _source_message_id?: string;
+  _selected_type?: string;
+};
+
+type XVibeConversationLearningEligibility = {
+  _processor?: string;
+  _status: XVibeConversationActionStatus;
+  _result_ok: boolean;
+  _action_type?: string;
+  _has_user_prompt: boolean;
+  _selected_type?: string;
+  _eligible: boolean;
+  _reason: string;
+  _normalized_prompt?: string;
+  _intent?: XVibeIntentResult;
+  _sanitized_intent?: XVibeJsonObject;
+  _validation_error?: string;
+};
+
+function read_learning_metadata(
+  message: XVibeConversationMessage,
+): XVibeConversationLearningMetadata {
+  if (!_xu.is_plain_object(message._metadata)) {
+    return {};
+  }
+
+  const processor =
+    typeof message._metadata._intent_processor === "string"
+      ? message._metadata._intent_processor.trim()
+      : undefined;
+  const normalized_prompt =
+    typeof message._metadata._normalized_prompt === "string"
+      ? message._metadata._normalized_prompt.trim()
+      : undefined;
+  const source_message_id =
+    typeof message._metadata._message_id === "string" &&
+      message._metadata._message_id.trim().length > 0
+      ? message._metadata._message_id.trim()
+      : undefined;
+
+  const selected_type =
+    typeof message._metadata._selected_type === "string" &&
+    message._metadata._selected_type.trim().length > 0
+      ? message._metadata._selected_type.trim()
+      : undefined;
+
+  return {
+    ...(processor ? { _processor: processor } : {}),
+    ...(normalized_prompt ? { _normalized_prompt: normalized_prompt } : {}),
+    ...(source_message_id ? { _source_message_id: source_message_id } : {}),
+    ...(selected_type ? { _selected_type: selected_type } : {}),
+  };
+}
+
+function resolve_learning_prompt(input: {
+  _message: XVibeConversationMessage;
+  _messages: XVibeConversationMessage[];
+  _metadata: XVibeConversationLearningMetadata;
+}): string | undefined {
+  if (input._metadata._normalized_prompt) {
+    return input._metadata._normalized_prompt;
+  }
+
+  if (!input._metadata._source_message_id) {
+    return undefined;
+  }
+
+  const source_message =
+    input._messages.find((message) =>
+      message._id === input._metadata._source_message_id,
+    );
+  if (
+    !source_message ||
+    source_message._role !== "user" ||
+    typeof source_message._text !== "string"
+  ) {
+    return undefined;
+  }
+
+  const normalized_prompt =
+    normalize_learned_intent_prompt(source_message._text);
+  return normalized_prompt || undefined;
+}
+
+function sanitize_verified_learned_intent(
+  intent: XVibeJsonObject,
+  action: XVibeJsonObject,
+): XVibeJsonObject {
+  const action_id = read_trimmed_string(action._id);
+  const title = derive_verified_learned_action_title(action);
+  const description = read_trimmed_string(action._description);
+  const action_reason = read_trimmed_string(action._reason);
+  const sanitized_action: XVibeJsonObject = {
+    ...(action_id ? { _id: action_id } : {}),
+    _title: title,
+    ...(description ? { _description: description } : {}),
+    _action_type: "apply-view-edit",
+    _status: "suggested",
+    ...(_xu.is_plain_object(action._params)
+      ? { _params: clone_json(action._params) }
+      : {}),
+    _requires_approval: true,
+    ...(action_reason ? { _reason: action_reason } : {}),
+  };
+
+  const reason = read_trimmed_string(intent._reason);
+  return {
+    _message_type: "edit",
+    _execution_level: "deterministic",
+    _should_mutate: true,
+    ...(typeof intent._confidence === "number" &&
+      Number.isFinite(intent._confidence)
+      ? { _confidence: intent._confidence }
+      : {}),
+    _reason: reason ?? "verified_semantic_apply_view_edit",
+    _actions: [sanitized_action],
+    ...(Array.isArray(intent._warnings) &&
+      intent._warnings.every((warning) => typeof warning === "string")
+      ? { _warnings: [...intent._warnings] as string[] }
+      : {}),
+  };
+}
+
+function evaluate_learning_eligibility(input: {
+  _app_id: string;
+  _env: string;
+  _message: XVibeConversationMessage;
+  _messages: XVibeConversationMessage[];
+  _intent: XVibeJsonObject | undefined;
+  _action: XVibeJsonObject;
+  _status: XVibeConversationActionStatus;
+}): XVibeConversationLearningEligibility {
+  const metadata = read_learning_metadata(input._message);
+  const action_type =
+    typeof input._action._action_type === "string"
+      ? input._action._action_type
+      : undefined;
+  const result_ok =
+    _xu.is_plain_object(input._action._result) &&
+    input._action._result._ok === true;
+  const normalized_prompt =
+    resolve_learning_prompt({
+      _message: input._message,
+      _messages: input._messages,
+      _metadata: metadata,
+    });
+  const base = {
+    ...(metadata._processor ? { _processor: metadata._processor } : {}),
+    _status: input._status,
+    _result_ok: result_ok,
+    ...(action_type ? { _action_type: action_type } : {}),
+    _has_user_prompt: normalized_prompt !== undefined,
+    ...(metadata._selected_type ? { _selected_type: metadata._selected_type } : {}),
+  };
+
+  if (metadata._processor !== "SemanticIntentProcessor") {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: metadata._processor
+        ? "processor_not_semantic"
+        : "missing_processor",
+    };
+  }
+
+  if (input._status !== "done") {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "status_not_done",
+    };
+  }
+
+  if (!result_ok) {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "result_not_ok",
+    };
+  }
+
+  if (action_type !== "apply-view-edit") {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "action_type_not_apply_view_edit",
+    };
+  }
+
+  if (!normalized_prompt) {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "missing_user_prompt",
+    };
+  }
+
+  if (!input._intent) {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "missing_intent",
+    };
+  }
+
+  const intent =
+    sanitize_verified_learned_intent(input._intent, input._action);
+  const validation = validate_learned_intent_result(intent);
+  if (!validation._ok) {
+    return {
+      ...base,
+      _eligible: false,
+      _reason: "invalid_intent",
+      _sanitized_intent: intent,
+      _validation_error: validation._validation_error,
+    };
+  }
+
+  return {
+    ...base,
+    _eligible: true,
+    _reason: "eligible",
+    _normalized_prompt: normalized_prompt,
+    _intent: intent as unknown as XVibeIntentResult,
+  };
+}
+
+async function learn_verified_conversation_action(input: {
+  _app_id: string;
+  _env: string;
+  _message: XVibeConversationMessage;
+  _messages: XVibeConversationMessage[];
+  _intent: XVibeJsonObject | undefined;
+  _action: XVibeJsonObject;
+  _status: XVibeConversationActionStatus;
+}): Promise<void> {
+  const eligibility = evaluate_learning_eligibility(input);
+  _xlog.log("[xvibe] learned intent eligibility", {
+    _processor: eligibility._processor,
+    _status: eligibility._status,
+    _result_ok: eligibility._result_ok,
+    _action_type: eligibility._action_type,
+    _has_user_prompt: eligibility._has_user_prompt,
+    _selected_type: eligibility._selected_type,
+    _eligible: eligibility._eligible,
+    _reason: eligibility._reason,
+  });
+
+  if (eligibility._reason === "invalid_intent") {
+    _xlog.warn("[xvibe] learned intent invalid", {
+      _validation_error: eligibility._validation_error,
+      _sanitized_intent: eligibility._sanitized_intent,
+    });
+  }
+
+  if (
+    !eligibility._eligible ||
+    !eligibility._normalized_prompt ||
+    !eligibility._intent
+  ) {
+    return;
+  }
+
+  const learn_result =
+    await new IntentMemoryStore().learn({
+      _app_id: input._app_id,
+      _env: input._env,
+      _normalized_prompt: eligibility._normalized_prompt,
+      ...(eligibility._selected_type
+        ? { _selected_type: eligibility._selected_type }
+        : {}),
+      _intent: eligibility._intent,
+      _source: "semantic",
+      _verified: true,
+    });
+
+  if (!learn_result._ok) {
+    _xlog.warn("[xvibe] learned intent store skipped", {
+      _app_id: input._app_id,
+      _env: input._env,
+      _reason: learn_result._reason,
+    });
+  }
 }
 
 function read_conversation_index(
@@ -1057,6 +1388,28 @@ export class ConversationManager {
 
   static async updateConversationAction(xcmd: XCommand) {
     const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+    _xlog.log("[xvibe] conversation action update received", {
+      _conversation_id:
+        typeof params._conversation_id === "string"
+          ? params._conversation_id
+          : undefined,
+      _message_id:
+        typeof params._message_id === "string"
+          ? params._message_id
+          : undefined,
+      _action_id:
+        typeof params._action_id === "string"
+          ? params._action_id
+          : undefined,
+      _status:
+        typeof params._status === "string"
+          ? params._status
+          : undefined,
+      _has_result: params._result !== undefined,
+      _result_ok:
+        _xu.is_plain_object(params._result) &&
+        (params._result as XVibeJsonObject)._ok === true,
+    });
 
     try {
       const app_id = normalize_safe_app_id(params._app_id);
@@ -1159,6 +1512,16 @@ export class ConversationManager {
       }
 
       write_conversation_messages(conversation_dir, messages);
+
+      await learn_verified_conversation_action({
+        _app_id: app_id,
+        _env: env,
+        _message: message,
+        _messages: messages,
+        _intent: intent,
+        _action: action,
+        _status: status,
+      });
 
       return {
         _ok: true,

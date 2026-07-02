@@ -69,7 +69,7 @@ export type XVibeResolvedTask = {
   _edit_style_property?: string;
   _edit_style_value?: string;
   _edit_property_name?: string;
-  _edit_property_value?: string | number | boolean | null;
+  _edit_property_value?: unknown;
   _edit_object_value?: Record<string, any>;
   _edit_field?: string;
   _explicit_artifact_type: boolean;

@@ -1,5 +1,5 @@
 import assert from "assert";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { _x, _xlog } from "@xpell/core";
@@ -35,7 +35,14 @@ import {
   resolve_xvibe_task,
   VibeIntentPlanner,
 } from "./XVIBE/VibeIntentPlanner.js";
-import { XVibeIntentEngine } from "./XVIBE/XVibeIntentEngine.js";
+import {
+  XVibeIntentEngine,
+  type XVibeIntentEngineOptions,
+} from "./XVIBE/XVibeIntentEngine.js";
+import {
+  IntentMemoryStore,
+  validate_learned_intent_result,
+} from "./XVIBE/IntentMemory/IntentMemoryStore.js";
 import {
   SemanticIntentProcessor,
   type XVibeSemanticIntentGenerateJsonInput,
@@ -150,6 +157,7 @@ const XVIBE_INTENT_STUB_CONVERSATION_RESULT = {
 
 const XVIBE_INTENT_PROCESSOR_CHAIN = [
   "DeterministicIntentProcessor",
+  "LearnedIntentProcessor",
   "SemanticIntentProcessor",
 ];
 
@@ -185,6 +193,44 @@ function set_xvibe_semantic_intent_env(
   } else {
     process.env.XVIBE_SEMANTIC_INTENT_PROVIDER = provider;
   }
+}
+
+const xvibe_empty_intent_memory_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-empty-intent-memory-"));
+const xvibe_empty_intent_memory_store = new IntentMemoryStore({
+  _work_folder: xvibe_empty_intent_memory_work_dir,
+});
+
+function xvibe_test_intent_engine(
+  options: XVibeIntentEngineOptions = {},
+): XVibeIntentEngine {
+  return new XVibeIntentEngine({
+    _intent_memory_store: xvibe_empty_intent_memory_store,
+    ...options,
+  });
+}
+
+async function write_xvibe_learned_intents(
+  work_folder: string,
+  entries: unknown[] | string,
+): Promise<string> {
+  const memory_dir = path.join(
+    work_folder,
+    "xvm",
+    "apps",
+    "test",
+    "intent-test-app",
+    "intent-memory",
+  );
+  await mkdir(memory_dir, { recursive: true });
+  const memory_path = path.join(memory_dir, "learned-intents.json");
+  await writeFile(
+    memory_path,
+    typeof entries === "string"
+      ? entries
+      : JSON.stringify(entries, null, 2),
+  );
+  return memory_path;
 }
 
 function xvibe_intent_selected_object_context(
@@ -230,7 +276,7 @@ function assert_xvibe_selected_object_action(
 
 set_xvibe_semantic_intent_env(undefined);
 
-const xvibe_intent_engine = new XVibeIntentEngine();
+const xvibe_intent_engine = xvibe_test_intent_engine();
 const xvibe_intent_valid_res = await xvibe_intent_engine.analyze({
   _message: "hello",
   _runtime_context: {
@@ -247,6 +293,492 @@ assert.deepEqual(
   XVIBE_INTENT_PROCESSOR_CHAIN,
 );
 assert.equal(typeof xvibe_intent_valid_res._duration_ms, "number");
+
+const xvibe_learn_file_create_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learn-file-create-"));
+const xvibe_learn_file_create_store = new IntentMemoryStore({
+  _work_folder: xvibe_learn_file_create_work_dir,
+});
+const xvibe_learn_file_create_res =
+  await xvibe_learn_file_create_store.learn({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _normalized_prompt: "first learned phrase",
+    _intent: XVIBE_SEMANTIC_VALID_INTENT as any,
+    _source: "semantic",
+    _verified: true,
+  });
+assert.equal(xvibe_learn_file_create_res._ok, true);
+const xvibe_learn_file_create_path = path.join(
+  xvibe_learn_file_create_work_dir,
+  "xvm",
+  "apps",
+  "test",
+  "intent-test-app",
+  "intent-memory",
+  "learned-intents.json",
+);
+assert.equal(
+  xvibe_learn_file_create_res._ok
+    ? xvibe_learn_file_create_res._path
+    : undefined,
+  xvibe_learn_file_create_path,
+);
+await access(xvibe_learn_file_create_path);
+const xvibe_learn_file_create_entries = JSON.parse(
+  await readFile(xvibe_learn_file_create_path, "utf-8"),
+);
+assert.equal(Array.isArray(xvibe_learn_file_create_entries), true);
+assert.equal(xvibe_learn_file_create_entries.length, 1);
+assert.equal(
+  xvibe_learn_file_create_entries[0]._normalized_prompt,
+  "first learned phrase",
+);
+
+const xvibe_learn_placeholder_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learn-placeholder-"));
+const xvibe_learn_placeholder_store = new IntentMemoryStore({
+  _work_folder: xvibe_learn_placeholder_work_dir,
+});
+const xvibe_learn_placeholder_intent = {
+  _message_type: "edit",
+  _execution_level: "deterministic",
+  _should_mutate: true,
+  _confidence: 0.93,
+  _reason: "placeholder_fixture",
+  _actions: [
+    {
+      _id: "placeholder-edit",
+      _title: "Hide selected label",
+      _action_type: "apply-view-edit",
+      _status: "suggested",
+      _requires_approval: true,
+      _params: {
+        _view_id: "main",
+        _target_id: "label-1",
+        _target_type: "label",
+        _source_view_id: "page-toolbar",
+        _path: ["_children", 0],
+        _edit_action: "hide-object",
+        _style_value: "red",
+        _text: "literal text",
+      },
+    },
+  ],
+  _warnings: [],
+};
+const xvibe_learn_placeholder_res =
+  await xvibe_learn_placeholder_store.learn({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _normalized_prompt: "hide currently selected label",
+    _intent: xvibe_learn_placeholder_intent as any,
+    _source: "semantic",
+    _verified: true,
+  });
+assert.equal(xvibe_learn_placeholder_res._ok, true);
+const xvibe_learn_placeholder_path =
+  xvibe_learn_placeholder_res._ok
+    ? xvibe_learn_placeholder_res._path
+    : "";
+const read_xvibe_learn_placeholder_entries = async (): Promise<any[]> =>
+  JSON.parse(await readFile(xvibe_learn_placeholder_path, "utf-8"));
+const xvibe_learn_placeholder_entries =
+  await read_xvibe_learn_placeholder_entries();
+assert.deepEqual(
+  xvibe_learn_placeholder_entries[0]._intent._actions[0]._params,
+  {
+    _view_id: "main",
+    _target_id: "$selected._json_id",
+    _target_type: "$selected._type",
+    _source_view_id: "$selected._source_view_id",
+    _path: "$selected._path",
+    _edit_action: "hide-object",
+    _style_value: "red",
+    _text: "literal text",
+  },
+);
+set_xvibe_semantic_intent_env("true", "placeholder-fallback-provider");
+let xvibe_placeholder_semantic_generate_count = 0;
+const xvibe_learn_placeholder_engine = xvibe_test_intent_engine({
+  _intent_memory_store: xvibe_learn_placeholder_store,
+  _semantic_generate_json: async () => {
+    xvibe_placeholder_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_learn_placeholder_replay_res =
+  await xvibe_learn_placeholder_engine.analyze({
+    _message: "Hide currently selected label.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _selected_object: {
+        _json_id: "label-current",
+        _id: "runtime-label-current",
+        _type: "label",
+        _source_view_id: "page-content",
+        _path: ["_children", 2],
+      },
+    },
+  });
+assert.equal(xvibe_learn_placeholder_replay_res._ok, true);
+assert.equal(
+  xvibe_learn_placeholder_replay_res._processor,
+  "LearnedIntentProcessor",
+);
+assert.deepEqual(
+  xvibe_learn_placeholder_replay_res._intent?._actions[0]._params,
+  {
+    _view_id: "main",
+    _target_id: "label-current",
+    _target_type: "label",
+    _source_view_id: "page-content",
+    _path: ["_children", 2],
+    _edit_action: "hide-object",
+    _style_value: "red",
+    _text: "literal text",
+  },
+);
+const xvibe_learn_placeholder_second_replay_res =
+  await xvibe_learn_placeholder_engine.analyze({
+    _message: "hide currently selected label",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _selected_object: {
+        _json_id: "label-next",
+        _id: "runtime-label-next",
+        _type: "label",
+        _source_view_id: "page-footer",
+        _path: ["_children", 5],
+      },
+    },
+  });
+assert.equal(
+  xvibe_learn_placeholder_second_replay_res._processor,
+  "LearnedIntentProcessor",
+);
+assert.equal(
+  xvibe_learn_placeholder_second_replay_res._intent?._actions[0]._params?._target_id,
+  "label-next",
+);
+assert.equal(
+  xvibe_learn_placeholder_second_replay_res._intent?._actions[0]._params?._source_view_id,
+  "page-footer",
+);
+const xvibe_learn_placeholder_missing_selected_res =
+  await xvibe_learn_placeholder_engine.analyze({
+    _message: "hide currently selected label",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert.equal(xvibe_learn_placeholder_missing_selected_res._ok, true);
+assert.equal(
+  xvibe_learn_placeholder_missing_selected_res._processor,
+  "SemanticIntentProcessor",
+);
+assert.equal(xvibe_placeholder_semantic_generate_count, 1);
+assert.deepEqual(
+  (await read_xvibe_learn_placeholder_entries())[0]._intent._actions[0]._params,
+  {
+    _view_id: "main",
+    _target_id: "$selected._json_id",
+    _target_type: "$selected._type",
+    _source_view_id: "$selected._source_view_id",
+    _path: "$selected._path",
+    _edit_action: "hide-object",
+    _style_value: "red",
+    _text: "literal text",
+  },
+);
+set_xvibe_semantic_intent_env(undefined);
+
+const xvibe_learned_created_at = "2026-01-01T00:00:00.000Z";
+const xvibe_learned_updated_at = "2026-01-01T00:00:00.000Z";
+const xvibe_learned_exact_intent = {
+  _message_type: "question",
+  _execution_level: "model",
+  _should_mutate: false,
+  _confidence: 0.91,
+  _reason: "learned_exact_fixture",
+  _actions: [
+    {
+      _id: "learned-exact-reply",
+      _title: "Reply from learned memory",
+      _action_type: "reply",
+      _status: "suggested",
+    },
+  ],
+  _warnings: [],
+};
+const xvibe_learned_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learned-intent-"));
+const xvibe_learned_memory_path = await write_xvibe_learned_intents(
+  xvibe_learned_work_dir,
+  [
+    {
+      _normalized_prompt: "what is this",
+      _intent: xvibe_learned_exact_intent,
+      _source: "semantic",
+      _hits: 4,
+      _created_at: xvibe_learned_created_at,
+      _updated_at: xvibe_learned_updated_at,
+    },
+  ],
+);
+set_xvibe_semantic_intent_env("true", "learned-should-not-call-semantic");
+let xvibe_learned_semantic_generate_count = 0;
+const xvibe_learned_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_work_dir,
+  }),
+  _semantic_generate_json: async () => {
+    xvibe_learned_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_learned_exact_res = await xvibe_learned_engine.analyze({
+  _message: "  WHAT   is this???  ",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_learned_exact_res._ok, true);
+assert.equal(xvibe_learned_exact_res._processor, "LearnedIntentProcessor");
+assert.deepEqual(xvibe_learned_exact_res._intent, xvibe_learned_exact_intent);
+assert.equal(xvibe_learned_semantic_generate_count, 0);
+assert.equal(
+  JSON.parse(await readFile(xvibe_learned_memory_path, "utf-8"))[0]._hits,
+  5,
+);
+xvibe_learned_exact_res._intent!._actions[0]._title = "Mutated response";
+const xvibe_learned_exact_clone_res = await xvibe_learned_engine.analyze({
+  _message: "what is this",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(
+  xvibe_learned_exact_clone_res._intent?._actions[0]._title,
+  "Reply from learned memory",
+);
+assert.equal(
+  JSON.parse(await readFile(xvibe_learned_memory_path, "utf-8"))[0]._hits,
+  6,
+);
+set_xvibe_semantic_intent_env(undefined);
+
+const xvibe_learned_selected_type_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learned-selected-type-"));
+const xvibe_learned_generic_intent = {
+  _message_type: "conversation",
+  _execution_level: "model",
+  _should_mutate: false,
+  _confidence: 0.7,
+  _reason: "learned_generic_fixture",
+  _actions: [
+    {
+      _id: "learned-generic-reply",
+      _title: "Generic learned reply",
+      _action_type: "reply",
+      _status: "suggested",
+    },
+  ],
+  _warnings: [],
+};
+const xvibe_learned_button_intent = {
+  _message_type: "edit",
+  _execution_level: "model",
+  _should_mutate: true,
+  _confidence: 0.88,
+  _reason: "learned_button_fixture",
+  _actions: [
+    {
+      _id: "learned-button-edit",
+      _title: "Edit learned button",
+      _action_type: "apply-view-edit",
+      _status: "suggested",
+      _requires_approval: true,
+      _params: {
+        _view_id: "view-main",
+        _target_id: "button-json-1",
+        _target_type: "button",
+        _edit_action: "hide-object",
+      },
+    },
+  ],
+  _warnings: [],
+};
+await write_xvibe_learned_intents(
+  xvibe_learned_selected_type_work_dir,
+  [
+    {
+      _normalized_prompt: "do the thing",
+      _intent: xvibe_learned_generic_intent,
+      _source: "semantic",
+      _hits: 1,
+      _created_at: xvibe_learned_created_at,
+      _updated_at: xvibe_learned_updated_at,
+    },
+    {
+      _normalized_prompt: "do the thing",
+      _selected_type: "button",
+      _intent: xvibe_learned_button_intent,
+      _source: "semantic",
+      _hits: 2,
+      _created_at: xvibe_learned_created_at,
+      _updated_at: xvibe_learned_updated_at,
+    },
+  ],
+);
+const xvibe_learned_selected_type_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_selected_type_work_dir,
+  }),
+});
+const xvibe_learned_selected_type_res =
+  await xvibe_learned_selected_type_engine.analyze({
+    _message: "do the thing.",
+    _runtime_context: xvibe_intent_selected_object_context({
+      _type: "button",
+    }),
+  });
+assert.equal(xvibe_learned_selected_type_res._ok, true);
+assert.equal(
+  xvibe_learned_selected_type_res._processor,
+  "LearnedIntentProcessor",
+);
+assert.deepEqual(
+  xvibe_learned_selected_type_res._intent,
+  xvibe_learned_button_intent,
+);
+
+const xvibe_learned_miss_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learned-miss-"));
+await write_xvibe_learned_intents(
+  xvibe_learned_miss_work_dir,
+  [
+    {
+      _normalized_prompt: "stored phrase",
+      _intent: xvibe_learned_exact_intent,
+      _source: "semantic",
+      _hits: 1,
+      _created_at: xvibe_learned_created_at,
+      _updated_at: xvibe_learned_updated_at,
+    },
+  ],
+);
+const xvibe_learned_miss_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_miss_work_dir,
+  }),
+});
+const xvibe_learned_miss_res = await xvibe_learned_miss_engine.analyze({
+  _message: "not stored",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_learned_miss_res._ok, true);
+assert.deepEqual(
+  xvibe_learned_miss_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+const xvibe_learned_corrupt_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learned-corrupt-"));
+await write_xvibe_learned_intents(
+  xvibe_learned_corrupt_work_dir,
+  "{ invalid json",
+);
+const xvibe_learned_corrupt_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_corrupt_work_dir,
+  }),
+});
+const xvibe_learned_corrupt_res = await xvibe_learned_corrupt_engine.analyze({
+  _message: "what is this",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_learned_corrupt_res._ok, true);
+assert.deepEqual(
+  xvibe_learned_corrupt_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+const xvibe_learned_deterministic_work_dir =
+  await mkdtemp(path.join(tmpdir(), "xvibe-learned-deterministic-"));
+await write_xvibe_learned_intents(
+  xvibe_learned_deterministic_work_dir,
+  [
+    {
+      _normalized_prompt: "hide selected",
+      _intent: xvibe_learned_exact_intent,
+      _source: "semantic",
+      _hits: 1,
+      _created_at: xvibe_learned_created_at,
+      _updated_at: xvibe_learned_updated_at,
+    },
+  ],
+);
+const xvibe_learned_deterministic_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_deterministic_work_dir,
+  }),
+});
+const xvibe_learned_deterministic_res =
+  await xvibe_learned_deterministic_engine.analyze({
+    _message: "hide selected",
+    _runtime_context: xvibe_intent_selected_object_context(),
+  });
+assert.equal(
+  xvibe_learned_deterministic_res._processor,
+  "DeterministicIntentProcessor",
+);
+assert_xvibe_selected_object_action(
+  xvibe_learned_deterministic_res,
+  "hide-object",
+);
+
+set_xvibe_semantic_intent_env("true", "learned-miss-semantic-provider");
+let xvibe_learned_miss_semantic_generate_count = 0;
+const xvibe_learned_semantic_miss_engine = xvibe_test_intent_engine({
+  _intent_memory_store: new IntentMemoryStore({
+    _work_folder: xvibe_learned_miss_work_dir,
+  }),
+  _semantic_generate_json: async () => {
+    xvibe_learned_miss_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_learned_semantic_miss_res =
+  await xvibe_learned_semantic_miss_engine.analyze({
+    _message: "semantic after learned miss",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert.equal(xvibe_learned_semantic_miss_res._ok, true);
+assert.equal(
+  xvibe_learned_semantic_miss_res._processor,
+  "SemanticIntentProcessor",
+);
+assert.deepEqual(
+  xvibe_learned_semantic_miss_res._intent,
+  XVIBE_SEMANTIC_VALID_INTENT,
+);
+assert.equal(xvibe_learned_miss_semantic_generate_count, 1);
+set_xvibe_semantic_intent_env(undefined);
 
 let xvibe_intent_engine_xai_generate_count = 0;
 const original_intent_engine_execute = (_x as any).execute;
@@ -369,7 +901,7 @@ assert.equal(xvibe_semantic_disabled_processor_res, null);
 assert.equal(xvibe_semantic_disabled_processor_generate_count, 0);
 
 let xvibe_semantic_disabled_engine_generate_count = 0;
-const xvibe_semantic_disabled_engine = new XVibeIntentEngine({
+const xvibe_semantic_disabled_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => {
     xvibe_semantic_disabled_engine_generate_count += 1;
     return XVIBE_SEMANTIC_VALID_INTENT;
@@ -393,7 +925,7 @@ assert.equal(xvibe_semantic_disabled_engine_generate_count, 0);
 
 set_xvibe_semantic_intent_env("true");
 let xvibe_semantic_deterministic_generate_count = 0;
-const xvibe_semantic_deterministic_engine = new XVibeIntentEngine({
+const xvibe_semantic_deterministic_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => {
     xvibe_semantic_deterministic_generate_count += 1;
     return XVIBE_SEMANTIC_VALID_INTENT;
@@ -422,7 +954,7 @@ assert.equal(xvibe_semantic_deterministic_generate_count, 0);
 set_xvibe_semantic_intent_env("true", "mock-semantic-provider");
 const xvibe_semantic_enabled_generate_inputs:
   XVibeSemanticIntentGenerateJsonInput[] = [];
-const xvibe_semantic_enabled_engine = new XVibeIntentEngine({
+const xvibe_semantic_enabled_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async (input) => {
     xvibe_semantic_enabled_generate_inputs.push(input);
     return XVIBE_SEMANTIC_VALID_INTENT;
@@ -527,7 +1059,7 @@ assert.deepEqual(
   "XVibeIntentResult",
 );
 
-const xvibe_semantic_normalized_engine = new XVibeIntentEngine({
+const xvibe_semantic_normalized_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "IntentResult",
     _execution_level: "artifact",
@@ -590,7 +1122,7 @@ assert.equal(
   true,
 );
 
-const xvibe_semantic_missing_edit_defaults_engine = new XVibeIntentEngine({
+const xvibe_semantic_missing_edit_defaults_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "ViewEditIntent",
     _execution_level: "model",
@@ -647,7 +1179,7 @@ assert.equal(
   "show-object",
 );
 
-const xvibe_semantic_schema_name_edit_engine = new XVibeIntentEngine({
+const xvibe_semantic_schema_name_edit_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "XVibeIntentResult",
     _execution_level: "TYPED_OBJECT",
@@ -695,7 +1227,7 @@ assert.equal(
 );
 
 const xvibe_semantic_schema_name_without_actions_engine =
-  new XVibeIntentEngine({
+  xvibe_test_intent_engine({
     _semantic_generate_json: async () => ({
       _message_type: "XVibeIntentResult",
       _execution_level: "TYPED_OBJECT",
@@ -720,7 +1252,7 @@ assert.deepEqual(
   XVIBE_INTENT_STUB_CONVERSATION_RESULT,
 );
 
-const xvibe_semantic_non_edit_typed_runtime_engine = new XVibeIntentEngine({
+const xvibe_semantic_non_edit_typed_runtime_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "generate",
     _execution_level: "typed_runtime",
@@ -753,7 +1285,7 @@ assert.deepEqual(
   XVIBE_INTENT_STUB_CONVERSATION_RESULT,
 );
 
-const xvibe_semantic_non_edit_schema_label_engine = new XVibeIntentEngine({
+const xvibe_semantic_non_edit_schema_label_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "EditIntent",
     _execution_level: "artifact",
@@ -787,7 +1319,7 @@ assert.deepEqual(
 );
 
 const xvibe_semantic_non_edit_planning_typed_object_engine =
-  new XVibeIntentEngine({
+  xvibe_test_intent_engine({
     _semantic_generate_json: async () => ({
       _message_type: "planning",
       _execution_level: "typed_object",
@@ -891,7 +1423,7 @@ assert.equal(
 );
 
 set_xvibe_semantic_intent_env("true");
-const xvibe_semantic_invalid_engine = new XVibeIntentEngine({
+const xvibe_semantic_invalid_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "conversation",
     _execution_level: "model",
@@ -915,7 +1447,7 @@ assert.deepEqual(
 );
 
 set_xvibe_semantic_intent_env("true");
-const xvibe_semantic_unknown_alias_engine = new XVibeIntentEngine({
+const xvibe_semantic_unknown_alias_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "unclear-intent-kind",
     _execution_level: "model",
@@ -963,7 +1495,7 @@ try {
     return original_semantic_action_execute.call(_x, command);
   };
 
-  const xvibe_semantic_action_engine = new XVibeIntentEngine({
+  const xvibe_semantic_action_engine = xvibe_test_intent_engine({
     _semantic_generate_json: async () => ({
       _message_type: "edit",
       _execution_level: "model",
@@ -3659,7 +4191,18 @@ assert.deepEqual(
     _eligible: false,
     _reason: "unsupported_property",
     _details: {
+      _target_type: "button",
       _property_name: "_children",
+      _skill_design_found: false,
+      _allowed_field_keys: [
+        "_class",
+        "_style",
+        "_text",
+        "class",
+        "disabled",
+        "placeholder",
+        "style",
+      ],
     },
   },
 );
@@ -6693,6 +7236,625 @@ try {
   (_x as any).execute = original_execute;
   (_x as any).getModule = original_get_module;
   await rm(vibe_run_inspector_work_folder, { recursive: true, force: true });
+}
+
+const app_artifacts_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xstudio-app-artifacts-"));
+try {
+  const app_artifacts_app_id = "explorer-app";
+  const app_artifacts_env = "test";
+  const app_artifacts_app_dir = path.join(
+    app_artifacts_work_folder,
+    "xvm",
+    "apps",
+    app_artifacts_env,
+    app_artifacts_app_id,
+  );
+  const app_artifacts_views_dir = path.join(app_artifacts_app_dir, "views");
+  const app_artifacts_flows_dir = path.join(app_artifacts_app_dir, "flows");
+  const app_artifacts_entities_dir = path.join(app_artifacts_app_dir, "entities");
+  const app_artifacts_registry_dir = path.join(
+    app_artifacts_work_folder,
+    "generated",
+    "xmodules",
+  );
+  const app_artifacts_module_path = path.join(app_artifacts_registry_dir, "calc");
+  const app_artifacts_files = [
+    path.join(app_artifacts_app_dir, "app.json"),
+    path.join(app_artifacts_views_dir, "main.json"),
+    path.join(app_artifacts_flows_dir, "signup.json"),
+    path.join(app_artifacts_entities_dir, "users.json"),
+    path.join(app_artifacts_registry_dir, "registry.json"),
+  ];
+
+  await mkdir(app_artifacts_views_dir, { recursive: true });
+  await mkdir(app_artifacts_flows_dir, { recursive: true });
+  await mkdir(app_artifacts_entities_dir, { recursive: true });
+  await mkdir(app_artifacts_registry_dir, { recursive: true });
+  await writeFile(
+    app_artifacts_files[0],
+    JSON.stringify({
+      _app_id: app_artifacts_app_id,
+      _env: app_artifacts_env,
+      _meta: {
+        _version: 1,
+        _entry_view_id: "main",
+      },
+      _config: {},
+    }, null, 2),
+  );
+  await writeFile(
+    app_artifacts_files[1],
+    JSON.stringify({
+      _id: "main",
+      _type: "view",
+      _title: "Main View",
+      _children: [],
+    }, null, 2),
+  );
+  await writeFile(
+    app_artifacts_files[2],
+    JSON.stringify({
+      _id: "signup",
+      _title: "Signup Flow",
+      _steps: [],
+    }, null, 2),
+  );
+  await writeFile(
+    app_artifacts_files[3],
+    JSON.stringify({
+      _id: "users",
+      _title: "Users",
+      _schema: {},
+    }, null, 2),
+  );
+  await writeFile(
+    app_artifacts_files[4],
+    JSON.stringify({
+      _version: 1,
+      _modules: {
+        calc: {
+          _id: "calc",
+          _name: "calc",
+          _target: "server",
+          _artifact_path: app_artifacts_module_path,
+          _manifest_file: path.join(app_artifacts_module_path, "manifest.json"),
+          _module_file: path.join(app_artifacts_module_path, "module.js"),
+          _manifest_sha256: "manifest-hash",
+          _module_sha256: "module-hash",
+          _ops: ["add"],
+          _autoload: true,
+          _state: "implemented",
+          _implementation_complete: true,
+          _created_by: "module-creator",
+          _created_at: 1,
+          _updated_at: 1,
+        },
+      },
+    }, null, 2),
+  );
+
+  const app_artifacts_server_xvm =
+    new ServerXVMModule({ _work_folder: app_artifacts_work_folder });
+  const app_artifacts_studio = new XStudioModule();
+  const original_app_artifacts_execute = (_x as any).execute;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "entity-manager" && command?._op === "register") {
+      return { _ok: true, _result: { _registered: true } };
+    }
+
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (app_artifacts_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(app_artifacts_server_xvm, command);
+      }
+    }
+
+    return original_app_artifacts_execute.call(_x, command);
+  };
+
+  try {
+    await app_artifacts_server_xvm.init_on_boot();
+    const app_artifacts_before = new Map(
+      await Promise.all(
+        app_artifacts_files.map(async (file) => [
+          file,
+          {
+            content: await readFile(file, "utf-8"),
+            mtimeMs: (await stat(file)).mtimeMs,
+          },
+        ] as const),
+      ),
+    );
+
+    const app_artifacts_result = await (app_artifacts_studio as any)._list_app_artifacts({
+      _params: {
+        _app_id: app_artifacts_app_id,
+        _env: app_artifacts_env,
+      },
+    });
+
+    assert.equal(app_artifacts_result._ok, true);
+    assert.equal(app_artifacts_result._app_id, app_artifacts_app_id);
+    assert.equal(app_artifacts_result._env, app_artifacts_env);
+    assert.deepEqual(app_artifacts_result._artifacts._views, [
+      {
+        _id: "main",
+        _title: "Main View",
+        _path: "views/main.json",
+      },
+    ]);
+    assert.deepEqual(app_artifacts_result._artifacts._flows, [
+      {
+        _id: "signup",
+        _title: "Signup Flow",
+        _path: "flows/signup.json",
+      },
+    ]);
+    assert.deepEqual(app_artifacts_result._artifacts._entities, [
+      {
+        _id: "users",
+        _path: "entities/users.json",
+      },
+    ]);
+    assert.deepEqual(app_artifacts_result._artifacts._modules, [
+      {
+        _id: "calc",
+        _title: "calc",
+        _path: app_artifacts_module_path,
+        _enabled: true,
+      },
+    ]);
+
+    for (const file of app_artifacts_files) {
+      const before = app_artifacts_before.get(file);
+      assert.ok(before);
+      assert.equal(await readFile(file, "utf-8"), before.content);
+      assert.equal((await stat(file)).mtimeMs, before.mtimeMs);
+    }
+
+    const invalid_app_artifacts_result =
+      await (app_artifacts_studio as any)._list_app_artifacts({
+        _params: {
+          _app_id: "../explorer-app",
+          _env: app_artifacts_env,
+        },
+      });
+    assert.equal(invalid_app_artifacts_result._ok, false);
+    assert.equal(invalid_app_artifacts_result._error._code, "E_STUDIO_INVALID_APP_ID");
+
+    const invalid_env_artifacts_result =
+      await (app_artifacts_studio as any)._list_app_artifacts({
+        _params: {
+          _app_id: app_artifacts_app_id,
+          _env: "../test",
+        },
+      });
+    assert.equal(invalid_env_artifacts_result._ok, false);
+    assert.equal(invalid_env_artifacts_result._error._code, "E_STUDIO_INVALID_ENV");
+  } finally {
+    (_x as any).execute = original_app_artifacts_execute;
+  }
+} finally {
+  await rm(app_artifacts_work_folder, { recursive: true, force: true });
+}
+
+const missing_app_artifacts_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xstudio-missing-app-artifacts-"));
+try {
+  const missing_app_artifacts_app_id = "empty-app";
+  const missing_app_artifacts_env = "test";
+  const missing_app_artifacts_app_dir = path.join(
+    missing_app_artifacts_work_folder,
+    "xvm",
+    "apps",
+    missing_app_artifacts_env,
+    missing_app_artifacts_app_id,
+  );
+  await mkdir(missing_app_artifacts_app_dir, { recursive: true });
+  await writeFile(
+    path.join(missing_app_artifacts_app_dir, "app.json"),
+    JSON.stringify({
+      _app_id: missing_app_artifacts_app_id,
+      _env: missing_app_artifacts_env,
+      _meta: {
+        _version: 1,
+        _entry_view_id: "main",
+      },
+      _config: {},
+    }, null, 2),
+  );
+
+  const missing_app_artifacts_server_xvm =
+    new ServerXVMModule({ _work_folder: missing_app_artifacts_work_folder });
+  const missing_app_artifacts_studio = new XStudioModule();
+  const original_missing_app_artifacts_execute = (_x as any).execute;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (missing_app_artifacts_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(missing_app_artifacts_server_xvm, command);
+      }
+    }
+
+    return original_missing_app_artifacts_execute.call(_x, command);
+  };
+
+  try {
+    await missing_app_artifacts_server_xvm.init_on_boot();
+    const missing_app_artifacts_result =
+      await (missing_app_artifacts_studio as any)._list_app_artifacts({
+        _params: {
+          _app_id: missing_app_artifacts_app_id,
+          _env: missing_app_artifacts_env,
+        },
+      });
+
+    assert.equal(missing_app_artifacts_result._ok, true);
+    assert.deepEqual(missing_app_artifacts_result._artifacts, {
+      _views: [],
+      _flows: [],
+      _entities: [],
+      _modules: [],
+    });
+  } finally {
+    (_x as any).execute = original_missing_app_artifacts_execute;
+  }
+} finally {
+  await rm(missing_app_artifacts_work_folder, { recursive: true, force: true });
+}
+
+const create_view_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-create-view-"));
+try {
+  const create_view_server_xvm =
+    new ServerXVMModule({ _work_folder: create_view_work_folder });
+  const create_view_app_id = "create-view-app";
+  const create_view_env = "test";
+  const create_view_dir = path.join(
+    create_view_work_folder,
+    "xvm",
+    "apps",
+    create_view_env,
+    create_view_app_id,
+    "views",
+  );
+
+  await (create_view_server_xvm as any)._create_app({
+    _params: {
+      _app_id: create_view_app_id,
+      _env: create_view_env,
+    },
+  });
+
+  const blank_view_path = path.join(create_view_dir, "blank_view.json");
+  const blank_view_res = await (create_view_server_xvm as any)._create_view({
+    _params: {
+      _app_id: create_view_app_id,
+      _env: create_view_env,
+      _view_id: "blank_view",
+      _template: "blank",
+    },
+  });
+  assert.equal(blank_view_res._ok, true);
+  assert.equal(blank_view_res._view_id, "blank_view");
+  assert.equal(blank_view_res._path, blank_view_path);
+  assert.deepEqual(blank_view_res._view, {
+    _id: "blank_view",
+    _type: "view",
+    _children: [],
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(blank_view_path, "utf-8")),
+    blank_view_res._view,
+  );
+  await assert.rejects(
+    access(path.join(
+      create_view_work_folder,
+      "system-xapps",
+      "view-starters",
+      "blank",
+      "view.json",
+    )),
+  );
+
+  const page_view_path = path.join(create_view_dir, "account-page.json");
+  const page_view_res = await (create_view_server_xvm as any)._create_view({
+    _params: {
+      _app_id: create_view_app_id,
+      _env: create_view_env,
+      _view_id: "account-page",
+      _title: "Account Page",
+      _template: "page",
+    },
+  });
+  assert.equal(page_view_res._ok, true);
+  assert.equal(page_view_res._path, page_view_path);
+  assert.deepEqual(page_view_res._view, {
+    _id: "account-page",
+    _type: "view",
+    _children: [
+      {
+        _id: "account-page-root",
+        _type: "stack",
+        class: "page-shell",
+        _children: [
+          {
+            _id: "account-page-title",
+            _type: "label",
+            _text: "Account Page",
+          },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(page_view_path, "utf-8")),
+    page_view_res._view,
+  );
+
+  const component_view_path = path.join(create_view_dir, "profile_card.json");
+  const component_view_res = await (create_view_server_xvm as any)._create_view({
+    _params: {
+      _app_id: create_view_app_id,
+      _env: create_view_env,
+      _view_id: "profile_card",
+      _template: "component",
+    },
+  });
+  assert.equal(component_view_res._ok, true);
+  assert.equal(component_view_res._path, component_view_path);
+  assert.deepEqual(component_view_res._view, {
+    _id: "profile_card",
+    _type: "view",
+    class: "xvm-component-view",
+    _children: [],
+  });
+  assert.deepEqual(
+    JSON.parse(await readFile(component_view_path, "utf-8")),
+    component_view_res._view,
+  );
+
+  await assert.rejects(
+    (create_view_server_xvm as any)._create_view({
+      _params: {
+        _app_id: create_view_app_id,
+        _env: create_view_env,
+        _view_id: "blank_view",
+        _template: "blank",
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_VIEW_ALREADY_EXISTS",
+  );
+
+  await assert.rejects(
+    (create_view_server_xvm as any)._create_view({
+      _params: {
+        _app_id: create_view_app_id,
+        _env: create_view_env,
+        _view_id: "../unsafe",
+        _template: "blank",
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_INVALID_VIEW_ID",
+  );
+
+  await assert.rejects(
+    (create_view_server_xvm as any)._create_view({
+      _params: {
+        _app_id: create_view_app_id,
+        _env: create_view_env,
+        _view_id: "UnsafeUpper",
+        _template: "blank",
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_INVALID_VIEW_ID",
+  );
+
+  await assert.rejects(
+    (create_view_server_xvm as any)._create_view({
+      _params: {
+        _app_id: create_view_app_id,
+        _env: create_view_env,
+        _view_id: "unsafe-template-view",
+        _template: "../page",
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_INVALID_VIEW_TEMPLATE",
+  );
+  await assert.rejects(
+    access(path.join(create_view_dir, "unsafe-template-view.json")),
+  );
+
+  const create_view_list_res =
+    await (create_view_server_xvm as any)._list_views({
+      _params: {
+        _app_id: create_view_app_id,
+        _env: create_view_env,
+      },
+    });
+  const create_view_list_ids =
+    create_view_list_res._result._views.map((view: any) => view._id);
+  assert.ok(create_view_list_ids.includes("blank_view"));
+  assert.ok(create_view_list_ids.includes("account-page"));
+  assert.ok(create_view_list_ids.includes("profile_card"));
+} finally {
+  await rm(create_view_work_folder, { recursive: true, force: true });
+}
+
+const view_starter_override_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-view-starter-override-"));
+try {
+  const view_starter_override_server_xvm =
+    new ServerXVMModule({ _work_folder: view_starter_override_work_folder });
+  const view_starter_override_app_id = "starter-override-app";
+  const view_starter_override_env = "test";
+  const view_starter_override_file = path.join(
+    view_starter_override_work_folder,
+    "system-xapps",
+    "view-starters",
+    "page",
+    "view.json",
+  );
+
+  await mkdir(path.dirname(view_starter_override_file), { recursive: true });
+  await writeFile(
+    view_starter_override_file,
+    JSON.stringify({
+      _id: "{{view_id}}",
+      _type: "view",
+      _children: [
+        {
+          _id: "{{view_id}}-override",
+          _type: "label",
+          _text: "{{title}} override",
+        },
+      ],
+    }, null, 2),
+    "utf-8",
+  );
+
+  await (view_starter_override_server_xvm as any)._create_app({
+    _params: {
+      _app_id: view_starter_override_app_id,
+      _env: view_starter_override_env,
+    },
+  });
+
+  const override_view_res =
+    await (view_starter_override_server_xvm as any)._create_view({
+      _params: {
+        _app_id: view_starter_override_app_id,
+        _env: view_starter_override_env,
+        _view_id: "override-page",
+        _title: "Work Starter",
+        _template: "page",
+      },
+    });
+
+  assert.equal(override_view_res._ok, true);
+  assert.deepEqual(override_view_res._view, {
+    _id: "override-page",
+    _type: "view",
+    _children: [
+      {
+        _id: "override-page-override",
+        _type: "label",
+        _text: "Work Starter override",
+      },
+    ],
+  });
+} finally {
+  await rm(view_starter_override_work_folder, { recursive: true, force: true });
+}
+
+const cwd_fallback_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-cwd-fallback-"));
+const cwd_fallback_outside_dir =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-outside-cwd-"));
+const original_cwd_for_view_starter = process.cwd();
+try {
+  process.chdir(cwd_fallback_outside_dir);
+
+  const cwd_fallback_server_xvm =
+    new ServerXVMModule({ _work_folder: cwd_fallback_work_folder });
+  const cwd_fallback_app_id = "cwd-fallback-app";
+  const cwd_fallback_env = "test";
+
+  await (cwd_fallback_server_xvm as any)._create_app({
+    _params: {
+      _app_id: cwd_fallback_app_id,
+      _env: cwd_fallback_env,
+    },
+  });
+
+  const cwd_fallback_view_res =
+    await (cwd_fallback_server_xvm as any)._create_view({
+      _params: {
+        _app_id: cwd_fallback_app_id,
+        _env: cwd_fallback_env,
+        _view_id: "cwd-fallback",
+        _template: "blank",
+      },
+    });
+
+  assert.equal(cwd_fallback_view_res._ok, true);
+  assert.deepEqual(cwd_fallback_view_res._view, {
+    _id: "cwd-fallback",
+    _type: "view",
+    _children: [],
+  });
+} finally {
+  process.chdir(original_cwd_for_view_starter);
+  await rm(cwd_fallback_work_folder, { recursive: true, force: true });
+  await rm(cwd_fallback_outside_dir, { recursive: true, force: true });
+}
+
+const missing_view_starter_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-missing-view-starter-"));
+try {
+  const missing_view_starter_package_root = path.join(
+    missing_view_starter_work_folder,
+    "missing-package-system-xapps",
+  );
+  const missing_view_starter_server_xvm =
+    new ServerXVMModule({
+      _work_folder: missing_view_starter_work_folder,
+      _package_system_xapps_path: missing_view_starter_package_root,
+    });
+  const missing_view_starter_app_id = "missing-starter-app";
+  const missing_view_starter_env = "test";
+  const missing_view_starter_work_path = path.join(
+    missing_view_starter_work_folder,
+    "system-xapps",
+    "view-starters",
+    "blank",
+    "view.json",
+  );
+  const missing_view_starter_package_path = path.join(
+    missing_view_starter_package_root,
+    "view-starters",
+    "blank",
+    "view.json",
+  );
+
+  await (missing_view_starter_server_xvm as any)._create_app({
+    _params: {
+      _app_id: missing_view_starter_app_id,
+      _env: missing_view_starter_env,
+    },
+  });
+
+  await assert.rejects(
+    (missing_view_starter_server_xvm as any)._create_view({
+      _params: {
+        _app_id: missing_view_starter_app_id,
+        _env: missing_view_starter_env,
+        _view_id: "missing-starter-view",
+        _template: "blank",
+      },
+    }),
+    (error: any) =>
+      error?._code === "E_XVM_VIEW_STARTER_NOT_FOUND" &&
+      error?._meta?._template === "blank" &&
+      error?._meta?._work_path === missing_view_starter_work_path &&
+      error?._meta?._package_path === missing_view_starter_package_path,
+  );
+  await assert.rejects(
+    access(path.join(
+      missing_view_starter_work_folder,
+      "xvm",
+      "apps",
+      missing_view_starter_env,
+      missing_view_starter_app_id,
+      "views",
+      "missing-starter-view.json",
+    )),
+  );
+} finally {
+  await rm(missing_view_starter_work_folder, { recursive: true, force: true });
 }
 
 const view_edit_refine_work_folder =
@@ -9855,6 +11017,35 @@ try {
   let apply_view_edit_xai_generate_count = 0;
   let apply_view_edit_push_update_count = 0;
   const apply_view_edit_push_update_view_ids: string[] = [];
+  const apply_view_edit_runtime_skills = {
+    _modules: [
+      {
+        _objects: [
+          { _id: "view" },
+          { _id: "button" },
+          { _id: "label" },
+          { _id: "toolbar" },
+          { _id: "xvm-view" },
+          {
+            _id: "kpi-card",
+            _design: {
+              _inspector: {
+                _fields: [
+                  { _key: "_value", _label: "Value", _input: "text" },
+                  { _key: "_label", _label: "Label", _input: "text" },
+                  { _key: "_delta", _label: "Delta", _input: "text" },
+                  { _key: "_trend", _label: "Trend", _input: "text" },
+                  { _key: "_icon", _label: "Icon", _input: "text" },
+                  { _key: "_variant", _label: "Variant", _input: "text" },
+                  { _key: "_config", _label: "Config", _input: "json" },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    ],
+  };
 
   await (apply_view_edit_server_xvm as any)._create_app({
     _params: {
@@ -9925,13 +11116,54 @@ try {
       },
     },
   });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "design-host",
+        _type: "view",
+        _children: [
+          {
+            _id: "design-source-ref",
+            _type: "xvm-view",
+            _view_id: "design-source",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "design-source",
+        _type: "view",
+        _children: [
+          {
+            _id: "kpi-card-1",
+            _type: "kpi-card",
+            _value: "10",
+            _label: "Revenue",
+            _delta: "+1%",
+            _trend: "up",
+            _icon: "line-chart",
+            _variant: "positive",
+          },
+        ],
+      },
+    },
+  });
 
+  (xvibe as any).latest_runtime_skills = apply_view_edit_runtime_skills;
   (_x as any).getModule = (name: string) =>
     name === "server-xvm"
       ? apply_view_edit_server_xvm
       : typeof original_get_module === "function"
         ? original_get_module.call(_x, name)
         : undefined;
+  (_x as any).getSkills = () => apply_view_edit_runtime_skills;
   (_x as any).execute = async (command: any) => {
     if (command?._module === "server-xvm") {
       const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
@@ -10019,6 +11251,228 @@ try {
     apply_view_edit_main_after_class._result._view._children[0].class,
     "title new",
   );
+
+  const apply_view_edit_design_value_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_value",
+        _property_value: "42",
+      },
+    });
+  assert.equal(apply_view_edit_design_value_result._ok, true);
+  assert.equal(apply_view_edit_design_value_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_design_value_result._result._mutation._property_name, "_value");
+
+  for (const [field, value] of [
+    ["_label", "Active Users"],
+    ["_delta", "+12%"],
+    ["_trend", "down"],
+    ["_icon", "users"],
+    ["_variant", "warning"],
+  ] as const) {
+    const apply_view_edit_design_field_result =
+      await (apply_view_edit_xvibe as any)._apply_view_edit({
+        _params: {
+          _app_id: apply_view_edit_app_id,
+          _env: apply_view_edit_env,
+          _view_id: "design-source",
+          _edit_action: "set-property",
+          _target_id: "kpi-card-1",
+          _target_type: "kpi-card",
+          _property_name: field,
+          _property_value: value,
+        },
+      });
+    assert.equal(apply_view_edit_design_field_result._ok, true);
+    assert.equal(apply_view_edit_design_field_result._result._mutation._property_name, field);
+  }
+
+  const apply_view_edit_design_after_fields =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+      },
+    });
+  const apply_view_edit_design_kpi_after_fields =
+    find_xui_node_for_test(apply_view_edit_design_after_fields._result._view, "kpi-card-1")!;
+  assert.equal(apply_view_edit_design_kpi_after_fields._value, "42");
+  assert.equal(apply_view_edit_design_kpi_after_fields._label, "Active Users");
+  assert.equal(apply_view_edit_design_kpi_after_fields._delta, "+12%");
+  assert.equal(apply_view_edit_design_kpi_after_fields._trend, "down");
+  assert.equal(apply_view_edit_design_kpi_after_fields._icon, "users");
+  assert.equal(apply_view_edit_design_kpi_after_fields._variant, "warning");
+
+  const apply_view_edit_push_count_before_unknown_design_field =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_design_unknown_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_unknown",
+        _property_value: "Nope",
+      },
+    });
+  assert.equal(apply_view_edit_design_unknown_result._ok, false);
+  assert.equal(apply_view_edit_design_unknown_result._reason, "unsupported_property");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_unknown_design_field,
+  );
+
+  const apply_view_edit_push_count_before_object_value =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_design_object_rejected_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_value",
+        _property_value: { _raw: 42 },
+      },
+    });
+  assert.equal(apply_view_edit_design_object_rejected_result._ok, false);
+  assert.equal(apply_view_edit_design_object_rejected_result._reason, "unsupported_property_value");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_object_value,
+  );
+
+  const apply_view_edit_push_count_before_array_value =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_design_array_rejected_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_value",
+        _property_value: [42],
+      },
+    });
+  assert.equal(apply_view_edit_design_array_rejected_result._ok, false);
+  assert.equal(apply_view_edit_design_array_rejected_result._reason, "unsupported_property_value");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_array_value,
+  );
+
+  const apply_view_edit_design_json_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_config",
+        _property_value: {
+          _format: "compact",
+          _thresholds: [10, 20],
+        },
+      },
+    });
+  assert.equal(apply_view_edit_design_json_result._ok, true);
+  const apply_view_edit_design_json_array_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_config",
+        _property_value: [
+          { _format: "wide" },
+          { _format: "compact" },
+        ],
+      },
+    });
+  assert.equal(apply_view_edit_design_json_array_result._ok, true);
+  const apply_view_edit_design_after_json =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(apply_view_edit_design_after_json._result._view, "kpi-card-1")?._config,
+    [
+      { _format: "wide" },
+      { _format: "compact" },
+    ],
+  );
+
+  const apply_view_edit_design_host_before =
+    JSON.stringify((await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-host",
+      },
+    }))._result._view);
+  const apply_view_edit_design_ref_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-host",
+        _source_view_id: "design-source",
+        _edit_action: "set-property",
+        _target_id: "kpi-card-1",
+        _target_type: "kpi-card",
+        _property_name: "_value",
+        _property_value: "84",
+      },
+    });
+  assert.equal(apply_view_edit_design_ref_result._ok, true);
+  assert.equal(apply_view_edit_design_ref_result._view_id, "design-host");
+  assert.equal(apply_view_edit_design_ref_result._source_view_id, "design-source");
+  assert.equal(apply_view_edit_design_ref_result._persisted_view_id, "design-source");
+  const apply_view_edit_design_after_ref =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-source",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_design_after_ref._result._view, "kpi-card-1")?._value,
+    "84",
+  );
+  const apply_view_edit_design_host_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "design-host",
+      },
+    });
+  assert.equal(JSON.stringify(apply_view_edit_design_host_after._result._view), apply_view_edit_design_host_before);
 
   const apply_view_edit_hide_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
@@ -11121,6 +12575,7 @@ try {
 } finally {
   (_x as any).execute = original_execute;
   (_x as any).getModule = original_get_module;
+  (_x as any).getSkills = original_get_skills;
   await rm(apply_view_edit_work_folder, { recursive: true, force: true });
 }
 
@@ -12360,26 +13815,52 @@ try {
     });
     assert.equal(create_action_id_conversation_res._ok, true);
 
+    const conversation_learned_memory_path = path.join(
+      conversation_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      "conversation-app",
+      "intent-memory",
+      "learned-intents.json",
+    );
+    const read_conversation_learned_entries = async (): Promise<any[]> =>
+      JSON.parse(
+        await readFile(conversation_learned_memory_path, "utf-8"),
+      );
+    const learned_entry_for_prompt = (
+      entries: any[],
+      normalized_prompt: string,
+    ): any | undefined =>
+      entries.find(
+        (entry) => entry._normalized_prompt === normalized_prompt,
+      );
+
     const original_conversation_intent_engine =
       (conversation_xvibe as any).intent_engine;
     set_xvibe_semantic_intent_env("true");
     try {
-      (conversation_xvibe as any).intent_engine = new XVibeIntentEngine({
+      let semantic_action_title = "Apply edit";
+      let semantic_action_target_id = "button-1";
+      let semantic_reason = "semantic_action_id_normalization";
+      (conversation_xvibe as any).intent_engine = xvibe_test_intent_engine({
         _semantic_generate_json: async () => ({
           _message_type: "edit",
           _execution_level: "model",
           _should_mutate: true,
           _confidence: 0.81,
-          _reason: "semantic_action_id_normalization",
+          _reason: semantic_reason,
           _actions: [
             {
-              _title: "Apply edit",
+              _title: semantic_action_title,
               _action_type: "apply-view-edit",
               _status: "suggested",
               _requires_approval: true,
               _params: {
                 _view_id: "main",
-                _target_id: "button-1",
+                _target_id: semantic_action_target_id,
+                _target_type: "button",
+                _source_view_id: "page-toolbar",
                 _edit_action: "hide-object",
               },
             },
@@ -12405,6 +13886,12 @@ try {
           _message: "hide the selected button semantically",
           _runtime_context: {
             _active_view_id: "main",
+            _selected_object: {
+              _json_id: "button-1",
+              _id: "button-runtime-1",
+              _type: "button",
+              _source_view_id: "page-toolbar",
+            },
           },
         },
       });
@@ -12476,6 +13963,646 @@ try {
       assert.equal(
         updated_action_id_message._intent._actions[0]._status,
         "done",
+      );
+      await access(conversation_learned_memory_path);
+
+      const learned_entries_after_success =
+        await read_conversation_learned_entries();
+      const learned_success_entry =
+        learned_entry_for_prompt(
+          learned_entries_after_success,
+          "hide the selected button semantically",
+        );
+      assert.ok(learned_success_entry);
+      assert.equal(learned_success_entry._version, 1);
+      assert.equal(learned_success_entry._source, "semantic");
+      assert.equal(learned_success_entry._hits, 0);
+      assert.equal(learned_success_entry._intent._message_type, "edit");
+      assert.equal(
+        learned_success_entry._intent._execution_level,
+        "deterministic",
+      );
+      assert.equal(learned_success_entry._intent._should_mutate, true);
+      assert.equal(typeof learned_success_entry._intent._confidence, "number");
+      assert.equal(
+        learned_success_entry._intent._reason,
+        "semantic_action_id_normalization",
+      );
+      assert.equal(learned_success_entry._intent._actions.length, 1);
+      assert.equal(
+        learned_success_entry._intent._actions[0]._title,
+        "Apply edit",
+      );
+      assert.equal(
+        learned_success_entry._intent._actions[0]._action_type,
+        "apply-view-edit",
+      );
+      assert.equal(
+        learned_success_entry._intent._actions[0]._status,
+        "suggested",
+      );
+      assert.equal(
+        learned_success_entry._intent._actions[0]._requires_approval,
+        true,
+      );
+      assert.deepEqual(
+        learned_success_entry._intent._actions[0]._params,
+        {
+          _view_id: "main",
+          _target_id: "$selected._json_id",
+          _target_type: "$selected._type",
+          _source_view_id: "$selected._source_view_id",
+          _edit_action: "hide-object",
+        },
+      );
+      assert.equal(
+        learned_success_entry._intent._actions[0]._result,
+        undefined,
+      );
+      assert.equal(
+        learned_success_entry._intent._actions[0]._metadata,
+        undefined,
+      );
+      assert.equal(learned_success_entry._verified, undefined);
+      assert.equal(learned_success_entry._processor, undefined);
+      assert.equal(learned_success_entry._conversation_id, undefined);
+      assert.equal(learned_success_entry._duration_ms, undefined);
+
+      const create_linked_prompt_conversation_res =
+        await (conversation_xvibe as any)._create_conversation({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "linked-prompt-chat",
+          },
+        });
+      assert.equal(create_linked_prompt_conversation_res._ok, true);
+      const append_linked_user_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "linked-prompt-chat",
+            _message: {
+              _id: "linked-user-prompt",
+              _role: "user",
+              _text: "Make the linked card blue.",
+            },
+          },
+        });
+      assert.equal(append_linked_user_res._ok, true);
+      const append_linked_tool_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "linked-prompt-chat",
+            _message: {
+              _id: "linked-tool-intent",
+              _role: "tool",
+              _text: "Intent analyzed.",
+              _intent: {
+                _message_type: "edit",
+                _execution_level: "model",
+                _should_mutate: true,
+                _confidence: 0.82,
+                _reason: "linked_prompt_learning",
+                _actions: [
+                  {
+                    _id: "linked-action",
+                    _title: "Apply linked edit",
+                    _action_type: "apply-view-edit",
+                    _status: "suggested",
+                    _requires_approval: true,
+                    _params: {
+                      _view_id: "main",
+                      _target_id: "card-1",
+                      _target_type: "card",
+                      _source_view_id: "main",
+                      _edit_action: "set-style",
+                    },
+                  },
+                ],
+                _warnings: [],
+              },
+              _metadata: {
+                _source: "xvibe.analyze-message",
+                _intent_processor: "SemanticIntentProcessor",
+                _message_id: "linked-user-prompt",
+                _selected_type: "card",
+              },
+            },
+          },
+        });
+      assert.equal(append_linked_tool_res._ok, true);
+      const update_linked_prompt_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "linked-prompt-chat",
+            _message_id: "linked-tool-intent",
+            _action_id: "linked-action",
+            _status: "done",
+            _result: {
+              _ok: true,
+            },
+          },
+        });
+      assert.equal(update_linked_prompt_res._ok, true);
+      const linked_prompt_entry =
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "make the linked card blue",
+        );
+      assert.ok(linked_prompt_entry);
+      assert.equal(linked_prompt_entry._selected_type, "card");
+      assert.equal(
+        linked_prompt_entry._intent._actions[0]._title,
+        "Apply linked edit",
+      );
+      assert.equal(
+        linked_prompt_entry._intent._execution_level,
+        "deterministic",
+      );
+      assert.equal(
+        linked_prompt_entry._intent._actions[0]._status,
+        "suggested",
+      );
+      assert.equal(
+        linked_prompt_entry._intent._actions[0]._requires_approval,
+        true,
+      );
+
+      const create_missing_title_conversation_res =
+        await (conversation_xvibe as any)._create_conversation({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "missing-title-learn-chat",
+          },
+        });
+      assert.equal(create_missing_title_conversation_res._ok, true);
+      const append_missing_title_user_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "missing-title-learn-chat",
+            _message: {
+              _id: "missing-title-user",
+              _role: "user",
+              _text: "Delete the title card without title.",
+            },
+          },
+        });
+      assert.equal(append_missing_title_user_res._ok, true);
+      const append_missing_title_tool_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "missing-title-learn-chat",
+            _message: {
+              _id: "missing-title-tool",
+              _role: "tool",
+              _text: "Intent analyzed.",
+              _intent: {
+                _message_type: "edit",
+                _execution_level: "model",
+                _should_mutate: true,
+                _confidence: 0.84,
+                _reason: "missing_title_learning",
+                _actions: [
+                  {
+                    _id: "missing-title-action",
+                    _action_type: "apply-view-edit",
+                    _status: "suggested",
+                    _requires_approval: true,
+                    _params: {
+                      _view_id: "main",
+                      _target_id: "title-card",
+                      _target_type: "card",
+                      _edit_action: "remove-object",
+                    },
+                  },
+                ],
+                _warnings: [],
+              },
+              _metadata: {
+                _source: "xvibe.analyze-message",
+                _intent_processor: "SemanticIntentProcessor",
+                _message_id: "missing-title-user",
+                _selected_type: "card",
+              },
+            },
+          },
+        });
+      assert.equal(append_missing_title_tool_res._ok, true);
+      const update_missing_title_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "missing-title-learn-chat",
+            _message_id: "missing-title-tool",
+            _action_id: "missing-title-action",
+            _status: "done",
+            _result: {
+              _ok: true,
+            },
+          },
+        });
+      assert.equal(update_missing_title_res._ok, true);
+      await access(conversation_learned_memory_path);
+      const missing_title_entry =
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "delete the title card without title",
+        );
+      assert.ok(missing_title_entry);
+      assert.equal(
+        validate_learned_intent_result(missing_title_entry._intent)._ok,
+        true,
+      );
+      assert.equal(
+        missing_title_entry._intent._actions[0]._title,
+        "Delete selected object",
+      );
+      assert.equal(
+        missing_title_entry._intent._actions[0]._status,
+        "suggested",
+      );
+
+      const create_invalid_learn_conversation_res =
+        await (conversation_xvibe as any)._create_conversation({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "invalid-learn-chat",
+          },
+        });
+      assert.equal(create_invalid_learn_conversation_res._ok, true);
+      const append_invalid_learn_user_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "invalid-learn-chat",
+            _message: {
+              _id: "invalid-learn-user",
+              _role: "user",
+              _text: "Invalid learned action.",
+            },
+          },
+        });
+      assert.equal(append_invalid_learn_user_res._ok, true);
+      const append_invalid_learn_tool_res =
+        await (conversation_xvibe as any)._append_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "invalid-learn-chat",
+            _message: {
+              _id: "invalid-learn-tool",
+              _role: "tool",
+              _text: "Intent analyzed.",
+              _intent: {
+                _message_type: "edit",
+                _execution_level: "model",
+                _should_mutate: true,
+                _confidence: 0.73,
+                _reason: "invalid_learn_fixture",
+                _actions: [
+                  {
+                    _id: "invalid-learn-action",
+                    _title: "Invalid learn action",
+                    _action_type: "apply-view-edit",
+                    _status: "suggested",
+                    _requires_approval: true,
+                  },
+                ],
+                _warnings: [],
+              },
+              _metadata: {
+                _source: "xvibe.analyze-message",
+                _intent_processor: "SemanticIntentProcessor",
+                _message_id: "invalid-learn-user",
+                _selected_type: "card",
+              },
+            },
+          },
+        });
+      assert.equal(append_invalid_learn_tool_res._ok, true);
+      const learned_invalid_logs: any[] = [];
+      const original_learned_invalid_warn = _xlog.warn;
+      (_xlog as any).warn = (message: string, data?: any) => {
+        if (message === "[xvibe] learned intent invalid") {
+          learned_invalid_logs.push(data);
+        }
+
+        return original_learned_invalid_warn.call(_xlog, message, data);
+      };
+      try {
+        const update_invalid_learn_res =
+          await (conversation_xvibe as any)._update_conversation_action({
+            _params: {
+              _app_id: "conversation-app",
+              _env: "test",
+              _conversation_id: "invalid-learn-chat",
+              _message_id: "invalid-learn-tool",
+              _action_id: "invalid-learn-action",
+              _status: "done",
+              _result: {
+                _ok: true,
+              },
+            },
+          });
+        assert.equal(update_invalid_learn_res._ok, true);
+      } finally {
+        (_xlog as any).warn = original_learned_invalid_warn;
+      }
+      assert.equal(learned_invalid_logs.length, 1);
+      assert.equal(
+        learned_invalid_logs[0]._validation_error,
+        "intent._actions[0]._params_required_for_apply_view_edit",
+      );
+      assert.equal(
+        learned_invalid_logs[0]._sanitized_intent._execution_level,
+        "deterministic",
+      );
+      assert.equal(
+        learned_invalid_logs[0]._sanitized_intent._actions[0]._status,
+        "suggested",
+      );
+      assert.equal(
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "invalid learned action",
+        ),
+        undefined,
+      );
+
+      const learned_reload_engine = new XVibeIntentEngine({
+        _intent_memory_store: new IntentMemoryStore({
+          _work_folder: conversation_work_folder,
+        }),
+      });
+      const learned_reload_res = await learned_reload_engine.analyze({
+        _message: "hide the selected button semantically",
+        _runtime_context: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _selected_object: {
+            _json_id: "button-current",
+            _id: "button-runtime-current",
+            _type: "button",
+            _source_view_id: "page-main",
+          },
+        },
+      });
+      assert.equal(learned_reload_res._ok, true);
+      assert.equal(
+        learned_reload_res._processor,
+        "LearnedIntentProcessor",
+      );
+      assert.equal(
+        learned_reload_res._intent?._actions[0]._title,
+        "Apply edit",
+      );
+      assert.equal(
+        learned_reload_res._intent?._actions[0]._status,
+        "suggested",
+      );
+      assert.equal(
+        learned_reload_res._intent?._actions[0]._requires_approval,
+        true,
+      );
+      assert.deepEqual(
+        learned_reload_res._intent?._actions[0]._params,
+        {
+          _view_id: "main",
+          _target_id: "button-current",
+          _target_type: "button",
+          _source_view_id: "page-main",
+          _edit_action: "hide-object",
+        },
+      );
+      assert.equal(
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "hide the selected button semantically",
+        )?._hits,
+        1,
+      );
+      const linked_replay_res = await learned_reload_engine.analyze({
+        _message: "Make the linked card blue.",
+        _runtime_context: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _selected_object: {
+            _json_id: "card-current",
+            _id: "card-runtime-current",
+            _type: "card",
+            _source_view_id: "main-current",
+          },
+        },
+      });
+      assert.equal(linked_replay_res._ok, true);
+      assert.equal(linked_replay_res._processor, "LearnedIntentProcessor");
+      assert.equal(
+        linked_replay_res._intent?._actions[0]._title,
+        "Apply linked edit",
+      );
+      assert.equal(
+        linked_replay_res._intent?._actions[0]._status,
+        "suggested",
+      );
+      assert.deepEqual(
+        linked_replay_res._intent?._actions[0]._params,
+        {
+          _view_id: "main",
+          _target_id: "card-current",
+          _target_type: "card",
+          _source_view_id: "main-current",
+          _edit_action: "set-style",
+        },
+      );
+
+      const analyze_failure_res = await (conversation_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "action-id-chat",
+          _message: "semantic failure prompt",
+          _runtime_context: {
+            _active_view_id: "main",
+          },
+        },
+      });
+      assert.equal(analyze_failure_res._ok, true);
+      const update_failure_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "action-id-chat",
+            _message_id: analyze_failure_res._result._message._id,
+            _action_id: "action-1",
+            _status: "failed",
+            _result: {
+              _ok: false,
+            },
+          },
+        });
+      assert.equal(update_failure_res._ok, true);
+      assert.equal(
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "semantic failure prompt",
+        ),
+        undefined,
+      );
+
+      const analyze_dismiss_res = await (conversation_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "action-id-chat",
+          _message: "semantic dismiss prompt",
+          _runtime_context: {
+            _active_view_id: "main",
+          },
+        },
+      });
+      assert.equal(analyze_dismiss_res._ok, true);
+      const update_dismiss_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "action-id-chat",
+            _message_id: analyze_dismiss_res._result._message._id,
+            _action_id: "action-1",
+            _status: "dismissed",
+          },
+        });
+      assert.equal(update_dismiss_res._ok, true);
+      assert.equal(
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "semantic dismiss prompt",
+        ),
+        undefined,
+      );
+
+      const analyze_deterministic_res = await (conversation_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "action-id-chat",
+          _message: "hide selected",
+          _runtime_context: xvibe_intent_selected_object_context(),
+        },
+      });
+      assert.equal(analyze_deterministic_res._ok, true);
+      assert.equal(
+        analyze_deterministic_res._result._message._metadata._intent_processor,
+        "DeterministicIntentProcessor",
+      );
+      const deterministic_action_id =
+        analyze_deterministic_res._intent._actions[0]._id;
+      const update_deterministic_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "action-id-chat",
+            _message_id: analyze_deterministic_res._result._message._id,
+            _action_id: deterministic_action_id,
+            _status: "done",
+            _result: {
+              _ok: true,
+            },
+          },
+        });
+      assert.equal(update_deterministic_res._ok, true);
+      assert.equal(
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "hide selected",
+        ),
+        undefined,
+      );
+
+      const learned_entry_before_duplicate =
+        learned_entry_for_prompt(
+          await read_conversation_learned_entries(),
+          "hide the selected button semantically",
+        );
+      assert.ok(learned_entry_before_duplicate);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      semantic_action_title = "Apply updated edit";
+      semantic_action_target_id = "button-2";
+      semantic_reason = "semantic_action_duplicate_update";
+      const analyze_duplicate_res = await (conversation_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "action-id-chat",
+          _message: "hide the selected button semantically",
+          _runtime_context: {
+            _active_view_id: "main",
+            _selected_object: {
+              _json_id: "button-2",
+              _id: "button-runtime-2",
+              _type: "button",
+              _source_view_id: "page-toolbar",
+            },
+          },
+        },
+      });
+      assert.equal(analyze_duplicate_res._ok, true);
+      const update_duplicate_res =
+        await (conversation_xvibe as any)._update_conversation_action({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "action-id-chat",
+            _message_id: analyze_duplicate_res._result._message._id,
+            _action_id: "action-1",
+            _status: "done",
+            _result: {
+              _ok: true,
+            },
+          },
+        });
+      assert.equal(update_duplicate_res._ok, true);
+      const learned_entries_after_duplicate =
+        await read_conversation_learned_entries();
+      const duplicate_prompt_entries =
+        learned_entries_after_duplicate.filter(
+          (entry) =>
+            entry._normalized_prompt ===
+              "hide the selected button semantically",
+        );
+      assert.equal(duplicate_prompt_entries.length, 1);
+      assert.equal(
+        duplicate_prompt_entries[0]._created_at,
+        learned_entry_before_duplicate._created_at,
+      );
+      assert.notEqual(
+        duplicate_prompt_entries[0]._updated_at,
+        learned_entry_before_duplicate._updated_at,
+      );
+      assert.equal(duplicate_prompt_entries[0]._hits, 1);
+      assert.equal(
+        duplicate_prompt_entries[0]._intent._actions[0]._title,
+        "Apply updated edit",
+      );
+      assert.equal(
+        duplicate_prompt_entries[0]._intent._actions[0]._params._target_id,
+        "$selected._json_id",
       );
     } finally {
       (conversation_xvibe as any).intent_engine =

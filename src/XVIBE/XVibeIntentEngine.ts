@@ -4,7 +4,9 @@ import type {
   XVibeIntentEngineResponse,
   XVibeIntentResult,
 } from "./XVibeTypes.js";
+import { IntentMemoryStore } from "./IntentMemory/IntentMemoryStore.js";
 import { DeterministicIntentProcessor } from "./Processors/DeterministicIntentProcessor.js";
+import { LearnedIntentProcessor } from "./Processors/LearnedIntentProcessor.js";
 import {
   SemanticIntentProcessor,
   type XVibeSemanticIntentGenerateJson,
@@ -12,6 +14,7 @@ import {
 import type { XVibeIntentProcessor } from "./Processors/XVibeIntentProcessor.js";
 
 export type XVibeIntentEngineOptions = {
+  _intent_memory_store?: IntentMemoryStore;
   _semantic_generate_json?: XVibeSemanticIntentGenerateJson;
 };
 
@@ -21,6 +24,9 @@ export class XVibeIntentEngine {
   constructor(options: XVibeIntentEngineOptions = {}) {
     this.processors = [
       new DeterministicIntentProcessor(),
+      new LearnedIntentProcessor({
+        _store: options._intent_memory_store,
+      }),
       new SemanticIntentProcessor({
         _generate_json: options._semantic_generate_json,
       }),

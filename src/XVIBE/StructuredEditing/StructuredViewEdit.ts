@@ -52,7 +52,7 @@ export type StructuredViewEditIntent = XVibeJsonObject & {
   _style_property?: string;
   _style_value?: string;
   _property_name?: string;
-  _property_value?: string | number | boolean | null;
+  _property_value?: unknown;
   _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
   _anchor_id?: string;
@@ -313,18 +313,23 @@ function read_structured_view_edit_action(value: unknown): StructuredViewEditAct
   throw new Error("Invalid '_edit_action': unsupported deterministic view edit action");
 }
 
-function read_structured_property_value(value: unknown): string | number | boolean | null | undefined {
+function read_structured_property_value(value: unknown): unknown {
+  if (value === undefined) {
+    return undefined;
+  }
+
   if (
-    value === undefined ||
     value === null ||
     typeof value === "string" ||
     typeof value === "number" ||
-    typeof value === "boolean"
+    typeof value === "boolean" ||
+    Array.isArray(value) ||
+    _xu.is_plain_object(value)
   ) {
     return value;
   }
 
-  throw new Error("Invalid '_property_value': expected string, number, boolean, or null");
+  throw new Error("Invalid '_property_value': expected JSON-compatible value");
 }
 
 function read_structured_object_value(value: unknown): XVibeJsonObject {

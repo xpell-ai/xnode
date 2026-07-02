@@ -147,30 +147,19 @@ const RESERVED_VIEW_IDS = new Set([
 const XVIBE_PLAN_VALIDATION_FAILED = "E_XVIBE_PLAN_VALIDATION_FAILED";
 const XVIBE_DETERMINISTIC_HIDE_MECHANISM = "style.display:none";
 const XVIBE_DETERMINISTIC_SHOW_MECHANISM = "remove-style.display:none";
-const XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES = new Set([
+const XVIBE_DETERMINISTIC_BUILTIN_PROPERTY_NAMES = new Set([
   "_text",
-  "_gap",
+  "class",
+  "_class",
+  "style",
+  "_style",
   "disabled",
   "placeholder",
-  "title",
-  "value",
-  "min",
-  "max",
-  "step",
-  "rows",
-  "cols",
 ]);
 const XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES = new Set([
   "_id",
   "_type",
   "_children",
-  "_on",
-  "_once",
-  "_flow",
-  "_flow_event",
-  "_style",
-  "class",
-  "_class",
 ]);
 const XVIBE_VALIDATION_REJECTED_TARGET_IDS = new Set([
   "and",
@@ -220,7 +209,7 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _style_property?: string;
   _style_value?: string;
   _property_name?: string;
-  _property_value?: string | number | boolean | null;
+  _property_value?: unknown;
   _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
   _anchor_id?: string;
@@ -3229,14 +3218,277 @@ function deterministic_style_is_empty(value: XVibeJsonObject): boolean {
   return Object.keys(value).length === 0;
 }
 
-function deterministic_allows_structured_class_property(input: {
-  _property_name: string;
-  _edit_intent?: XVibeViewEditIntent;
-}): boolean {
+function deterministic_is_primitive_or_null(value: unknown): boolean {
   return (
-    input._property_name === "class" &&
-    input._edit_intent?._structured_apply_view_edit === true
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
   );
+}
+
+function deterministic_is_json_property_value(value: unknown, seen = new Set<object>()): boolean {
+  if (value === null) return true;
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return true;
+  }
+
+  if (typeof value !== "object") return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.every((item) => deterministic_is_json_property_value(item, seen));
+  }
+
+  if (!_xu.is_plain_object(value)) return false;
+  return Object.values(value)
+    .every((item) => deterministic_is_json_property_value(item, seen));
+}
+
+function deterministic_runtime_skill_payloads(): unknown[] {
+  try {
+    const get_skills = (_x as any).getSkills;
+    const runtime_skills =
+      typeof get_skills === "function" ? get_skills.call(_x) : undefined;
+    return runtime_skills === undefined ? [] : [runtime_skills];
+  } catch {
+    return [];
+  }
+}
+
+function deterministic_collect_object_skills(value: unknown, out: XVibeJsonObject[] = []): XVibeJsonObject[] {
+  if (!_xu.is_plain_object(value)) return out;
+
+  if (_xu.is_plain_object(value._skill)) {
+    deterministic_collect_object_skills(value._skill, out);
+  }
+
+  if (_xu.is_plain_object(value._design)) {
+    out.push(value);
+  }
+
+  if (Array.isArray(value._skills)) {
+    for (const skill of value._skills) {
+      deterministic_collect_object_skills(skill, out);
+    }
+  }
+
+  if (Array.isArray(value._modules)) {
+    for (const module_item of value._modules) {
+      deterministic_collect_object_skills(module_item, out);
+    }
+  }
+
+  if (Array.isArray(value._objects)) {
+    for (const object_skill of value._objects) {
+      deterministic_collect_object_skills(object_skill, out);
+    }
+  }
+
+  return out;
+}
+
+function deterministic_skill_matches_type(skill: XVibeJsonObject, target_type: string): boolean {
+  return [
+    skill._id,
+    skill._xtype,
+    skill._xui_type,
+    skill._object_type,
+    skill._type,
+  ].some((value) => typeof value === "string" && value.trim() === target_type);
+}
+
+function deterministic_inspector_field_keys_from_skill(skill: XVibeJsonObject): {
+  _field_keys: string[];
+  _json_field_keys: string[];
+} {
+  const fields =
+    _xu.is_plain_object(skill._design) &&
+    _xu.is_plain_object(skill._design._inspector) &&
+    Array.isArray(skill._design._inspector._fields)
+      ? skill._design._inspector._fields
+      : [];
+  const field_keys: string[] = [];
+  const json_field_keys: string[] = [];
+
+  for (const field of fields) {
+    if (!_xu.is_plain_object(field)) continue;
+    const key =
+      typeof field._key === "string" ? field._key.trim() : "";
+    if (!key) continue;
+
+    field_keys.push(key);
+    if (field._input === "json") {
+      json_field_keys.push(key);
+    }
+  }
+
+  return {
+    _field_keys: Array.from(new Set(field_keys)),
+    _json_field_keys: Array.from(new Set(json_field_keys)),
+  };
+}
+
+function deterministic_inspector_fields_for_node(target_node: XVibeJsonObject): {
+  _skill_design_found: boolean;
+  _field_keys: string[];
+  _json_field_keys: string[];
+} {
+  const target_type =
+    typeof target_node._type === "string" ? target_node._type.trim() : "";
+  const candidate_skills = deterministic_collect_object_skills(target_node);
+  for (const payload of deterministic_runtime_skill_payloads()) {
+    deterministic_collect_object_skills(payload, candidate_skills);
+  }
+
+  const matching_skills =
+    target_type
+      ? candidate_skills.filter((skill) => deterministic_skill_matches_type(skill, target_type))
+      : candidate_skills.filter((skill) => _xu.is_plain_object(skill._design));
+  const field_keys = new Set<string>();
+  const json_field_keys = new Set<string>();
+
+  for (const skill of matching_skills) {
+    const fields = deterministic_inspector_field_keys_from_skill(skill);
+    for (const key of fields._field_keys) field_keys.add(key);
+    for (const key of fields._json_field_keys) json_field_keys.add(key);
+  }
+
+  return {
+    _skill_design_found: field_keys.size > 0,
+    _field_keys: Array.from(field_keys),
+    _json_field_keys: Array.from(json_field_keys),
+  };
+}
+
+function deterministic_existing_primitive_field_keys(target_node: XVibeJsonObject): string[] {
+  return Object.keys(target_node)
+    .filter((key) => {
+      const value = target_node[key];
+      return (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      );
+    });
+}
+
+function deterministic_set_property_eligibility(input: {
+  _target_node: XVibeJsonObject;
+  _property_name: string;
+  _next_value?: unknown;
+  _is_set: boolean;
+}): {
+  _ok: boolean;
+  _reason?: string;
+  _details?: XVibeJsonObject;
+} {
+  const property_name = input._property_name;
+  const target_type =
+    typeof input._target_node._type === "string" ? input._target_node._type : "";
+  const design = deterministic_inspector_fields_for_node(input._target_node);
+  const design_field_keys = new Set(design._field_keys);
+  const json_field_keys = new Set(design._json_field_keys);
+  const existing_primitive_field_keys =
+    deterministic_existing_primitive_field_keys(input._target_node);
+  const current_exists =
+    Object.prototype.hasOwnProperty.call(input._target_node, property_name);
+  const current_value = input._target_node[property_name];
+  const current_is_primitive_or_null =
+    deterministic_is_primitive_or_null(current_value);
+  const existing_allows_null =
+    input._is_set &&
+    input._next_value === null &&
+    current_exists &&
+    current_is_primitive_or_null;
+  const allowed_field_keys = Array.from(new Set([
+    ...XVIBE_DETERMINISTIC_BUILTIN_PROPERTY_NAMES,
+    ...design._field_keys,
+    ...existing_primitive_field_keys,
+    ...(existing_allows_null ? [property_name] : []),
+  ]))
+    .filter((key) => !XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(key))
+    .sort();
+  const unsupported_details = {
+    _target_type: target_type,
+    _property_name: property_name,
+    _skill_design_found: design._skill_design_found,
+    _allowed_field_keys: allowed_field_keys,
+  };
+
+  if (XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name)) {
+    return {
+      _ok: false,
+      _reason: "unsupported_property",
+      _details: unsupported_details,
+    };
+  }
+
+  const property_allowed =
+    XVIBE_DETERMINISTIC_BUILTIN_PROPERTY_NAMES.has(property_name) ||
+    design_field_keys.has(property_name) ||
+    existing_primitive_field_keys.includes(property_name) ||
+    existing_allows_null;
+
+  if (!property_allowed) {
+    return {
+      _ok: false,
+      _reason: "unsupported_property",
+      _details: unsupported_details,
+    };
+  }
+
+  if (!input._is_set) {
+    return { _ok: true };
+  }
+
+  const next_value = input._next_value;
+  const is_json_field = json_field_keys.has(property_name);
+  const next_is_object_or_array =
+    typeof next_value === "object" && next_value !== null;
+
+  if (next_is_object_or_array) {
+    if (!is_json_field || !deterministic_is_json_property_value(next_value)) {
+      return {
+        _ok: false,
+        _reason: "unsupported_property_value",
+        _details: {
+          ...unsupported_details,
+          _value_type: Array.isArray(next_value) ? "array" : "object",
+          _json_field: is_json_field,
+        },
+      };
+    }
+
+    return { _ok: true };
+  }
+
+  if (
+    typeof next_value === "string" ||
+    typeof next_value === "number" ||
+    typeof next_value === "boolean"
+  ) {
+    return { _ok: true };
+  }
+
+  if (next_value === null && existing_allows_null) {
+    return { _ok: true };
+  }
+
+  return {
+    _ok: false,
+    _reason: "unsupported_property_value",
+    _details: {
+      ...unsupported_details,
+      _value_type: next_value === null ? "null" : typeof next_value,
+      _json_field: is_json_field,
+    },
+  };
 }
 
 function find_first_style_sheet_node(current_view: unknown): XVibeJsonObject | undefined {
@@ -3723,27 +3975,6 @@ export function can_apply_deterministic_view_edit(input: {
       return { _eligible: false, _reason: "missing_property_name" };
     }
 
-    const structured_class_property =
-      deterministic_allows_structured_class_property({
-        _property_name: property_name,
-        _edit_intent: input._edit_intent,
-      });
-    if (
-      !structured_class_property &&
-      (
-        XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
-        !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
-      )
-    ) {
-      return {
-        _eligible: false,
-        _reason: "unsupported_property",
-        _details: {
-          _property_name: property_name,
-        },
-      };
-    }
-
     if (
       resolved_task._edit_action === "set-property" &&
       resolved_task._edit_property_value === undefined
@@ -3764,6 +3995,23 @@ export function can_apply_deterministic_view_edit(input: {
         _reason: target_resolution._reason,
         ...(target_resolution._details !== undefined
           ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const property_eligibility =
+      deterministic_set_property_eligibility({
+        _target_node: target_resolution._target_node,
+        _property_name: property_name,
+        _next_value: resolved_task._edit_property_value,
+        _is_set: resolved_task._edit_action === "set-property",
+      });
+    if (!property_eligibility._ok) {
+      return {
+        _eligible: false,
+        _reason: property_eligibility._reason ?? "unsupported_property",
+        ...(property_eligibility._details !== undefined
+          ? { _details: property_eligibility._details }
           : {}),
       };
     }
@@ -4961,24 +5209,20 @@ export function apply_deterministic_view_edit(input: {
       return { _ok: false, _reason: "missing_property_name" };
     }
 
-    const structured_class_property =
-      deterministic_allows_structured_class_property({
+    const property_eligibility =
+      deterministic_set_property_eligibility({
+        _target_node: target_node,
         _property_name: property_name,
-        _edit_intent: input._edit_intent,
+        _next_value: input._resolved_task._edit_property_value,
+        _is_set: eligibility._action === "set-property",
       });
-    if (
-      !structured_class_property &&
-      (
-        XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES.has(property_name) ||
-        !XVIBE_DETERMINISTIC_ALLOWED_PROPERTY_NAMES.has(property_name)
-      )
-    ) {
+    if (!property_eligibility._ok) {
       return {
         _ok: false,
-        _reason: "unsupported_property",
-        _details: {
-          _property_name: property_name,
-        },
+        _reason: property_eligibility._reason ?? "unsupported_property",
+        ...(property_eligibility._details !== undefined
+          ? { _details: property_eligibility._details }
+          : {}),
       };
     }
 

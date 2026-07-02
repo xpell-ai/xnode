@@ -1,9 +1,13 @@
 import { _xlog, type XCommand } from "@xpell/core";
 import { _xu } from "../../XNUtils/XUtils.js";
 import { ConversationManager } from "../Conversation/ConversationManager.js";
+import { normalize_learned_intent_prompt } from "../IntentMemory/IntentMemoryStore.js";
 import type { XVibeJsonObject } from "../VibeOutputParser.js";
 import type { XVibeIntentEngine } from "../XVibeIntentEngine.js";
-import type { XVibeIntentResult } from "../XVibeTypes.js";
+import type {
+  XVibeIntentResult,
+  XVibeIntentRuntimeContext,
+} from "../XVibeTypes.js";
 
 const XVIBE_INVALID_INTENT_REQUEST = "E_XVIBE_INVALID_INTENT_REQUEST";
 
@@ -51,6 +55,20 @@ function normalize_intent_action_ids(intent: XVibeIntentResult | undefined): voi
   }
 }
 
+function selected_type_from_runtime_context(
+  runtime_context: XVibeIntentRuntimeContext,
+): string | undefined {
+  const selected_object = runtime_context._selected_object;
+  if (!_xu.is_plain_object(selected_object)) {
+    return undefined;
+  }
+
+  return typeof selected_object._type === "string" &&
+    selected_object._type.trim().length > 0
+    ? selected_object._type.trim()
+    : undefined;
+}
+
 export class IntentConversationBridge {
   static async analyze(input: IntentConversationBridgeAnalyzeInput) {
     try {
@@ -88,6 +106,8 @@ export class IntentConversationBridge {
       }
 
       normalize_intent_action_ids(intent_result._intent);
+      const selected_type =
+        selected_type_from_runtime_context(request._runtime_context);
 
       const append_result: any = await ConversationManager.appendMessage({
         _params: {
@@ -100,6 +120,12 @@ export class IntentConversationBridge {
             _intent: intent_result._intent,
             _metadata: {
               _source: "xvibe.analyze-message",
+              ...(intent_result._processor
+                ? { _intent_processor: intent_result._processor }
+                : {}),
+              _normalized_prompt:
+                normalize_learned_intent_prompt(request._message),
+              ...(selected_type ? { _selected_type: selected_type } : {}),
             },
           },
         },

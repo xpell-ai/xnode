@@ -1,0 +1,18 @@
+{
+  "_id": "{{view_id}}",
+  "_type": "view",
+  "_children": [
+    {
+      "_id": "{{view_id}}-root",
+      "_type": "stack",
+      "class": "page-shell",
+      "_children": [
+        {
+          "_id": "{{view_id}}-title",
+          "_type": "label",
+          "_text": "{{title}}"
+        }
+      ]
+    }
+  ]
+}
