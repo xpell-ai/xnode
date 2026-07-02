@@ -21,7 +21,8 @@ export type StructuredViewEditAction =
   | "show-object"
   | "move-object"
   | "replace-object"
-  | "duplicate-object";
+  | "duplicate-object"
+  | "add-child";
 
 export type StructuredViewEditIntent = XVibeJsonObject & {
   _action:
@@ -41,7 +42,8 @@ export type StructuredViewEditIntent = XVibeJsonObject & {
     | "remove-property"
     | "move-object"
     | "replace-object"
-    | "duplicate-object";
+    | "duplicate-object"
+    | "add-child";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -59,6 +61,7 @@ export type StructuredViewEditIntent = XVibeJsonObject & {
   _anchor_text?: string;
   _anchor_type?: string;
   _target_type?: string;
+  _child?: XVibeJsonObject;
   _warnings?: string[];
 };
 
@@ -81,7 +84,8 @@ export type StructuredViewEditEligibility = {
     | "remove-property"
     | "move-object"
     | "replace-object"
-    | "duplicate-object";
+    | "duplicate-object"
+    | "add-child";
   _target_id?: string;
   _field?: "_text";
   _reason?: string;
@@ -305,7 +309,8 @@ function read_structured_view_edit_action(value: unknown): StructuredViewEditAct
     value === "show-object" ||
     value === "move-object" ||
     value === "replace-object" ||
-    value === "duplicate-object"
+    value === "duplicate-object" ||
+    value === "add-child"
   ) {
     return value;
   }
@@ -338,6 +343,18 @@ function read_structured_object_value(value: unknown): XVibeJsonObject {
   }
 
   throw new Error("Invalid '_object_value': expected object");
+}
+
+function read_structured_child_value(value: unknown): XVibeJsonObject {
+  if (!_xu.is_plain_object(value)) {
+    throw new Error("Invalid '_child': expected object");
+  }
+
+  if (typeof value._type !== "string" || value._type.trim().length === 0) {
+    throw new Error("Invalid '_child._type': expected non-empty string");
+  }
+
+  return value;
 }
 
 function read_structured_source_view_id(params: XVibeJsonObject): string | undefined {
@@ -610,6 +627,14 @@ function build_structured_view_edit_task(input: {
       read_structured_object_value(input.params._object_value);
     resolved_task._edit_object_value = object_value;
     edit_intent._object_value = object_value;
+    return { resolved_task, edit_intent };
+  }
+
+  if (input.action === "add-child") {
+    const child_value =
+      read_structured_child_value(input.params._child);
+    resolved_task._edit_child_value = child_value;
+    edit_intent._child = child_value;
     return { resolved_task, edit_intent };
   }
 
@@ -990,6 +1015,20 @@ export class StructuredViewEdit {
           ? { _persisted_version: persisted_version }
           : {}),
       });
+
+      if (mutation._action === "add-child") {
+        _xlog.log("[xvibe] structured add child", {
+          _app_id: app_id,
+          _env: env,
+          _view_id: view_id,
+          _source_view_id: source_view_id,
+          _persisted_view_id: persisted_view_id,
+          _target_id: mutation_target_id,
+          _child_type: mutation._child_type,
+          _child_id: mutation._child_id,
+        });
+      }
+
       const result_details: XVibeJsonObject = {
         _ok: true,
         _artifact_type: "view",

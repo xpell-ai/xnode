@@ -54,7 +54,7 @@ export type XVibeResolvedTask = {
   _action: XVibeResolvedTaskAction;
   _artifact_type: XVibeResolvedTaskArtifactType;
   _target_id?: string;
-  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
+  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
   _edit_target_id?: string;
   _edit_target_text?: string;
   _edit_target_type?: string;
@@ -71,6 +71,7 @@ export type XVibeResolvedTask = {
   _edit_property_name?: string;
   _edit_property_value?: unknown;
   _edit_object_value?: Record<string, any>;
+  _edit_child_value?: Record<string, any>;
   _edit_field?: string;
   _explicit_artifact_type: boolean;
   _explicit_target_id: boolean;

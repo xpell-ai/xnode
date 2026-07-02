@@ -11025,6 +11025,8 @@ try {
           { _id: "button" },
           { _id: "label" },
           { _id: "toolbar" },
+          { _id: "stack" },
+          { _id: "grid" },
           { _id: "xvm-view" },
           {
             _id: "kpi-card",
@@ -11072,6 +11074,79 @@ try {
             _id: "toolbar-ref",
             _type: "xvm-view",
             _view_id: "page-toolbar",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "layout-view",
+        _type: "view",
+        _children: [
+          {
+            _id: "stack-panel",
+            _type: "stack",
+            _children: [
+              {
+                _id: "stack-existing",
+                _type: "label",
+                _text: "Existing Stack",
+              },
+            ],
+          },
+          {
+            _id: "grid-panel",
+            _type: "grid",
+            _children: [
+              {
+                _id: "grid-existing",
+                _type: "label",
+                _text: "Existing Grid",
+              },
+            ],
+          },
+          {
+            _id: "childless-label",
+            _type: "label",
+            _text: "No Children",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "add-ref-host",
+        _type: "view",
+        _children: [
+          {
+            _id: "add-ref",
+            _type: "xvm-view",
+            _view_id: "add-ref-source",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "add-ref-source",
+        _type: "view",
+        _children: [
+          {
+            _id: "ref-stack",
+            _type: "stack",
+            _children: [],
           },
         ],
       },
@@ -11473,6 +11548,271 @@ try {
       },
     });
   assert.equal(JSON.stringify(apply_view_edit_design_host_after._result._view), apply_view_edit_design_host_before);
+
+  const apply_view_edit_add_view_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "layout-view",
+        _child: {
+          _type: "button",
+          _text: "Root Added",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_view_result._ok, true);
+  assert.equal(apply_view_edit_add_view_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_add_view_result._target_id, "layout-view");
+  assert.equal(apply_view_edit_add_view_result._parent_id, "layout-view");
+  assert.equal(apply_view_edit_add_view_result._insert_index, 3);
+  assert.equal(apply_view_edit_add_view_result._result._mutation._child_id, "button");
+  assert.equal(apply_view_edit_add_view_result._result._mutation._child_type, "button");
+  const apply_view_edit_layout_after_add_view =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_layout_after_add_view._result._view._children.map((child: any) => child._id),
+    ["stack-panel", "grid-panel", "childless-label", "button"],
+  );
+  assert.deepEqual(
+    apply_view_edit_layout_after_add_view._result._view._children[3],
+    {
+      _type: "button",
+      _text: "Root Added",
+      _id: "button",
+    },
+  );
+
+  const apply_view_edit_add_stack_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "stack-panel",
+        _target_type: "stack",
+        _child: {
+          _id: "stack-added",
+          _type: "label",
+          _text: "Stack Added",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_stack_result._ok, true);
+  assert.equal(apply_view_edit_add_stack_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_add_stack_result._result._mutation._child_id, "stack-added");
+  assert.equal(apply_view_edit_add_stack_result._insert_index, 1);
+  const apply_view_edit_layout_after_add_stack =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+      },
+    });
+  const apply_view_edit_stack_after_add =
+    find_xui_node_for_test(apply_view_edit_layout_after_add_stack._result._view, "stack-panel");
+  assert.ok(apply_view_edit_stack_after_add);
+  assert.deepEqual(
+    (apply_view_edit_stack_after_add._children as any[]).map((child) => child._id),
+    ["stack-existing", "stack-added"],
+  );
+
+  const apply_view_edit_add_grid_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "grid-panel",
+        _target_type: "grid",
+        _child: {
+          _id: "grid-added",
+          _type: "button",
+          _text: "Grid Added",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_grid_result._ok, true);
+  assert.equal(apply_view_edit_add_grid_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_add_grid_result._result._mutation._child_id, "grid-added");
+  assert.equal(apply_view_edit_add_grid_result._insert_index, 1);
+  const apply_view_edit_layout_after_add_grid =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+      },
+    });
+  const apply_view_edit_grid_after_add =
+    find_xui_node_for_test(apply_view_edit_layout_after_add_grid._result._view, "grid-panel");
+  assert.ok(apply_view_edit_grid_after_add);
+  assert.deepEqual(
+    (apply_view_edit_grid_after_add._children as any[]).map((child) => child._id),
+    ["grid-existing", "grid-added"],
+  );
+
+  const apply_view_edit_add_duplicate_id_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "layout-view",
+        _child: {
+          _id: "stack-added",
+          _type: "label",
+          _text: "Duplicate Replaced",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_duplicate_id_result._ok, true);
+  assert.equal(apply_view_edit_add_duplicate_id_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_add_duplicate_id_result._result._mutation._child_id, "stack-added-2");
+  const apply_view_edit_layout_after_duplicate_id =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_layout_after_duplicate_id._result._view._children.map((child: any) => child._id),
+    ["stack-panel", "grid-panel", "childless-label", "button", "stack-added-2"],
+  );
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_layout_after_duplicate_id._result._view, "stack-added-2")?._text,
+    "Duplicate Replaced",
+  );
+
+  const apply_view_edit_add_ref_host_before =
+    await readFile(
+      path.join(
+        apply_view_edit_work_folder,
+        "xvm",
+        "apps",
+        apply_view_edit_env,
+        apply_view_edit_app_id,
+        "views",
+        "add-ref-host.json",
+      ),
+      "utf-8",
+    );
+  const apply_view_edit_add_ref_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "add-ref-host",
+        _source_view_id: "add-ref-source",
+        _edit_action: "add-child",
+        _target_id: "ref-stack",
+        _target_type: "stack",
+        _child: {
+          _type: "button",
+          _text: "Referenced Add",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_ref_result._ok, true);
+  assert.equal(apply_view_edit_add_ref_result._view_id, "add-ref-host");
+  assert.equal(apply_view_edit_add_ref_result._source_view_id, "add-ref-source");
+  assert.equal(apply_view_edit_add_ref_result._persisted_view_id, "add-ref-source");
+  assert.equal(apply_view_edit_add_ref_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_add_ref_result._result._mutation._child_id, "button");
+  const apply_view_edit_add_ref_host_after =
+    await readFile(
+      path.join(
+        apply_view_edit_work_folder,
+        "xvm",
+        "apps",
+        apply_view_edit_env,
+        apply_view_edit_app_id,
+        "views",
+        "add-ref-host.json",
+      ),
+      "utf-8",
+    );
+  assert.equal(apply_view_edit_add_ref_host_after, apply_view_edit_add_ref_host_before);
+  const apply_view_edit_add_ref_source_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "add-ref-source",
+      },
+    });
+  const apply_view_edit_ref_stack_after_add =
+    find_xui_node_for_test(apply_view_edit_add_ref_source_after._result._view, "ref-stack");
+  assert.ok(apply_view_edit_ref_stack_after_add);
+  assert.deepEqual(
+    apply_view_edit_ref_stack_after_add._children,
+    [
+      {
+        _type: "button",
+        _text: "Referenced Add",
+        _id: "button",
+      },
+    ],
+  );
+
+  const apply_view_edit_push_count_before_add_missing =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_add_missing_target_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "missing-container",
+        _child: {
+          _type: "button",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_missing_target_result._ok, false);
+  assert.equal(apply_view_edit_add_missing_target_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_add_missing,
+  );
+
+  const apply_view_edit_push_count_before_add_childless =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_add_childless_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "layout-view",
+        _edit_action: "add-child",
+        _target_id: "childless-label",
+        _target_type: "label",
+        _child: {
+          _type: "button",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_add_childless_result._ok, false);
+  assert.equal(apply_view_edit_add_childless_result._reason, "target_without_children");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_add_childless,
+  );
 
   const apply_view_edit_hide_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({

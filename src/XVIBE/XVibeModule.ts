@@ -198,7 +198,7 @@ type XVibeViewMutationArtifact = XVibeJsonObject & {
 };
 
 type XVibeViewEditIntent = XVibeJsonObject & {
-  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
+  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -216,12 +216,13 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _anchor_text?: string;
   _anchor_type?: string;
   _target_type?: string;
+  _child?: XVibeJsonObject;
   _warnings?: string[];
 };
 
 type XVibeDeterministicViewEditEligibility = {
   _eligible: boolean;
-  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
+  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
   _target_id?: string;
   _field?: "_text";
   _reason: string;
@@ -233,7 +234,7 @@ type XVibeDeterministicViewEditResult = {
   _view?: unknown;
   _mutation?: {
     _type: "deterministic-view-edit";
-    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object";
+    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
     _target_id?: string;
     _field?: "_text";
     _previous_text?: string;
@@ -270,6 +271,8 @@ type XVibeDeterministicViewEditResult = {
     _source_view_id?: string;
     _requested_view_id?: string;
     _resolved_via?: "xvm-view";
+    _child_id?: string;
+    _child_type?: string;
     _warnings?: string[];
   };
   _reason?: string;
@@ -3089,6 +3092,87 @@ function clone_deterministic_duplicate_subtree(
   return clone;
 }
 
+function deterministic_new_child_id_base(type: unknown): string {
+  const source_type =
+    typeof type === "string" ? type.trim() : "";
+  const normalized_type =
+    source_type
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "-")
+      .replace(/^-+|-+$/gu, "");
+  return normalized_type || "object";
+}
+
+function collect_child_declared_ids(input: {
+  _child: XVibeJsonObject;
+}): string[] {
+  const ids: string[] = [];
+
+  const visit = (node: unknown): void => {
+    if (!_xu.is_plain_object(node)) return;
+
+    if (typeof node._id === "string" && node._id.trim().length > 0) {
+      ids.push(node._id.trim());
+    }
+
+    if (Array.isArray(node._children)) {
+      for (const child of node._children) {
+        visit(child);
+      }
+    }
+  };
+
+  visit(input._child);
+  return ids;
+}
+
+function first_duplicate_child_declared_id(child: XVibeJsonObject): string | undefined {
+  const seen = new Set<string>();
+
+  for (const id of collect_child_declared_ids({ _child: child })) {
+    if (seen.has(id)) return id;
+    seen.add(id);
+  }
+
+  return undefined;
+}
+
+function normalize_added_child_ids(input: {
+  _child: XVibeJsonObject;
+  _used_ids: Set<string>;
+}): XVibeJsonObject {
+  const child =
+    clone_deterministic_view_json(input._child) as XVibeJsonObject;
+
+  const assign_ids = (node: unknown): void => {
+    if (!_xu.is_plain_object(node)) return;
+    if (typeof node._type !== "string" || !node._type.trim()) return;
+
+    const declared_id =
+      typeof node._id === "string" ? node._id.trim() : "";
+
+    if (declared_id && !input._used_ids.has(declared_id)) {
+      node._id = declared_id;
+      input._used_ids.add(declared_id);
+    } else {
+      node._id =
+        deterministic_next_duplicate_id(
+          declared_id || deterministic_new_child_id_base(node._type),
+          input._used_ids,
+        );
+    }
+
+    if (Array.isArray(node._children)) {
+      for (const nested_child of node._children) {
+        assign_ids(nested_child);
+      }
+    }
+  };
+
+  assign_ids(child);
+  return child;
+}
+
 function xvibe_style_has_display_none(style: unknown): boolean {
   return (
     typeof style === "string" &&
@@ -3777,7 +3861,8 @@ export function can_apply_deterministic_view_edit(input: {
     resolved_task._edit_action !== "remove-property" &&
     resolved_task._edit_action !== "move-object" &&
     resolved_task._edit_action !== "replace-object" &&
-    resolved_task._edit_action !== "duplicate-object"
+    resolved_task._edit_action !== "duplicate-object" &&
+    resolved_task._edit_action !== "add-child"
   ) {
     return { _eligible: false, _reason: "unsupported_edit_action" };
   }
@@ -4123,6 +4208,66 @@ export function can_apply_deterministic_view_edit(input: {
       _reason: target_resolution._reason,
       _details: {
         _resolved_by: target_resolution._resolved_by,
+      },
+    };
+  }
+
+  if (resolved_task._edit_action === "add-child") {
+    const child_value = input._edit_intent?._child;
+
+    if (!_xu.is_plain_object(child_value)) {
+      return { _eligible: false, _reason: "missing_child" };
+    }
+
+    const child_type =
+      typeof child_value._type === "string" ? child_value._type.trim() : "";
+    if (!child_type) {
+      return { _eligible: false, _reason: "missing_child_type" };
+    }
+
+    const duplicate_child_id =
+      first_duplicate_child_declared_id(child_value);
+    if (duplicate_child_id) {
+      return {
+        _eligible: false,
+        _reason: "duplicate_child_id",
+        _details: {
+          _id: duplicate_child_id,
+        },
+      };
+    }
+
+    const target_node =
+      find_view_node_by_id(input._current_view, target_id);
+    if (!target_node) {
+      return {
+        _eligible: false,
+        _reason: "target_not_found",
+        _details: {
+          _target_id: target_id,
+        },
+      };
+    }
+
+    if (!Array.isArray(target_node._children)) {
+      return {
+        _eligible: false,
+        _reason: "target_without_children",
+        _details: {
+          _target_id: target_id,
+        },
+      };
+    }
+
+    return {
+      _eligible: true,
+      _action: "add-child",
+      _target_id: target_id,
+      _reason: "eligible",
+      _details: {
+        _resolved_by: "id",
+        _child_type: child_type,
+        _previous_index: target_node._children.length,
       },
     };
   }
@@ -4807,6 +4952,84 @@ export function apply_deterministic_view_edit(input: {
 
   const next_view =
     clone_deterministic_view_json(input._current_view);
+
+  if (eligibility._action === "add-child") {
+    const target_node =
+      find_view_node_by_id(next_view, eligibility._target_id);
+    if (!target_node) {
+      return {
+        _ok: false,
+        _reason: "target_not_found",
+        _details: {
+          _target_id: eligibility._target_id,
+        },
+      };
+    }
+
+    if (!Array.isArray(target_node._children)) {
+      return {
+        _ok: false,
+        _reason: "target_without_children",
+        _details: {
+          _target_id: eligibility._target_id,
+        },
+      };
+    }
+
+    const child_value = input._edit_intent?._child;
+    if (!_xu.is_plain_object(child_value)) {
+      return { _ok: false, _reason: "missing_child" };
+    }
+
+    const child_type =
+      typeof child_value._type === "string" ? child_value._type.trim() : "";
+    if (!child_type) {
+      return { _ok: false, _reason: "missing_child_type" };
+    }
+
+    const duplicate_child_id =
+      first_duplicate_child_declared_id(child_value);
+    if (duplicate_child_id) {
+      return {
+        _ok: false,
+        _reason: "duplicate_child_id",
+        _details: {
+          _id: duplicate_child_id,
+        },
+      };
+    }
+
+    const used_ids = new Set(
+      collect_view_nodes(next_view)
+        .map((node) => typeof node._id === "string" ? node._id.trim() : "")
+        .filter((id) => id.length > 0),
+    );
+    const next_child =
+      normalize_added_child_ids({
+        _child: child_value,
+        _used_ids: used_ids,
+      });
+    const child_id =
+      typeof next_child._id === "string" ? next_child._id : "";
+    const insert_index = target_node._children.length;
+    target_node._children.push(next_child);
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "add-child",
+        _target_id: eligibility._target_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        _parent_id: eligibility._target_id,
+        _insert_index: insert_index,
+        _child_id: child_id,
+        _child_type: child_type,
+        _next_object: next_child,
+      },
+    };
+  }
 
   if (eligibility._action === "duplicate-object") {
     const target_location =
@@ -6796,11 +7019,12 @@ export class XVibeModule extends XModule {
         _app_id: "Target app id.",
         _env: "Target environment.",
         _view_id: "Target/source view id.",
-        _edit_action: "set-property, remove-property, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, or duplicate-object.",
+        _edit_action: "set-property, remove-property, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, duplicate-object, or add-child.",
         _target_id: "Target XUI object id.",
         _target_type: "Optional target XUI type.",
         _before_id: "Anchor XUI object id for move-object or duplicate-object before placement.",
         _after_id: "Anchor XUI object id for move-object or duplicate-object after placement.",
+        _child: "Child XUI object for add-child.",
         _property_name: "Property name for property edits.",
         _property_value: "Property value for set-property.",
         _style_property: "Style property for style edits.",
