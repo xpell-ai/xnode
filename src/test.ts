@@ -12693,6 +12693,210 @@ try {
     path.join(apply_view_edit_ref_views_dir, "page-toolbar.json");
   const apply_view_edit_ref_main_before =
     await readFile(apply_view_edit_ref_main_file, "utf-8");
+
+  const apply_view_edit_set_interaction_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _trigger: "click",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+          _params: {
+            _view_id: "v2",
+          },
+        },
+      },
+    });
+  assert.equal(apply_view_edit_set_interaction_result._ok, true);
+  assert.equal(apply_view_edit_set_interaction_result._edit_action, "set-interaction");
+  assert.equal(apply_view_edit_set_interaction_result._target_id, "toolbar-button");
+  assert.equal(apply_view_edit_set_interaction_result._interaction_scope, "_on");
+  assert.equal(apply_view_edit_set_interaction_result._trigger, "click");
+  assert.equal(apply_view_edit_set_interaction_result._handler_removed, false);
+  assert.equal(apply_view_edit_set_interaction_result._persisted_view_id, "page-toolbar");
+  const apply_view_edit_toolbar_after_set_interaction =
+    JSON.parse(await readFile(apply_view_edit_ref_toolbar_file, "utf-8"));
+  assert.deepEqual(
+    find_xui_node_for_test(apply_view_edit_toolbar_after_set_interaction, "toolbar-button")?._on,
+    {
+      click: {
+        _module: "xvm",
+        _op: "navigate",
+        _params: {
+          _view_id: "v2",
+        },
+      },
+    },
+  );
+
+  const apply_view_edit_update_interaction_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _interaction_scope: "_on",
+        _trigger: "click",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+          _params: {
+            _view_id: "v3",
+          },
+        },
+      },
+    });
+  assert.equal(apply_view_edit_update_interaction_result._ok, true);
+  assert.equal(apply_view_edit_update_interaction_result._handler_removed, false);
+  const apply_view_edit_toolbar_after_update_interaction =
+    JSON.parse(await readFile(apply_view_edit_ref_toolbar_file, "utf-8"));
+  assert.equal(
+    (find_xui_node_for_test(apply_view_edit_toolbar_after_update_interaction, "toolbar-button") as any)?._on?.click?._params?._view_id,
+    "v3",
+  );
+
+  const apply_view_edit_remove_interaction_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _trigger: "click",
+        _handler: null,
+      },
+    });
+  assert.equal(apply_view_edit_remove_interaction_result._ok, true);
+  assert.equal(apply_view_edit_remove_interaction_result._handler_removed, true);
+  const apply_view_edit_toolbar_after_remove_interaction =
+    JSON.parse(await readFile(apply_view_edit_ref_toolbar_file, "utf-8"));
+  const apply_view_edit_toolbar_button_after_remove_interaction =
+    find_xui_node_for_test(apply_view_edit_toolbar_after_remove_interaction, "toolbar-button");
+  assert.ok(apply_view_edit_toolbar_button_after_remove_interaction);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(
+      apply_view_edit_toolbar_button_after_remove_interaction,
+      "_on",
+    ),
+    false,
+  );
+
+  const apply_view_edit_push_count_before_bad_interaction =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_bad_trigger_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _trigger: "hover",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_bad_trigger_result._ok, false);
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_bad_interaction,
+  );
+
+  const apply_view_edit_bad_scope_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _interaction_scope: "_bad",
+        _trigger: "click",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_bad_scope_result._ok, false);
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_bad_interaction,
+  );
+
+  const apply_view_edit_bad_handler_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "toolbar-button",
+        _target_type: "button",
+        _trigger: "click",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+          _params: "v4",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_bad_handler_result._ok, false);
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_bad_interaction,
+  );
+
+  const apply_view_edit_ref_interaction_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+        _source_view_id: "page-toolbar",
+        _edit_action: "set-interaction",
+        _target_id: "settings-button",
+        _target_type: "button",
+        _trigger: "click",
+        _handler: {
+          _module: "xvm",
+          _op: "navigate",
+          _params: {
+            _view_id: "settings",
+          },
+        },
+      },
+    });
+  assert.equal(apply_view_edit_ref_interaction_result._ok, true);
+  assert.equal(apply_view_edit_ref_interaction_result._view_id, "main");
+  assert.equal(apply_view_edit_ref_interaction_result._source_view_id, "page-toolbar");
+  assert.equal(apply_view_edit_ref_interaction_result._persisted_view_id, "page-toolbar");
+  assert.equal(apply_view_edit_ref_interaction_result._edit_action, "set-interaction");
+  const apply_view_edit_ref_main_after_interaction =
+    await readFile(apply_view_edit_ref_main_file, "utf-8");
+  assert.equal(apply_view_edit_ref_main_after_interaction, apply_view_edit_ref_main_before);
+  const apply_view_edit_ref_toolbar_after_interaction =
+    JSON.parse(await readFile(apply_view_edit_ref_toolbar_file, "utf-8"));
+  assert.equal(
+    (find_xui_node_for_test(apply_view_edit_ref_toolbar_after_interaction, "settings-button") as any)?._on?.click?._params?._view_id,
+    "settings",
+  );
+
   const apply_view_edit_ref_source_resolved_logs: any[] = [];
   const apply_view_edit_ref_persisted_logs: any[] = [];
   const apply_view_edit_ref_original_log = _xlog.log;

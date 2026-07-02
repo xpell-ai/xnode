@@ -197,8 +197,10 @@ type XVibeViewMutationArtifact = XVibeJsonObject & {
   _ops: XVibeViewMutationOperation[];
 };
 
+type XVibeInteractionScope = "_on" | "_once";
+
 type XVibeViewEditIntent = XVibeJsonObject & {
-  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
+  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -210,6 +212,9 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _style_value?: string;
   _property_name?: string;
   _property_value?: unknown;
+  _interaction_scope?: XVibeInteractionScope;
+  _trigger?: string;
+  _handler?: Record<string, any> | null;
   _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
   _anchor_id?: string;
@@ -222,7 +227,7 @@ type XVibeViewEditIntent = XVibeJsonObject & {
 
 type XVibeDeterministicViewEditEligibility = {
   _eligible: boolean;
-  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
+  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
   _target_id?: string;
   _field?: "_text";
   _reason: string;
@@ -234,7 +239,7 @@ type XVibeDeterministicViewEditResult = {
   _view?: unknown;
   _mutation?: {
     _type: "deterministic-view-edit";
-    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
+    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
     _target_id?: string;
     _field?: "_text";
     _previous_text?: string;
@@ -250,6 +255,11 @@ type XVibeDeterministicViewEditResult = {
     _previous_value?: unknown;
     _next_value?: unknown;
     _property_name?: string;
+    _interaction_scope?: XVibeInteractionScope;
+    _trigger?: string;
+    _handler_removed?: boolean;
+    _handler_module?: string;
+    _handler_op?: string;
     _previous_object?: XVibeJsonObject;
     _next_object?: XVibeJsonObject;
     _move_position?: "before" | "after" | "top" | "bottom";
@@ -3334,6 +3344,64 @@ function deterministic_is_json_property_value(value: unknown, seen = new Set<obj
     .every((item) => deterministic_is_json_property_value(item, seen));
 }
 
+function deterministic_interaction_scope(value: unknown): XVibeInteractionScope {
+  return value === "_once" ? "_once" : "_on";
+}
+
+function deterministic_interaction_handler_validation(
+  handler: unknown,
+): { _ok: true } | { _ok: false; _reason: string; _details?: XVibeJsonObject } {
+  if (handler === null) {
+    return { _ok: true };
+  }
+
+  if (!_xu.is_plain_object(handler)) {
+    return {
+      _ok: false,
+      _reason: "invalid_handler",
+      _details: {
+        _handler_type: Array.isArray(handler) ? "array" : typeof handler,
+      },
+    };
+  }
+
+  if (typeof handler._module !== "string" || handler._module.trim().length === 0) {
+    return {
+      _ok: false,
+      _reason: "invalid_handler",
+      _details: {
+        _field: "_module",
+      },
+    };
+  }
+
+  if (typeof handler._op !== "string" || handler._op.trim().length === 0) {
+    return {
+      _ok: false,
+      _reason: "invalid_handler",
+      _details: {
+        _field: "_op",
+      },
+    };
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(handler, "_params") &&
+    handler._params !== undefined &&
+    !_xu.is_plain_object(handler._params)
+  ) {
+    return {
+      _ok: false,
+      _reason: "invalid_handler",
+      _details: {
+        _field: "_params",
+      },
+    };
+  }
+
+  return { _ok: true };
+}
+
 function deterministic_runtime_skill_payloads(): unknown[] {
   try {
     const get_skills = (_x as any).getSkills;
@@ -3862,7 +3930,8 @@ export function can_apply_deterministic_view_edit(input: {
     resolved_task._edit_action !== "move-object" &&
     resolved_task._edit_action !== "replace-object" &&
     resolved_task._edit_action !== "duplicate-object" &&
-    resolved_task._edit_action !== "add-child"
+    resolved_task._edit_action !== "add-child" &&
+    resolved_task._edit_action !== "set-interaction"
   ) {
     return { _eligible: false, _reason: "unsupported_edit_action" };
   }
@@ -4108,6 +4177,96 @@ export function can_apply_deterministic_view_edit(input: {
       _reason: target_resolution._reason,
       _details: {
         _resolved_by: target_resolution._resolved_by,
+      },
+    };
+  }
+
+  if (resolved_task._edit_action === "set-interaction") {
+    const interaction_scope = resolved_task._edit_interaction_scope ?? "_on";
+    if (interaction_scope !== "_on" && interaction_scope !== "_once") {
+      return {
+        _eligible: false,
+        _reason: "unsupported_interaction_scope",
+        _details: {
+          _interaction_scope: interaction_scope,
+        },
+      };
+    }
+
+    const trigger =
+      typeof resolved_task._edit_trigger === "string"
+        ? resolved_task._edit_trigger.trim()
+        : "";
+    if (!trigger) {
+      return { _eligible: false, _reason: "missing_trigger" };
+    }
+
+    if (trigger !== "click") {
+      return {
+        _eligible: false,
+        _reason: "unsupported_trigger",
+        _details: {
+          _trigger: trigger,
+        },
+      };
+    }
+
+    const has_handler =
+      Object.prototype.hasOwnProperty.call(resolved_task, "_edit_handler");
+    if (!has_handler) {
+      return { _eligible: false, _reason: "missing_handler" };
+    }
+
+    const handler_validation =
+      deterministic_interaction_handler_validation(resolved_task._edit_handler);
+    if (!handler_validation._ok) {
+      return {
+        _eligible: false,
+        _reason: handler_validation._reason,
+        ...(handler_validation._details !== undefined
+          ? { _details: handler_validation._details }
+          : {}),
+      };
+    }
+
+    const target_resolution =
+      resolve_deterministic_view_edit_target({
+        _current_view: input._current_view,
+        _target_id: target_id,
+        _target_text: resolved_task._edit_target_text,
+        _target_type: resolved_task._edit_target_type,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const existing_scope = target_resolution._target_node[interaction_scope];
+    if (existing_scope !== undefined && !_xu.is_plain_object(existing_scope)) {
+      return {
+        _eligible: false,
+        _reason: "interaction_scope_not_object",
+        _details: {
+          _target_id: target_resolution._target_id,
+          _interaction_scope: interaction_scope,
+        },
+      };
+    }
+
+    return {
+      _eligible: true,
+      _action: "set-interaction",
+      _target_id: target_resolution._target_id,
+      _reason: target_resolution._reason,
+      _details: {
+        _resolved_by: target_resolution._resolved_by,
+        _interaction_scope: interaction_scope,
+        _trigger: trigger,
       },
     };
   }
@@ -4952,6 +5111,117 @@ export function apply_deterministic_view_edit(input: {
 
   const next_view =
     clone_deterministic_view_json(input._current_view);
+
+  if (eligibility._action === "set-interaction") {
+    const target_node =
+      find_view_node_by_id(next_view, eligibility._target_id);
+    if (!target_node) {
+      return {
+        _ok: false,
+        _reason: "target_not_found",
+        _details: {
+          _target_id: eligibility._target_id,
+        },
+      };
+    }
+
+    const interaction_scope =
+      deterministic_interaction_scope(input._resolved_task._edit_interaction_scope);
+    const trigger =
+      typeof input._resolved_task._edit_trigger === "string"
+        ? input._resolved_task._edit_trigger.trim()
+        : "";
+    if (trigger !== "click") {
+      return {
+        _ok: false,
+        _reason: trigger ? "unsupported_trigger" : "missing_trigger",
+        ...(trigger ? { _details: { _trigger: trigger } } : {}),
+      };
+    }
+
+    const handler = input._resolved_task._edit_handler;
+    const handler_validation =
+      deterministic_interaction_handler_validation(handler);
+    if (!handler_validation._ok) {
+      return {
+        _ok: false,
+        _reason: handler_validation._reason,
+        ...(handler_validation._details !== undefined
+          ? { _details: handler_validation._details }
+          : {}),
+      };
+    }
+
+    const existing_scope = target_node[interaction_scope];
+    if (existing_scope !== undefined && !_xu.is_plain_object(existing_scope)) {
+      return {
+        _ok: false,
+        _reason: "interaction_scope_not_object",
+        _details: {
+          _target_id: eligibility._target_id,
+          _interaction_scope: interaction_scope,
+        },
+      };
+    }
+
+    const previous_handler =
+      _xu.is_plain_object(existing_scope)
+        ? existing_scope[trigger]
+        : undefined;
+
+    if (handler === null) {
+      if (_xu.is_plain_object(existing_scope)) {
+        delete existing_scope[trigger];
+        if (Object.keys(existing_scope).length === 0) {
+          delete target_node[interaction_scope];
+        }
+      }
+
+      return {
+        _ok: true,
+        _view: next_view,
+        _mutation: {
+          _type: "deterministic-view-edit",
+          _action: "set-interaction",
+          _target_id: eligibility._target_id,
+          _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+          _interaction_scope: interaction_scope,
+          _trigger: trigger,
+          _handler_removed: true,
+          ...(previous_handler !== undefined ? { _previous_object: previous_handler } : {}),
+        },
+      };
+    }
+
+    if (!_xu.is_plain_object(handler)) {
+      return { _ok: false, _reason: "invalid_handler" };
+    }
+
+    const next_handler =
+      clone_deterministic_view_json(handler) as XVibeJsonObject;
+    const next_scope =
+      _xu.is_plain_object(existing_scope) ? existing_scope : {};
+    next_scope[trigger] = next_handler;
+    target_node[interaction_scope] = next_scope;
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "set-interaction",
+        _target_id: eligibility._target_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        _interaction_scope: interaction_scope,
+        _trigger: trigger,
+        _handler_removed: false,
+        _handler_module: next_handler._module as string,
+        _handler_op: next_handler._op as string,
+        ...(previous_handler !== undefined ? { _previous_object: previous_handler } : {}),
+        _next_object: next_handler,
+      },
+    };
+  }
 
   if (eligibility._action === "add-child") {
     const target_node =
@@ -7019,7 +7289,7 @@ export class XVibeModule extends XModule {
         _app_id: "Target app id.",
         _env: "Target environment.",
         _view_id: "Target/source view id.",
-        _edit_action: "set-property, remove-property, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, duplicate-object, or add-child.",
+        _edit_action: "set-property, remove-property, set-interaction, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, duplicate-object, or add-child.",
         _target_id: "Target XUI object id.",
         _target_type: "Optional target XUI type.",
         _before_id: "Anchor XUI object id for move-object or duplicate-object before placement.",
@@ -7027,6 +7297,9 @@ export class XVibeModule extends XModule {
         _child: "Child XUI object for add-child.",
         _property_name: "Property name for property edits.",
         _property_value: "Property value for set-property.",
+        _interaction_scope: "Interaction scope for set-interaction: _on or _once. Default: _on.",
+        _trigger: "Interaction trigger for set-interaction. V1 supports click.",
+        _handler: "Interaction handler object for set-interaction, or null to remove the trigger.",
         _style_property: "Style property for style edits.",
         _style_value: "Style value for set-style.",
         _class_name: "Class name for add/remove/toggle class edits.",

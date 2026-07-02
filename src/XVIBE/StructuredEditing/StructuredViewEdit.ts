@@ -22,7 +22,8 @@ export type StructuredViewEditAction =
   | "move-object"
   | "replace-object"
   | "duplicate-object"
-  | "add-child";
+  | "add-child"
+  | "set-interaction";
 
 export type StructuredViewEditIntent = XVibeJsonObject & {
   _action:
@@ -43,7 +44,8 @@ export type StructuredViewEditIntent = XVibeJsonObject & {
     | "move-object"
     | "replace-object"
     | "duplicate-object"
-    | "add-child";
+    | "add-child"
+    | "set-interaction";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -55,6 +57,9 @@ export type StructuredViewEditIntent = XVibeJsonObject & {
   _style_value?: string;
   _property_name?: string;
   _property_value?: unknown;
+  _interaction_scope?: "_on" | "_once";
+  _trigger?: string;
+  _handler?: Record<string, any> | null;
   _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
   _anchor_id?: string;
@@ -85,7 +90,8 @@ export type StructuredViewEditEligibility = {
     | "move-object"
     | "replace-object"
     | "duplicate-object"
-    | "add-child";
+    | "add-child"
+    | "set-interaction";
   _target_id?: string;
   _field?: "_text";
   _reason?: string;
@@ -310,7 +316,8 @@ function read_structured_view_edit_action(value: unknown): StructuredViewEditAct
     value === "move-object" ||
     value === "replace-object" ||
     value === "duplicate-object" ||
-    value === "add-child"
+    value === "add-child" ||
+    value === "set-interaction"
   ) {
     return value;
   }
@@ -335,6 +342,57 @@ function read_structured_property_value(value: unknown): unknown {
   }
 
   throw new Error("Invalid '_property_value': expected JSON-compatible value");
+}
+
+function read_structured_interaction_scope(value: unknown): "_on" | "_once" {
+  if (value === undefined || value === null) {
+    return "_on";
+  }
+
+  if (value === "_on" || value === "_once") {
+    return value;
+  }
+
+  throw new Error("Invalid '_interaction_scope': expected '_on' or '_once'");
+}
+
+function read_structured_interaction_trigger(value: unknown): string {
+  const trigger =
+    read_required_string(value, "_trigger");
+
+  if (trigger !== "click") {
+    throw new Error("Invalid '_trigger': unsupported interaction trigger");
+  }
+
+  return trigger;
+}
+
+function read_structured_interaction_handler(value: unknown): Record<string, any> | null {
+  if (value === null) {
+    return null;
+  }
+
+  if (!_xu.is_plain_object(value)) {
+    throw new Error("Invalid '_handler': expected object or null");
+  }
+
+  if (typeof value._module !== "string" || value._module.trim().length === 0) {
+    throw new Error("Invalid '_handler._module': expected non-empty string");
+  }
+
+  if (typeof value._op !== "string" || value._op.trim().length === 0) {
+    throw new Error("Invalid '_handler._op': expected non-empty string");
+  }
+
+  if (
+    Object.prototype.hasOwnProperty.call(value, "_params") &&
+    value._params !== undefined &&
+    !_xu.is_plain_object(value._params)
+  ) {
+    throw new Error("Invalid '_handler._params': expected object");
+  }
+
+  return value;
 }
 
 function read_structured_object_value(value: unknown): XVibeJsonObject {
@@ -677,6 +735,23 @@ function build_structured_view_edit_task(input: {
       edit_intent._property_value = property_value;
     }
 
+    return { resolved_task, edit_intent };
+  }
+
+  if (input.action === "set-interaction") {
+    const interaction_scope =
+      read_structured_interaction_scope(input.params._interaction_scope);
+    const trigger =
+      read_structured_interaction_trigger(input.params._trigger);
+    const handler =
+      read_structured_interaction_handler(input.params._handler);
+
+    resolved_task._edit_interaction_scope = interaction_scope;
+    resolved_task._edit_trigger = trigger;
+    resolved_task._edit_handler = handler;
+    edit_intent._interaction_scope = interaction_scope;
+    edit_intent._trigger = trigger;
+    edit_intent._handler = handler;
     return { resolved_task, edit_intent };
   }
 
@@ -1029,6 +1104,27 @@ export class StructuredViewEdit {
         });
       }
 
+      if (mutation._action === "set-interaction") {
+        _xlog.log("[xvibe] structured set interaction", {
+          _app_id: app_id,
+          _env: env,
+          _view_id: view_id,
+          _source_view_id: source_view_id,
+          _persisted_view_id: persisted_view_id,
+          _target_id: mutation_target_id,
+          ...(target_type ? { _target_type: target_type } : {}),
+          _interaction_scope: mutation._interaction_scope,
+          _trigger: mutation._trigger,
+          _handler_removed: mutation._handler_removed === true,
+          ...(typeof mutation._handler_module === "string"
+            ? { _handler_module: mutation._handler_module }
+            : {}),
+          ...(typeof mutation._handler_op === "string"
+            ? { _handler_op: mutation._handler_op }
+            : {}),
+        });
+      }
+
       const result_details: XVibeJsonObject = {
         _ok: true,
         _artifact_type: "view",
@@ -1069,6 +1165,15 @@ export class StructuredViewEdit {
           : {}),
         ...(typeof mutation._removed_text === "string"
           ? { _removed_text: mutation._removed_text }
+          : {}),
+        ...(typeof mutation._interaction_scope === "string"
+          ? { _interaction_scope: mutation._interaction_scope }
+          : {}),
+        ...(typeof mutation._trigger === "string"
+          ? { _trigger: mutation._trigger }
+          : {}),
+        ...(typeof mutation._handler_removed === "boolean"
+          ? { _handler_removed: mutation._handler_removed }
           : {}),
         ...(typeof mutation._hide_mechanism === "string"
           ? { _hide_mechanism: mutation._hide_mechanism }
@@ -1122,6 +1227,15 @@ export class StructuredViewEdit {
           : {}),
         ...(typeof mutation._removed_text === "string"
           ? { _removed_text: mutation._removed_text }
+          : {}),
+        ...(typeof mutation._interaction_scope === "string"
+          ? { _interaction_scope: mutation._interaction_scope }
+          : {}),
+        ...(typeof mutation._trigger === "string"
+          ? { _trigger: mutation._trigger }
+          : {}),
+        ...(typeof mutation._handler_removed === "boolean"
+          ? { _handler_removed: mutation._handler_removed }
           : {}),
         ...(typeof mutation._hide_mechanism === "string"
           ? { _hide_mechanism: mutation._hide_mechanism }

@@ -54,7 +54,7 @@ export type XVibeResolvedTask = {
   _action: XVibeResolvedTaskAction;
   _artifact_type: XVibeResolvedTaskArtifactType;
   _target_id?: string;
-  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child";
+  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
   _edit_target_id?: string;
   _edit_target_text?: string;
   _edit_target_type?: string;
@@ -70,6 +70,9 @@ export type XVibeResolvedTask = {
   _edit_style_value?: string;
   _edit_property_name?: string;
   _edit_property_value?: unknown;
+  _edit_interaction_scope?: "_on" | "_once";
+  _edit_trigger?: string;
+  _edit_handler?: Record<string, any> | null;
   _edit_object_value?: Record<string, any>;
   _edit_child_value?: Record<string, any>;
   _edit_field?: string;
