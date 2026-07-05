@@ -225,6 +225,7 @@ export type XVibeIntentMessageType =
   | "inspect"
   | "edit"
   | "generate"
+  | "plan"
   | "planning"
   | "debug";
 
@@ -254,6 +255,14 @@ export type XVibeIntentActionStatus =
   | "failed"
   | "rejected";
 
+export type XVibeIntentArtifactRequestType =
+  | "entity"
+  | "flow"
+  | "view"
+  | "form"
+  | "table"
+  | "execution-graph";
+
 export interface XVibeIntentAction {
   _id: string;
   _title: string;
@@ -274,6 +283,8 @@ export interface XVibeIntentResult {
   _reason?: string;
   _actions: XVibeIntentAction[];
   _warnings?: string[];
+  _artifact_type?: XVibeIntentArtifactRequestType;
+  _artifact_request?: Record<string, any>;
 }
 
 export interface XVibeIntentRuntimeContext {

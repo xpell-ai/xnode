@@ -6,6 +6,11 @@ import type {
 } from "./XVibeTypes.js";
 import { IntentMemoryStore } from "./IntentMemory/IntentMemoryStore.js";
 import { DeterministicIntentProcessor } from "./Processors/DeterministicIntentProcessor.js";
+import { CrudProcessor } from "./Processors/CrudProcessor.js";
+import { EntityProcessor } from "./Processors/EntityProcessor.js";
+import { FlowProcessor } from "./Processors/FlowProcessor.js";
+import { FormProcessor } from "./Processors/FormProcessor.js";
+import { TableProcessor } from "./Processors/TableProcessor.js";
 import { LearnedIntentProcessor } from "./Processors/LearnedIntentProcessor.js";
 import {
   SemanticIntentProcessor,
@@ -27,6 +32,11 @@ export class XVibeIntentEngine {
       new LearnedIntentProcessor({
         _store: options._intent_memory_store,
       }),
+      new EntityProcessor(),
+      new FlowProcessor(),
+      new FormProcessor(),
+      new TableProcessor(),
+      new CrudProcessor(),
       new SemanticIntentProcessor({
         _generate_json: options._semantic_generate_json,
       }),

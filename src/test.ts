@@ -39,6 +39,14 @@ import {
   XVibeIntentEngine,
   type XVibeIntentEngineOptions,
 } from "./XVIBE/XVibeIntentEngine.js";
+import { ArtifactResolver } from "./XVIBE/Artifact/ArtifactResolver.js";
+import { CapabilityRegistry } from "./XVIBE/ExecutionGraph/CapabilityRegistry.js";
+import { ExecutionGraphExecutor } from "./XVIBE/ExecutionGraph/ExecutionGraphExecutor.js";
+import { ExecutionGraphPlanner } from "./XVIBE/ExecutionGraph/ExecutionGraphPlanner.js";
+import {
+  ExecutionRecipeLoader,
+  substituteExecutionRecipeTemplate,
+} from "./XVIBE/ExecutionGraph/ExecutionRecipes.js";
 import {
   IntentMemoryStore,
   validate_learned_intent_result,
@@ -109,6 +117,43 @@ function find_xui_node_for_test(value: unknown, id: string): Record<string, unkn
   return undefined;
 }
 
+async function list_relative_files_for_test(dir: string): Promise<string[]> {
+  try {
+    await access(dir);
+  } catch {
+    return [];
+  }
+
+  const files: string[] = [];
+  async function walk(current_dir: string) {
+    const entries = await readdir(current_dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const entry_path = path.join(current_dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(entry_path);
+      } else {
+        files.push(path.relative(dir, entry_path));
+      }
+    }
+  }
+
+  await walk(dir);
+  return files.sort();
+}
+
+function flatten_execution_graph_nodes_for_test(nodes: any[]): any[] {
+  const flattened: any[] = [];
+
+  for (const node of nodes) {
+    flattened.push(node);
+    if (Array.isArray(node._children)) {
+      flattened.push(...flatten_execution_graph_nodes_for_test(node._children));
+    }
+  }
+
+  return flattened;
+}
+
 function collect_missing_xui_node_ids(value: unknown, path = "_view", missing: string[] = []): string[] {
   if (Array.isArray(value)) {
     value.forEach((item, index) => {
@@ -158,6 +203,11 @@ const XVIBE_INTENT_STUB_CONVERSATION_RESULT = {
 const XVIBE_INTENT_PROCESSOR_CHAIN = [
   "DeterministicIntentProcessor",
   "LearnedIntentProcessor",
+  "EntityProcessor",
+  "FlowProcessor",
+  "FormProcessor",
+  "TableProcessor",
+  "CrudProcessor",
   "SemanticIntentProcessor",
 ];
 
@@ -274,6 +324,118 @@ function assert_xvibe_selected_object_action(
   });
 }
 
+function assert_xvibe_entity_artifact_request(
+  response: any,
+  entity_name: string,
+  fields?: { _name: string }[],
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "EntityProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create entity artifact request.");
+  assert.equal(response._intent?._artifact_type, "entity");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "create",
+    _entity_name: entity_name,
+    ...(fields ? { _fields: fields } : {}),
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_flow_artifact_request(
+  response: any,
+  flow_id: string,
+  entity_name: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "FlowProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create flow artifact request.");
+  assert.equal(response._intent?._artifact_type, "flow");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "create",
+    _flow_id: flow_id,
+    _entity_name: entity_name,
+    _action: "entity-add",
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_form_artifact_request(
+  response: any,
+  entity_name: string,
+  view_id: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "FormProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create form artifact request.");
+  assert.equal(response._intent?._artifact_type, "form");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "create",
+    _entity_name: entity_name,
+    _view_id: view_id,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_table_artifact_request(
+  response: any,
+  entity_name: string,
+  view_id: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "TableProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create table artifact request.");
+  assert.equal(response._intent?._artifact_type, "table");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "create",
+    _entity_name: entity_name,
+    _view_id: view_id,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_crud_execution_plan_request(
+  response: any,
+  entity_name: string,
+  fields?: { _name: string }[],
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "CrudProcessor");
+  assert.equal(response._intent?._message_type, "plan");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create CRUD execution plan.");
+  assert.equal(response._intent?._artifact_type, "execution-graph");
+  assert.equal(response._intent?._artifact_request?._operation, "plan");
+  assert.equal(response._intent?._artifact_request?._graph_type, "crud");
+  assert.equal(response._intent?._artifact_request?._entity_name, entity_name);
+  assert.deepEqual(
+    response._intent?._artifact_request?._fields,
+    fields,
+  );
+  assert.equal(
+    Array.isArray(response._intent?._artifact_request?._execution_graph?._nodes),
+    true,
+  );
+  assert.deepEqual(response._intent?._actions, []);
+}
+
 set_xvibe_semantic_intent_env(undefined);
 
 const xvibe_intent_engine = xvibe_test_intent_engine();
@@ -293,6 +455,607 @@ assert.deepEqual(
   XVIBE_INTENT_PROCESSOR_CHAIN,
 );
 assert.equal(typeof xvibe_intent_valid_res._duration_ms, "number");
+
+const xvibe_entity_create_user_res = await xvibe_intent_engine.analyze({
+  _message: "Create entity User",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(xvibe_entity_create_user_res, "user");
+
+const xvibe_entity_create_customer_res = await xvibe_intent_engine.analyze({
+  _message: "Create entity Customer",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_create_customer_res,
+  "customer",
+);
+
+const xvibe_entity_add_customer_res = await xvibe_intent_engine.analyze({
+  _message: "Add entity Customer",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_add_customer_res,
+  "customer",
+);
+
+const xvibe_entity_called_product_res = await xvibe_intent_engine.analyze({
+  _message: "Create an entity called Product",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_called_product_res,
+  "product",
+);
+
+const xvibe_entity_xdb_invoice_res = await xvibe_intent_engine.analyze({
+  _message: "Create XDB entity Invoice",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_xdb_invoice_res,
+  "invoice",
+);
+
+const xvibe_entity_make_employee_res = await xvibe_intent_engine.analyze({
+  _message: "Make entity Employee",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_make_employee_res,
+  "employee",
+);
+
+const xvibe_entity_customer_orders_res = await xvibe_intent_engine.analyze({
+  _message: "Create entity Customer Orders",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_customer_orders_res,
+  "customer-orders",
+);
+
+const xvibe_entity_product_newline_fields_res =
+  await xvibe_intent_engine.analyze({
+    _message: "Create entity Product with:\nname\nprice\ndescription",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_product_newline_fields_res,
+  "product",
+  [
+    { _name: "name" },
+    { _name: "price" },
+    { _name: "description" },
+  ],
+);
+assert.equal(
+  xvibe_entity_product_newline_fields_res._intent?._artifact_request?._schema,
+  undefined,
+);
+assert.equal(
+  xvibe_entity_product_newline_fields_res._intent?._artifact_request?._fields?.[0]?._type,
+  undefined,
+);
+
+const xvibe_entity_product_comma_fields_res =
+  await xvibe_intent_engine.analyze({
+    _message: "Create entity Product with name, price, description",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_product_comma_fields_res,
+  "product",
+  [
+    { _name: "name" },
+    { _name: "price" },
+    { _name: "description" },
+  ],
+);
+
+const xvibe_entity_product_bullet_fields_res =
+  await xvibe_intent_engine.analyze({
+    _message: "Create entity Product with:\n- First Name\n- price\n- description",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_entity_artifact_request(
+  xvibe_entity_product_bullet_fields_res,
+  "product",
+  [
+    { _name: "first-name" },
+    { _name: "price" },
+    { _name: "description" },
+  ],
+);
+
+const xvibe_entity_non_entity_res = await xvibe_intent_engine.analyze({
+  _message: "Create a dashboard",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_entity_non_entity_res._ok, true);
+assert.deepEqual(
+  xvibe_entity_non_entity_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+for (const message of [
+  "delete entity User",
+  "modify entity User",
+  "rename entity User",
+  "update entity User",
+]) {
+  const xvibe_entity_forbidden_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert.equal(xvibe_entity_forbidden_res._ok, true);
+  assert.deepEqual(
+    xvibe_entity_forbidden_res._intent,
+    XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+  );
+}
+
+const xvibe_flow_create_product_res = await xvibe_intent_engine.analyze({
+  _message: "Create flow create-product that adds product entity",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_create_product_res,
+  "create-product",
+  "product",
+);
+
+const xvibe_flow_for_aime_user_res = await xvibe_intent_engine.analyze({
+  _message: "Create flow create-aime-user for aime-user",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_for_aime_user_res,
+  "create-aime-user",
+  "aime-user",
+);
+
+const xvibe_flow_entity_manager_add_res = await xvibe_intent_engine.analyze({
+  _message: "Add flow create-user that calls entity-manager.add for user",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_entity_manager_add_res,
+  "create-user",
+  "user",
+);
+
+const xvibe_flow_event_payload_res = await xvibe_intent_engine.analyze({
+  _message:
+    "Create flow create-aime-user that receives event payload and adds aime-user",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_event_payload_res,
+  "create-aime-user",
+  "aime-user",
+);
+
+const xvibe_flow_normalized_res = await xvibe_intent_engine.analyze({
+  _message: "Create flow Create Product Record that adds Product Type entity",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_normalized_res,
+  "create-product-record",
+  "product-type",
+);
+
+const xvibe_flow_non_flow_res = await xvibe_intent_engine.analyze({
+  _message: "Create a dashboard that lists users",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_flow_non_flow_res._ok, true);
+assert.deepEqual(
+  xvibe_flow_non_flow_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+for (const message of [
+  "delete flow create-user",
+  "modify flow create-user",
+  "rename flow create-user",
+  "update flow create-user",
+  "Create flow delete-user that deletes user",
+]) {
+  const xvibe_flow_forbidden_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert.equal(xvibe_flow_forbidden_res._ok, true);
+  assert.deepEqual(
+    xvibe_flow_forbidden_res._intent,
+    XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "flow-before-semantic-provider");
+let xvibe_flow_semantic_generate_count = 0;
+const xvibe_flow_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_flow_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_flow_before_semantic_res =
+  await xvibe_flow_before_semantic_engine.analyze({
+    _message: "Create flow create-product that adds product entity",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_flow_artifact_request(
+  xvibe_flow_before_semantic_res,
+  "create-product",
+  "product",
+);
+assert.deepEqual(
+  xvibe_flow_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_flow_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+for (const [message, entity_name, view_id] of [
+  ["Create form for product", "product", "create-product"],
+  ["Create product form", "product", "create-product"],
+  ["Make form for product", "product", "create-product"],
+  ["Add form view for product", "product", "create-product"],
+  ["Create create-product form", "product", "create-product"],
+  ["Create form for product called create-product-v2", "product", "create-product-v2"],
+  ["Create form for product named create-product-v2", "product", "create-product-v2"],
+  ["Create product form called create-product-v2", "product", "create-product-v2"],
+  ["Create product form named create-product-v2", "product", "create-product-v2"],
+  ["Create form for Product named Create Product V2", "product", "create-product-v2"],
+] as const) {
+  const xvibe_form_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_form_artifact_request(
+    xvibe_form_res,
+    entity_name,
+    view_id,
+  );
+}
+
+const xvibe_form_non_form_res = await xvibe_intent_engine.analyze({
+  _message: "Create a dashboard that lists products",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_form_non_form_res._ok, true);
+assert.deepEqual(
+  xvibe_form_non_form_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+for (const message of [
+  "delete form for product",
+  "modify product form",
+  "rename form create-product",
+  "update product form",
+]) {
+  const xvibe_form_forbidden_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert.equal(xvibe_form_forbidden_res._ok, true);
+  assert.deepEqual(
+    xvibe_form_forbidden_res._intent,
+    XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "form-before-semantic-provider");
+let xvibe_form_semantic_generate_count = 0;
+const xvibe_form_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_form_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_form_before_semantic_res =
+  await xvibe_form_before_semantic_engine.analyze({
+    _message: "Create form for product",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_form_artifact_request(
+  xvibe_form_before_semantic_res,
+  "product",
+  "create-product",
+);
+assert.deepEqual(
+  xvibe_form_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_form_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+for (const [message, entity_name, view_id] of [
+  ["Create table for product", "product", "product-list"],
+  ["Create product table", "product", "product-list"],
+  ["Create list for product", "product", "product-list"],
+  ["Create product list", "product", "product-list"],
+  ["Create table for product called product-list", "product", "product-list"],
+  ["Create product table named product-list", "product", "product-list"],
+  ["Create table for Product Type named Product Type List", "product-type", "product-type-list"],
+] as const) {
+  const xvibe_table_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_table_artifact_request(
+    xvibe_table_res,
+    entity_name,
+    view_id,
+  );
+}
+
+const xvibe_table_non_table_res = await xvibe_intent_engine.analyze({
+  _message: "Create dashboard with users table",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert.equal(xvibe_table_non_table_res._ok, true);
+assert.deepEqual(
+  xvibe_table_non_table_res._intent,
+  XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+);
+
+for (const message of [
+  "delete table for product",
+  "modify product table",
+  "rename list product-list",
+  "update product list",
+]) {
+  const xvibe_table_forbidden_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert.equal(xvibe_table_forbidden_res._ok, true);
+  assert.deepEqual(
+    xvibe_table_forbidden_res._intent,
+    XVIBE_INTENT_STUB_CONVERSATION_RESULT,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "table-before-semantic-provider");
+let xvibe_table_semantic_generate_count = 0;
+const xvibe_table_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_table_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_table_before_semantic_res =
+  await xvibe_table_before_semantic_engine.analyze({
+    _message: "Create table for product",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_table_artifact_request(
+  xvibe_table_before_semantic_res,
+  "product",
+  "product-list",
+);
+assert.deepEqual(
+  xvibe_table_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_table_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+for (const message of [
+  "Create Product CRUD",
+  "Create CRUD for Product",
+  "Build Product CRUD",
+  "Generate Product CRUD",
+] as const) {
+  const xvibe_crud_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_crud_execution_plan_request(
+    xvibe_crud_res,
+    "product",
+  );
+}
+
+const xvibe_crud_normalized_res = await xvibe_intent_engine.analyze({
+  _message: "Create Product Type CRUD",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_normalized_res,
+  "product-type",
+);
+
+const xvibe_crud_comma_fields_res = await xvibe_intent_engine.analyze({
+  _message: "Create Partner CRUD with name,email,phone",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_comma_fields_res,
+  "partner",
+  [
+    { _name: "name" },
+    { _name: "email" },
+    { _name: "phone" },
+  ],
+);
+
+const xvibe_crud_bullet_fields_res = await xvibe_intent_engine.analyze({
+  _message: "Create Partner CRUD with:\n- name\n- email\n- phone",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_bullet_fields_res,
+  "partner",
+  [
+    { _name: "name" },
+    { _name: "email" },
+    { _name: "phone" },
+  ],
+);
+
+const xvibe_crud_newline_fields_res = await xvibe_intent_engine.analyze({
+  _message: "Create Customer CRUD having:\nfirst_name\nlast_name\nemail",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_newline_fields_res,
+  "customer",
+  [
+    { _name: "first-name" },
+    { _name: "last-name" },
+    { _name: "email" },
+  ],
+);
+
+const xvibe_crud_colon_fields_res = await xvibe_intent_engine.analyze({
+  _message: "Create Partner CRUD: name, email, phone",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_colon_fields_res,
+  "partner",
+  [
+    { _name: "name" },
+    { _name: "email" },
+    { _name: "phone" },
+  ],
+);
+
+set_xvibe_semantic_intent_env("true", "crud-before-semantic-provider");
+let xvibe_crud_semantic_generate_count = 0;
+const xvibe_crud_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_crud_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_crud_before_semantic_res =
+  await xvibe_crud_before_semantic_engine.analyze({
+    _message: "Create Product CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_crud_execution_plan_request(
+  xvibe_crud_before_semantic_res,
+  "product",
+);
+assert.deepEqual(
+  xvibe_crud_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_crud_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
 
 const xvibe_learn_file_create_work_dir =
   await mkdtemp(path.join(tmpdir(), "xvibe-learn-file-create-"));
@@ -800,6 +1563,10 @@ try {
     xvibe_intent_hide_selected_res,
     "hide-object",
   );
+  assert.equal(
+    xvibe_intent_hide_selected_res._processor,
+    "DeterministicIntentProcessor",
+  );
 
   const xvibe_intent_delete_selected_res = await xvibe_intent_engine.analyze({
     _message: "delete selected",
@@ -950,6 +1717,28 @@ assert.deepEqual(
 );
 assert.equal(typeof xvibe_semantic_deterministic_res._duration_ms, "number");
 assert.equal(xvibe_semantic_deterministic_generate_count, 0);
+
+let xvibe_semantic_entity_generate_count = 0;
+const xvibe_semantic_entity_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_semantic_entity_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_semantic_entity_res =
+  await xvibe_semantic_entity_engine.analyze({
+    _message: "Create entity User",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_entity_artifact_request(xvibe_semantic_entity_res, "user");
+assert.deepEqual(
+  xvibe_semantic_entity_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_semantic_entity_generate_count, 0);
 
 set_xvibe_semantic_intent_env("true", "mock-semantic-provider");
 const xvibe_semantic_enabled_generate_inputs:
@@ -13636,6 +14425,1977 @@ try {
     },
   });
 
+  const artifact_request_app_id = "artifact-request-app";
+  await _x.execute({
+    _module: "server-xvm",
+    _op: "create_app",
+    _params: {
+      _app_id: artifact_request_app_id,
+      _env: "test",
+    },
+  });
+
+  const artifact_request_intent_engine = xvibe_test_intent_engine();
+  const artifact_request_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message: "Create entity User",
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert.equal(artifact_request_intent_res._ok, true);
+  assert.equal(
+    artifact_request_intent_res._intent?._artifact_type,
+    "entity",
+  );
+  assert.deepEqual(
+    artifact_request_intent_res._intent?._artifact_request,
+    {
+      _operation: "create",
+      _entity_name: "user",
+    },
+  );
+  const artifact_request_fields_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message: "Create entity Product with name, price, description",
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert.equal(artifact_request_fields_intent_res._ok, true);
+  assert.deepEqual(
+    artifact_request_fields_intent_res._intent?._artifact_request,
+    {
+      _operation: "create",
+      _entity_name: "product",
+      _fields: [
+        { _name: "name" },
+        { _name: "price" },
+        { _name: "description" },
+      ],
+    },
+  );
+  assert.equal(
+    artifact_request_fields_intent_res._intent?._artifact_request?._schema,
+    undefined,
+  );
+  const artifact_request_flow_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message:
+        "Create flow Create Product Record that receives event payload and adds Product entity",
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert_xvibe_flow_artifact_request(
+    artifact_request_flow_intent_res,
+    "create-product-record",
+    "product",
+  );
+  const artifact_request_form_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message: "Create product form",
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert_xvibe_form_artifact_request(
+    artifact_request_form_intent_res,
+    "product",
+    "create-product",
+  );
+  const artifact_request_table_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message: "Create product table named product-list",
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert_xvibe_table_artifact_request(
+    artifact_request_table_intent_res,
+    "product",
+    "product-list",
+  );
+
+  const artifact_request_xvibe = new XVibeModule();
+  assert.equal(
+    XVibeModule._ops["apply-artifact-request"]._name,
+    "apply-artifact-request",
+  );
+  const original_artifact_request_execute = (_x as any).execute;
+  let artifact_request_ai_calls = 0;
+  let artifact_request_studio_calls = 0;
+  let graph_failure_set_entity_calls = 0;
+  const graph_execution_persist_ops: string[] = [];
+  try {
+    (_x as any).execute = async (command: any) => {
+      if (
+        command?._module === "xai" ||
+        String(command?._module ?? "").includes("router")
+      ) {
+        artifact_request_ai_calls += 1;
+        throw new Error("AI/router should not be called for artifact request apply");
+      }
+
+      if (command?._module === "studio") {
+        artifact_request_studio_calls += 1;
+        throw new Error("XStudio should not be called for artifact request apply");
+      }
+
+      if (
+        command?._module === "server-xvm" &&
+        command?._op === "set_entity" &&
+        command?._params?._app_id === "graph-failure-app"
+      ) {
+        graph_failure_set_entity_calls += 1;
+        return {
+          _ok: false,
+          _result: {
+            _code: "E_TEST_GRAPH_ENTITY_CREATE_FAILED",
+            _message: "Forced graph entity create failure",
+          },
+        };
+      }
+
+      if (
+        command?._module === "server-xvm" &&
+        command?._params?._app_id === "graph-execution-app" &&
+        ["set_entity", "set_flow", "push_update"].includes(command?._op)
+      ) {
+        graph_execution_persist_ops.push(command._op);
+      }
+
+      return original_artifact_request_execute.call(_x, command);
+    };
+
+    const apply_entity_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: artifact_request_intent_res._intent?._artifact_type,
+          _artifact_request:
+            artifact_request_intent_res._intent?._artifact_request,
+          _conversation_id: "artifact-request-conversation",
+          _message_id: "artifact-request-message",
+        },
+      });
+    const expected_entity_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "entities",
+      "user.json",
+    );
+    assert.deepEqual(apply_entity_request_res, {
+      _ok: true,
+      _artifact_type: "entity",
+      _operation: "create",
+      _entity_name: "user",
+      _path: expected_entity_artifact_path,
+    });
+    const created_entity_artifact = JSON.parse(
+      await readFile(expected_entity_artifact_path, "utf-8"),
+    );
+    assert.deepEqual(created_entity_artifact, {
+      _id: "user",
+      _schema: {},
+    });
+    assert.equal(created_entity_artifact._schema._id, undefined);
+    assert.equal(created_entity_artifact._schema._created_at, undefined);
+    assert.equal(created_entity_artifact._schema._updated_at, undefined);
+
+    const apply_entity_fields_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type:
+            artifact_request_fields_intent_res._intent?._artifact_type,
+          _artifact_request:
+            artifact_request_fields_intent_res._intent?._artifact_request,
+        },
+      });
+    const expected_entity_fields_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "entities",
+      "product.json",
+    );
+    assert.deepEqual(apply_entity_fields_request_res, {
+      _ok: true,
+      _artifact_type: "entity",
+      _operation: "create",
+      _entity_name: "product",
+      _path: expected_entity_fields_artifact_path,
+    });
+    const created_entity_fields_artifact = JSON.parse(
+      await readFile(expected_entity_fields_artifact_path, "utf-8"),
+    );
+    assert.deepEqual(created_entity_fields_artifact, {
+      _id: "product",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+        price: {
+          _type: "String",
+        },
+        description: {
+          _type: "String",
+        },
+      },
+    });
+
+    const artifact_resolver = new ArtifactResolver();
+    const resolved_product_entity = await artifact_resolver.getEntity(
+      artifact_request_app_id,
+      "test",
+      "product",
+    );
+    assert.equal(resolved_product_entity?._id, "product");
+    assert.equal(resolved_product_entity?._schema?.name?._type, "String");
+    assert.equal(resolved_product_entity?._schema?.price?._type, "String");
+    assert.equal(
+      resolved_product_entity?._schema?.description?._type,
+      "String",
+    );
+    assert.equal(
+      await artifact_resolver.entityExists(
+        artifact_request_app_id,
+        "test",
+        "product",
+      ),
+      true,
+    );
+    assert.equal(
+      await artifact_resolver.getEntity(
+        artifact_request_app_id,
+        "test",
+        "missing-product",
+      ),
+      null,
+    );
+    assert.equal(
+      await artifact_resolver.entityExists(
+        artifact_request_app_id,
+        "test",
+        "missing-product",
+      ),
+      false,
+    );
+
+    const apply_form_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type:
+            artifact_request_form_intent_res._intent?._artifact_type,
+          _artifact_request:
+            artifact_request_form_intent_res._intent?._artifact_request,
+        },
+      });
+    const expected_form_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "views",
+      "create-product.json",
+    );
+    assert.deepEqual(apply_form_request_res, {
+      _ok: true,
+      _artifact_type: "form",
+      _operation: "create",
+      _view_id: "create-product",
+      _entity_name: "product",
+      _path: expected_form_artifact_path,
+    });
+    const created_form_artifact = JSON.parse(
+      await readFile(expected_form_artifact_path, "utf-8"),
+    );
+    assert.equal(created_form_artifact._id, "create-product");
+    assert.equal(created_form_artifact._type, "view");
+    assert.equal(
+      find_xui_node_for_test(created_form_artifact, "create-product-title")
+        ?._text,
+      "Create Product",
+    );
+    const created_form_container = find_xui_node_for_test(
+      created_form_artifact,
+      "create-product-form",
+    );
+    assert.equal(created_form_container?._type, "form");
+    assert.equal((created_form_container as any)?._submit, undefined);
+    const created_form_name_field = find_xui_node_for_test(
+      created_form_artifact,
+      "create-product-field-name",
+    ) as any;
+    const created_form_price_field = find_xui_node_for_test(
+      created_form_artifact,
+      "create-product-field-price",
+    ) as any;
+    const created_form_description_field = find_xui_node_for_test(
+      created_form_artifact,
+      "create-product-field-description",
+    ) as any;
+    assert.equal(created_form_name_field?._type, "field");
+    assert.equal(created_form_name_field?._control?._type, "input");
+    assert.equal(created_form_name_field?._control?._name, "name");
+    assert.equal(
+      created_form_name_field?._control?._data_output,
+      "form.create-product.name",
+    );
+    assert.equal(
+      created_form_name_field?._control?._update_data_source_event,
+      "input",
+    );
+    assert.equal(created_form_price_field?._type, "field");
+    assert.equal(created_form_price_field?._control?._type, "input");
+    assert.equal(created_form_price_field?._control?._name, "price");
+    assert.equal(
+      created_form_price_field?._control?._data_output,
+      "form.create-product.price",
+    );
+    assert.equal(created_form_description_field?._type, "field");
+    assert.equal(created_form_description_field?._control?._type, "input");
+    assert.equal(
+      created_form_description_field?._control?._name,
+      "description",
+    );
+    assert.equal(
+      created_form_description_field?._control?._data_output,
+      "form.create-product.description",
+    );
+    const created_form_submit = find_xui_node_for_test(
+      created_form_artifact,
+      "create-product-submit",
+    ) as any;
+    assert.equal(created_form_submit?._type, "button");
+    assert.equal(created_form_submit?.type, "button");
+    assert.equal(created_form_submit?._flow, undefined);
+    assert.equal(created_form_submit?._flow_event, undefined);
+    assert.equal(
+      find_xui_node_for_test(created_form_artifact, "create-product-field-_id"),
+      undefined,
+    );
+    assert.equal(
+      find_xui_node_for_test(
+        created_form_artifact,
+        "create-product-field-_created_at",
+      ),
+      undefined,
+    );
+    assert.equal(
+      find_xui_node_for_test(
+        created_form_artifact,
+        "create-product-field-_updated_at",
+      ),
+      undefined,
+    );
+    const created_form_field_ids =
+      (created_form_container?._children as Record<string, unknown>[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id);
+    assert.deepEqual(created_form_field_ids, [
+      "create-product-field-name",
+      "create-product-field-price",
+      "create-product-field-description",
+    ]);
+    const resolved_product_form = await artifact_resolver.getView(
+      artifact_request_app_id,
+      "test",
+      "create-product",
+    );
+    assert.equal(resolved_product_form?._id, "create-product");
+    assert.equal(
+      await artifact_resolver.viewExists(
+        artifact_request_app_id,
+        "test",
+        "create-product",
+      ),
+      true,
+    );
+
+    const table_artifact_app_id = "table-artifact-app";
+    const table_artifact_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: table_artifact_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(table_artifact_create_app_res._ok, true);
+    const table_entity_fixture_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: table_artifact_app_id,
+        _env: "test",
+        _entity: {
+          _id: "product",
+          _schema: {
+            _id: {
+              _type: "String",
+            },
+            name: {
+              _type: "String",
+            },
+            price: {
+              _type: "String",
+            },
+            _created_at: {
+              _type: "Date",
+            },
+            description: {
+              _type: "String",
+            },
+            _updated_at: {
+              _type: "Date",
+            },
+          },
+        },
+      },
+    });
+    assert.equal(table_entity_fixture_res._ok, true);
+    const apply_table_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: table_artifact_app_id,
+          _env: "test",
+          _artifact_type:
+            artifact_request_table_intent_res._intent?._artifact_type,
+          _artifact_request:
+            artifact_request_table_intent_res._intent?._artifact_request,
+        },
+      });
+    const expected_table_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      table_artifact_app_id,
+      "views",
+      "product-list.json",
+    );
+    assert.deepEqual(apply_table_request_res, {
+      _ok: true,
+      _artifact_type: "table",
+      _operation: "create",
+      _view_id: "product-list",
+      _entity_name: "product",
+      _path: expected_table_artifact_path,
+    });
+    const created_table_artifact = JSON.parse(
+      await readFile(expected_table_artifact_path, "utf-8"),
+    );
+    assert.equal(created_table_artifact._id, "product-list");
+    assert.equal(created_table_artifact._type, "view");
+    assert.equal(
+      find_xui_node_for_test(created_table_artifact, "product-list-title")
+        ?._text,
+      "Product List",
+    );
+    const created_table = find_xui_node_for_test(
+      created_table_artifact,
+      "product-list-table",
+    ) as any;
+    assert.equal(created_table?._type, "table");
+    assert.equal(created_table?._data_source, "product.records");
+    assert.deepEqual(created_table_artifact._on_mount, {
+      _module: "entity-client",
+      _op: "find",
+      _params: {
+        _entity: "product",
+        _filter: {},
+        _output: "product.records",
+      },
+    });
+    assert.deepEqual(created_table?._columns, [
+      {
+        _key: "name",
+        _label: "Name",
+      },
+      {
+        _key: "price",
+        _label: "Price",
+      },
+      {
+        _key: "description",
+        _label: "Description",
+      },
+    ]);
+    assert.equal(
+      created_table?._columns.some((column: any) => column._key === "_id"),
+      false,
+    );
+    assert.equal(
+      created_table?._columns.some(
+        (column: any) => column._key === "_created_at",
+      ),
+      false,
+    );
+    assert.equal(
+      created_table?._columns.some(
+        (column: any) => column._key === "_updated_at",
+      ),
+      false,
+    );
+    assert.deepEqual(
+      created_table?._columns.map((column: any) => column._key),
+      ["name", "price", "description"],
+    );
+    const resolved_product_table = await artifact_resolver.getView(
+      table_artifact_app_id,
+      "test",
+      "product-list",
+    );
+    assert.equal(resolved_product_table?._id, "product-list");
+
+    const table_artifact_before_duplicate =
+      await readFile(expected_table_artifact_path, "utf-8");
+    const duplicate_table_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: table_artifact_app_id,
+          _env: "test",
+          _artifact_type: "table",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "product",
+            _view_id: "product-list",
+          },
+        },
+      });
+    assert.equal(duplicate_table_request_res._ok, false);
+    assert.equal(
+      duplicate_table_request_res._error._code,
+      "E_XVIBE_TABLE_ARTIFACT_EXISTS",
+    );
+    assert.equal(
+      await readFile(expected_table_artifact_path, "utf-8"),
+      table_artifact_before_duplicate,
+    );
+
+    const missing_entity_form_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "views",
+      "create-missing-product.json",
+    );
+    const missing_entity_form_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "form",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "missing-product",
+            _view_id: "create-missing-product",
+          },
+        },
+      });
+    assert.equal(missing_entity_form_res._ok, false);
+    assert.equal(
+      missing_entity_form_res._error._code,
+      "E_XVIBE_ENTITY_SCHEMA_UNAVAILABLE",
+    );
+    await assert.rejects(access(missing_entity_form_path));
+
+    const apply_flow_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type:
+            artifact_request_flow_intent_res._intent?._artifact_type,
+          _artifact_request:
+            artifact_request_flow_intent_res._intent?._artifact_request,
+        },
+      });
+    const expected_flow_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "flows",
+      "create-product-record.json",
+    );
+    assert.deepEqual(apply_flow_request_res, {
+      _ok: true,
+      _artifact_type: "flow",
+      _operation: "create",
+      _flow_id: "create-product-record",
+      _entity_name: "product",
+      _path: expected_flow_artifact_path,
+    });
+    const created_flow_artifact = JSON.parse(
+      await readFile(expected_flow_artifact_path, "utf-8"),
+    );
+    assert.deepEqual(created_flow_artifact, {
+      _id: "create-product-record",
+      _steps: [
+        {
+          _id: "add-product",
+          _command: {
+            _module: "entity-manager",
+            _op: "add",
+            _params: {
+              _app_id: artifact_request_app_id,
+              _env: "test",
+              _entity: "product",
+              _data: {
+                name: "$event.name",
+                price: "$event.price",
+                description: "$event.description",
+              },
+            },
+          },
+        },
+      ],
+    });
+    assert.equal(
+      created_flow_artifact._steps[0]._command._module,
+      "entity-manager",
+    );
+    assert.equal(created_flow_artifact._steps[0]._command._op, "add");
+    const created_flow_data =
+      created_flow_artifact._steps[0]._command._params._data;
+    assert.equal(typeof created_flow_data, "object");
+    assert.equal(Array.isArray(created_flow_data), false);
+    assert.notEqual(created_flow_data, "$event");
+    assert.deepEqual(Object.keys(created_flow_data), [
+      "name",
+      "price",
+      "description",
+    ]);
+    assert.deepEqual(created_flow_data, {
+      name: "$event.name",
+      price: "$event.price",
+      description: "$event.description",
+    });
+    assert.equal(created_flow_data._id, undefined);
+    assert.equal(created_flow_data._created_at, undefined);
+    assert.equal(created_flow_data._updated_at, undefined);
+
+    const crud_flow_fixture_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_flow",
+      _params: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+        _flow: {
+          _id: "create-product",
+          _steps: [
+            {
+              _id: "add-product",
+              _command: {
+                _module: "entity-manager",
+                _op: "add",
+                _params: {
+                  _app_id: artifact_request_app_id,
+                  _env: "test",
+                  _entity: "product",
+                  _data: {
+                    name: "$event.name",
+                    price: "$event.price",
+                    description: "$event.description",
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(crud_flow_fixture_res._ok, true);
+
+    const form_wiring_app_id = "form-flow-wiring-app";
+    const form_wiring_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: form_wiring_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(form_wiring_create_app_res._ok, true);
+    const form_wiring_entity_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: form_wiring_app_id,
+        _env: "test",
+        _entity: {
+          _id: "administrators",
+          _schema: {
+            _id: {
+              _type: "String",
+            },
+            display_name: {
+              _type: "String",
+            },
+            email: {
+              _type: "String",
+            },
+            _created_at: {
+              _type: "Date",
+            },
+            role: {
+              _type: "String",
+            },
+            _updated_at: {
+              _type: "Date",
+            },
+          },
+        },
+      },
+    });
+    assert.equal(form_wiring_entity_res._ok, true);
+    const form_wiring_flow_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_flow",
+      _params: {
+        _app_id: form_wiring_app_id,
+        _env: "test",
+        _flow: {
+          _id: "create-administrators",
+          _steps: [
+            {
+              _id: "add-administrators",
+              _command: {
+                _module: "entity-manager",
+                _op: "add",
+                _params: {
+                  _app_id: form_wiring_app_id,
+                  _env: "test",
+                  _entity: "administrators",
+                  _data: {
+                    display_name: "$event.display_name",
+                    email: "$event.email",
+                    role: "$event.role",
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(form_wiring_flow_res._ok, true);
+    const form_wiring_apply_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: form_wiring_app_id,
+          _env: "test",
+          _artifact_type: "form",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "administrators",
+            _view_id: "create-administrators",
+          },
+        },
+      });
+    const expected_form_wiring_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      form_wiring_app_id,
+      "views",
+      "create-administrators.json",
+    );
+    assert.deepEqual(form_wiring_apply_res, {
+      _ok: true,
+      _artifact_type: "form",
+      _operation: "create",
+      _view_id: "create-administrators",
+      _entity_name: "administrators",
+      _path: expected_form_wiring_path,
+    });
+    const form_wiring_artifact = JSON.parse(
+      await readFile(expected_form_wiring_path, "utf-8"),
+    );
+    const form_wiring_container = find_xui_node_for_test(
+      form_wiring_artifact,
+      "create-administrators-form",
+    ) as any;
+    assert.deepEqual(
+      (form_wiring_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id),
+      [
+        "create-administrators-field-display_name",
+        "create-administrators-field-email",
+        "create-administrators-field-role",
+      ],
+    );
+    assert.deepEqual(
+      (form_wiring_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => [child._field, child._control?._data_output]),
+      [
+        ["display_name", "form.create-administrators.display_name"],
+        ["email", "form.create-administrators.email"],
+        ["role", "form.create-administrators.role"],
+      ],
+    );
+    const form_wiring_submit = find_xui_node_for_test(
+      form_wiring_artifact,
+      "create-administrators-submit",
+    ) as any;
+    assert.equal(form_wiring_submit?._type, "button");
+    assert.equal(form_wiring_submit?.type, "button");
+    assert.equal(form_wiring_submit?._flow_event, "click");
+    assert.deepEqual(form_wiring_submit?._flow, {
+      _id: "create-administrators",
+      _payload: {
+        display_name: "$xdata.form.create-administrators.display_name",
+        email: "$xdata.form.create-administrators.email",
+        role: "$xdata.form.create-administrators.role",
+      },
+    });
+    assert.equal(form_wiring_submit?._flow?._payload?._id, undefined);
+    assert.equal(form_wiring_submit?._flow?._payload?._created_at, undefined);
+    assert.equal(form_wiring_submit?._flow?._payload?._updated_at, undefined);
+    assert.deepEqual(form_wiring_container?._submit, {
+      _flow: "create-administrators",
+      _running: true,
+    });
+
+    const form_success_app_id = "form-success-app";
+    const form_success_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: form_success_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(form_success_create_app_res._ok, true);
+    const form_success_entity_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: form_success_app_id,
+        _env: "test",
+        _entity: {
+          _id: "vendors",
+          _schema: {
+            name: {
+              _type: "String",
+            },
+            email: {
+              _type: "String",
+            },
+          },
+        },
+      },
+    });
+    assert.equal(form_success_entity_res._ok, true);
+    const form_success_flow_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_flow",
+      _params: {
+        _app_id: form_success_app_id,
+        _env: "test",
+        _flow: {
+          _id: "create-vendors",
+          _steps: [
+            {
+              _id: "add-vendors",
+              _command: {
+                _module: "entity-manager",
+                _op: "add",
+                _params: {
+                  _app_id: form_success_app_id,
+                  _env: "test",
+                  _entity: "vendors",
+                  _data: {
+                    name: "$event.name",
+                    email: "$event.email",
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(form_success_flow_res._ok, true);
+    const form_success_list_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: form_success_app_id,
+        _env: "test",
+        _view: {
+          _id: "vendors-list",
+          _type: "view",
+          _children: [],
+        },
+      },
+    });
+    assert.equal(form_success_list_res._ok, true);
+    const form_success_apply_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: form_success_app_id,
+          _env: "test",
+          _artifact_type: "form",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "vendors",
+            _view_id: "create-vendors",
+          },
+        },
+      });
+    assert.equal(form_success_apply_res._ok, true);
+    const form_success_artifact = JSON.parse(
+      await readFile(
+        path.resolve(
+          entity_sync_work_folder,
+          "xvm",
+          "apps",
+          "test",
+          form_success_app_id,
+          "views",
+          "create-vendors.json",
+        ),
+        "utf-8",
+      ),
+    );
+    const form_success_container = find_xui_node_for_test(
+      form_success_artifact,
+      "create-vendors-form",
+    ) as any;
+    assert.deepEqual(form_success_container?._submit, {
+      _flow: "create-vendors",
+      _running: true,
+      _success_view: "vendors-list",
+    });
+    const form_success_submit = find_xui_node_for_test(
+      form_success_artifact,
+      "create-vendors-submit",
+    ) as any;
+    assert.equal(form_success_submit?._flow_event, "click");
+    assert.deepEqual(form_success_submit?._flow, {
+      _id: "create-vendors",
+      _payload: {
+        name: "$xdata.form.create-vendors.name",
+        email: "$xdata.form.create-vendors.email",
+      },
+    });
+
+    const artifact_request_app_dir = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+    );
+    const files_before_graph_plan =
+      await list_relative_files_for_test(artifact_request_app_dir);
+    const capability_registry = new CapabilityRegistry();
+    assert.deepEqual(capability_registry.lookupCapability("entity"), {
+      _id: "entity",
+      _artifact_type: "entity",
+      _supported: true,
+      _executor: "ArtifactExecutor",
+      _dependencies: [],
+    });
+    assert.deepEqual(capability_registry.lookupCapability("flow"), {
+      _id: "flow",
+      _artifact_type: "flow",
+      _supported: true,
+      _executor: "ArtifactExecutor",
+      _dependencies: [],
+    });
+    assert.deepEqual(capability_registry.lookupCapability("form"), {
+      _id: "form",
+      _artifact_type: "form",
+      _supported: true,
+      _executor: "ArtifactExecutor",
+      _dependencies: [],
+    });
+    assert.deepEqual(capability_registry.lookupCapability("table"), {
+      _id: "table",
+      _artifact_type: "table",
+      _supported: true,
+      _executor: "ArtifactExecutor",
+      _dependencies: [],
+    });
+    assert.deepEqual(capability_registry.lookupCapability("view"), {
+      _id: "view",
+      _artifact_type: "view",
+      _supported: false,
+      _executor: null,
+      _dependencies: [],
+    });
+    assert.equal(capability_registry.lookupCapability("unknown"), null);
+    assert.throws(
+      () => capability_registry.requireCapability("unknown"),
+      /Execution capability not found: unknown/u,
+    );
+
+    const crud_recipe = new ExecutionRecipeLoader().loadRecipe("crud");
+    assert.deepEqual(
+      crud_recipe._artifacts.map((artifact) => ({
+        _capability: artifact._capability,
+        _artifact_id_template: artifact._artifact_id_template,
+        _depends_on: artifact._depends_on,
+        _required: artifact._required,
+        ...(artifact._children
+          ? {
+              _children: artifact._children.map((child) => ({
+                _capability: child._capability,
+                _artifact_id_template: child._artifact_id_template,
+                _depends_on: child._depends_on,
+                _required: child._required,
+              })),
+            }
+          : {}),
+      })),
+      [
+        {
+          _capability: "entity",
+          _artifact_id_template: "{entity}",
+          _depends_on: [],
+          _required: true,
+        },
+        {
+          _capability: "flow",
+          _artifact_id_template: "create-{entity}",
+          _depends_on: ["entity"],
+          _required: true,
+        },
+        {
+          _capability: "form",
+          _artifact_id_template: "create-{entity}",
+          _depends_on: ["entity", "flow"],
+          _required: true,
+        },
+        {
+          _capability: "view",
+          _artifact_id_template: "{entity}-list",
+          _depends_on: ["form"],
+          _required: false,
+          _children: [
+            {
+              _capability: "table",
+              _artifact_id_template: "{entity}-list",
+              _depends_on: [],
+              _required: false,
+            },
+          ],
+        },
+      ],
+    );
+    assert.equal(
+      substituteExecutionRecipeTemplate("flow:create-{entity}", {
+        _entity_name: "product",
+      }),
+      "flow:create-product",
+    );
+    assert.equal(
+      substituteExecutionRecipeTemplate("{entity}-list", {
+        _entity_name: "product",
+      }),
+      "product-list",
+    );
+    const product_crud_graph =
+      await new ExecutionGraphPlanner().planCrud({
+        _app_id: artifact_request_app_id,
+        _env: "test",
+        _entity_name: "Product",
+      });
+    const partner_crud_graph =
+      await new ExecutionGraphPlanner().planCrud({
+        _app_id: artifact_request_app_id,
+        _env: "test",
+        _entity_name: "Partner",
+        _fields: [
+          { _name: "name" },
+          { _name: "email" },
+          { _name: "phone" },
+        ],
+      });
+    const files_after_graph_plan =
+      await list_relative_files_for_test(artifact_request_app_dir);
+    assert.deepEqual(files_after_graph_plan, files_before_graph_plan);
+    assert.deepEqual(product_crud_graph, {
+      _nodes: [
+        {
+          _id: "entity:product",
+          _artifact_type: "entity",
+          _artifact_id: "product",
+          _exists: true,
+          _required: true,
+          _depends_on: [],
+        },
+        {
+          _id: "flow:create-product",
+          _artifact_type: "flow",
+          _artifact_id: "create-product",
+          _exists: true,
+          _required: true,
+          _depends_on: ["entity:product"],
+        },
+        {
+          _id: "form:create-product",
+          _artifact_type: "form",
+          _artifact_id: "create-product",
+          _exists: true,
+          _required: true,
+          _depends_on: ["entity:product", "flow:create-product"],
+        },
+        {
+          _id: "view:product-list",
+          _artifact_type: "view",
+          _artifact_id: "product-list",
+          _exists: false,
+          _required: false,
+          _depends_on: ["form:create-product"],
+          _children: [
+            {
+              _id: "table:product-list",
+              _artifact_type: "table",
+              _artifact_id: "product-list",
+              _exists: false,
+              _required: false,
+              _depends_on: [],
+            },
+          ],
+        },
+      ],
+      _summary: {
+        _total: 5,
+        _existing: 3,
+        _missing: 2,
+      },
+    });
+    assert.deepEqual(partner_crud_graph._nodes[0], {
+      _id: "entity:partner",
+      _artifact_type: "entity",
+      _artifact_id: "partner",
+      _exists: false,
+      _required: true,
+      _depends_on: [],
+      _fields: [
+        { _name: "name" },
+        { _name: "email" },
+        { _name: "phone" },
+      ],
+    });
+    assert.equal(partner_crud_graph._nodes[1]._fields, undefined);
+    assert.equal(partner_crud_graph._nodes[2]._fields, undefined);
+    assert.equal(partner_crud_graph._nodes[3]._fields, undefined);
+    assert.equal(partner_crud_graph._nodes[3]._children?.[0]?._fields, undefined);
+
+    const forwarded_entity_artifact_requests: any[] = [];
+    const field_forwarding_executor = new ExecutionGraphExecutor(
+      {
+        planCrud: async () => ({
+          _nodes: [
+            {
+              _id: "entity:partner",
+              _artifact_type: "entity",
+              _artifact_id: "partner",
+              _exists: false,
+              _required: true,
+              _depends_on: [],
+              _fields: [
+                { _name: "name" },
+                { _name: "email" },
+                { _name: "phone" },
+              ],
+            },
+          ],
+          _summary: {
+            _total: 1,
+            _existing: 0,
+            _missing: 1,
+          },
+        }),
+      } as any,
+      {
+        apply: async (xcmd: any) => {
+          forwarded_entity_artifact_requests.push(xcmd._params);
+          return {
+            _ok: true,
+            _artifact_type: "entity",
+            _operation: "create",
+            _entity_name: "partner",
+            _path: "/tmp/partner.json",
+          };
+        },
+      } as any,
+      new CapabilityRegistry(),
+    );
+    const field_forwarding_execute_res = await field_forwarding_executor.apply({
+      _params: {
+        _app_id: "field-forwarding-app",
+        _env: "test",
+        _graph_type: "crud",
+        _entity_name: "partner",
+        _fields: [
+          { _name: "name" },
+          { _name: "email" },
+          { _name: "phone" },
+        ],
+      },
+    } as any);
+    assert.equal(field_forwarding_execute_res._ok, true);
+    assert.deepEqual(forwarded_entity_artifact_requests, [
+      {
+        _app_id: "field-forwarding-app",
+        _env: "test",
+        _artifact_type: "entity",
+        _artifact_request: {
+          _operation: "create",
+          _entity_name: "partner",
+          _fields: [
+            { _name: "name" },
+            { _name: "email" },
+            { _name: "phone" },
+          ],
+        },
+      },
+    ]);
+
+    assert.equal(
+      XVibeModule._ops["execute-execution-graph"]._name,
+      "execute-execution-graph",
+    );
+
+    const graph_execution_app_id = "graph-execution-app";
+    const graph_execution_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: graph_execution_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(graph_execution_create_app_res._ok, true);
+
+    const graph_execute_res =
+      await (artifact_request_xvibe as any)._execute_execution_graph({
+        _params: {
+          _app_id: graph_execution_app_id,
+          _env: "test",
+          _graph_type: "crud",
+          _entity_name: "Product",
+          _execution_graph: {
+            _nodes: [
+              {
+                _id: "entity:client-lie",
+                _artifact_type: "entity",
+                _artifact_id: "client-lie",
+                _exists: true,
+                _required: true,
+                _depends_on: [],
+              },
+            ],
+          },
+        },
+      });
+    assert.equal(graph_execute_res._ok, true);
+    assert.equal(graph_execute_res._graph_type, "crud");
+    assert.equal(graph_execute_res._entity_name, "product");
+    const graph_execute_flat_nodes =
+      flatten_execution_graph_nodes_for_test(graph_execute_res._nodes);
+    assert.deepEqual(
+      graph_execute_flat_nodes.map((node: any) => [
+        node._id,
+        node._status,
+        node._reason,
+      ]),
+      [
+        ["entity:product", "created", undefined],
+        ["flow:create-product", "created", undefined],
+        ["form:create-product", "created", undefined],
+        ["view:product-list", "skipped", "unsupported_artifact_type"],
+        ["table:product-list", "created", undefined],
+      ],
+    );
+    assert.equal(graph_execute_res._nodes[3]._id, "view:product-list");
+    assert.equal(
+      graph_execute_res._nodes[3]._children?.[0]?._id,
+      "table:product-list",
+    );
+    assert.deepEqual(graph_execute_res._summary, {
+      _existing: 0,
+      _created: 4,
+      _skipped: 1,
+      _failed: 0,
+    });
+    assert.deepEqual(graph_execution_persist_ops, [
+      "set_entity",
+      "set_flow",
+      "push_update",
+      "push_update",
+    ]);
+    assert.equal(
+      graph_execute_res._nodes[0]._result?._entity_name,
+      "product",
+    );
+    assert.equal(
+      graph_execute_res._nodes[1]._result?._flow_id,
+      "create-product",
+    );
+    assert.equal(
+      graph_execute_res._nodes[2]._result?._view_id,
+      "create-product",
+    );
+    assert.equal(
+      graph_execute_res._nodes[3]._children?.[0]?._result?._view_id,
+      "product-list",
+    );
+
+    const graph_execution_app_dir = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      graph_execution_app_id,
+    );
+    const graph_execution_files =
+      await list_relative_files_for_test(graph_execution_app_dir);
+    assert.deepEqual(graph_execution_files, [
+      "app.json",
+      "entities/product.json",
+      "flows/create-product.json",
+      "views/create-product.json",
+      "views/product-list.json",
+    ]);
+
+    const graph_fields_app_id = "graph-fields-app";
+    const graph_fields_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: graph_fields_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(graph_fields_create_app_res._ok, true);
+    const graph_fields_request =
+      xvibe_crud_comma_fields_res._intent?._artifact_request;
+    const graph_fields_execute_res =
+      await (artifact_request_xvibe as any)._execute_execution_graph({
+        _params: {
+          _app_id: graph_fields_app_id,
+          _env: "test",
+          _graph_type: graph_fields_request?._graph_type,
+          _entity_name: graph_fields_request?._entity_name,
+          _fields: graph_fields_request?._fields,
+          _execution_graph: graph_fields_request?._execution_graph,
+        },
+      });
+    assert.equal(graph_fields_execute_res._ok, true);
+    assert.equal(graph_fields_execute_res._entity_name, "partner");
+    const graph_fields_flat_nodes =
+      flatten_execution_graph_nodes_for_test(graph_fields_execute_res._nodes);
+    assert.deepEqual(
+      graph_fields_flat_nodes.map((node: any) => [
+        node._id,
+        node._status,
+        node._reason,
+      ]),
+      [
+        ["entity:partner", "created", undefined],
+        ["flow:create-partner", "created", undefined],
+        ["form:create-partner", "created", undefined],
+        ["view:partner-list", "skipped", "unsupported_artifact_type"],
+        ["table:partner-list", "created", undefined],
+      ],
+    );
+    assert.deepEqual(graph_fields_execute_res._summary, {
+      _existing: 0,
+      _created: 4,
+      _skipped: 1,
+      _failed: 0,
+    });
+    const graph_fields_app_dir = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      graph_fields_app_id,
+    );
+    const graph_fields_entity_path = path.join(
+      graph_fields_app_dir,
+      "entities",
+      "partner.json",
+    );
+    const graph_fields_flow_path = path.join(
+      graph_fields_app_dir,
+      "flows",
+      "create-partner.json",
+    );
+    const graph_fields_form_path = path.join(
+      graph_fields_app_dir,
+      "views",
+      "create-partner.json",
+    );
+    const graph_fields_table_path = path.join(
+      graph_fields_app_dir,
+      "views",
+      "partner-list.json",
+    );
+    const graph_fields_entity = JSON.parse(
+      await readFile(graph_fields_entity_path, "utf-8"),
+    );
+    assert.equal(graph_fields_entity._id, "partner");
+    assert.equal(graph_fields_entity._schema?.name?._type, "String");
+    assert.equal(graph_fields_entity._schema?.email?._type, "String");
+    assert.equal(graph_fields_entity._schema?.phone?._type, "String");
+    const graph_fields_flow = JSON.parse(
+      await readFile(graph_fields_flow_path, "utf-8"),
+    );
+    assert.deepEqual(
+      graph_fields_flow._steps[0]._command._params._data,
+      {
+        name: "$event.name",
+        email: "$event.email",
+        phone: "$event.phone",
+      },
+    );
+    const graph_fields_form = JSON.parse(
+      await readFile(graph_fields_form_path, "utf-8"),
+    );
+    const graph_fields_form_container = find_xui_node_for_test(
+      graph_fields_form,
+      "create-partner-form",
+    ) as any;
+    assert.deepEqual(
+      (graph_fields_form_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => [child._field, child._control?._name]),
+      [
+        ["name", "name"],
+        ["email", "email"],
+        ["phone", "phone"],
+      ],
+    );
+    const graph_fields_table = JSON.parse(
+      await readFile(graph_fields_table_path, "utf-8"),
+    );
+    const graph_fields_table_object = find_xui_node_for_test(
+      graph_fields_table,
+      "partner-list-table",
+    ) as any;
+    assert.equal(graph_fields_table_object?._data_source, "partner.records");
+    assert.deepEqual(graph_fields_table_object?._columns, [
+      {
+        _key: "name",
+        _label: "Name",
+      },
+      {
+        _key: "email",
+        _label: "Email",
+      },
+      {
+        _key: "phone",
+        _label: "Phone",
+      },
+    ]);
+
+    const employee_crud_res = await xvibe_intent_engine.analyze({
+      _message: "Create Employee CRUD with:\nname\nemail\nphone",
+      _runtime_context: {
+        _app_id: "employee-crud-app",
+        _env: "test",
+      },
+    });
+    assert_xvibe_crud_execution_plan_request(
+      employee_crud_res,
+      "employee",
+      [
+        { _name: "name" },
+        { _name: "email" },
+        { _name: "phone" },
+      ],
+    );
+    const employee_crud_app_id = "employee-crud-app";
+    const employee_crud_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: employee_crud_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(employee_crud_create_app_res._ok, true);
+    const employee_crud_request =
+      employee_crud_res._intent?._artifact_request;
+    const employee_crud_execute_res =
+      await (artifact_request_xvibe as any)._execute_execution_graph({
+        _params: {
+          _app_id: employee_crud_app_id,
+          _env: "test",
+          _graph_type: employee_crud_request?._graph_type,
+          _entity_name: employee_crud_request?._entity_name,
+          _fields: employee_crud_request?._fields,
+          _execution_graph: employee_crud_request?._execution_graph,
+        },
+      });
+    assert.equal(employee_crud_execute_res._ok, true);
+    const employee_add_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "add",
+      _params: {
+        _app_id: employee_crud_app_id,
+        _env: "test",
+        _entity: "employee",
+        _data: {
+          name: "Ada",
+          email: "ada@employee.test",
+          phone: "555-0100",
+        },
+      },
+    });
+    assert.equal(employee_add_res._ok, true);
+    const employee_table_path = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      employee_crud_app_id,
+      "views",
+      "employee-list.json",
+    );
+    const employee_table_view = JSON.parse(
+      await readFile(employee_table_path, "utf-8"),
+    );
+    const employee_table = find_xui_node_for_test(
+      employee_table_view,
+      "employee-list-table",
+    ) as any;
+    assert.ok(employee_table_view._on_mount);
+    assert.equal(employee_table_view._on_mount._module, "entity-client");
+    assert.equal(employee_table_view._on_mount._op, "find");
+    assert.equal(employee_table_view._on_mount._params?._entity, "employee");
+    assert.deepEqual(employee_table_view._on_mount._params?._filter, {});
+    assert.equal(employee_table_view._on_mount._params?._output, employee_table?._data_source);
+    assert.equal(employee_table?._data_source, "employee.records");
+    assert.deepEqual(
+      employee_table?._columns.map((column: any) => column._key),
+      ["name", "email", "phone"],
+    );
+    const employee_source_entity = String(employee_table?._data_source ?? "")
+      .replace(/\.records$/u, "");
+    assert.equal(employee_source_entity, "employee");
+    const employee_records_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: employee_crud_app_id,
+        _env: "test",
+        _entity: employee_source_entity,
+        _filter: {},
+      },
+    });
+    assert.equal(employee_records_res._ok, true);
+    const employee_records =
+      employee_records_res._result?._records?._data ?? [];
+    const employee_rendered_rows = employee_records.map((record: any) =>
+      Object.fromEntries(
+        employee_table._columns.map((column: any) => [
+          column._key,
+          record[column._key],
+        ]),
+      ),
+    );
+    assert.deepEqual(employee_rendered_rows, [
+      {
+        name: "Ada",
+        email: "ada@employee.test",
+        phone: "555-0100",
+      },
+    ]);
+
+    const graph_execute_existing_res =
+      await (artifact_request_xvibe as any)._execute_execution_graph({
+        _params: {
+          _app_id: graph_execution_app_id,
+          _env: "test",
+          _graph_type: "crud",
+          _entity_name: "product",
+          _execution_graph: {
+            _nodes: [],
+          },
+        },
+    });
+    assert.equal(graph_execute_existing_res._ok, true);
+    const graph_execute_existing_flat_nodes =
+      flatten_execution_graph_nodes_for_test(graph_execute_existing_res._nodes);
+    assert.deepEqual(
+      graph_execute_existing_flat_nodes.map((node: any) => [
+        node._id,
+        node._status,
+        node._reason,
+      ]),
+      [
+        ["entity:product", "existing", undefined],
+        ["flow:create-product", "existing", undefined],
+        ["form:create-product", "existing", undefined],
+        ["view:product-list", "existing", undefined],
+        ["table:product-list", "existing", undefined],
+      ],
+    );
+    assert.deepEqual(graph_execute_existing_res._summary, {
+      _existing: 5,
+      _created: 0,
+      _skipped: 0,
+      _failed: 0,
+    });
+    assert.deepEqual(graph_execution_persist_ops, [
+      "set_entity",
+      "set_flow",
+      "push_update",
+      "push_update",
+    ]);
+
+    const graph_failure_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: "graph-failure-app",
+        _env: "test",
+      },
+    });
+    assert.equal(graph_failure_create_app_res._ok, true);
+    const graph_failure_res =
+      await (artifact_request_xvibe as any)._execute_execution_graph({
+        _params: {
+          _app_id: "graph-failure-app",
+          _env: "test",
+          _graph_type: "crud",
+          _entity_name: "product",
+        },
+      });
+    assert.equal(graph_failure_res._ok, true);
+    assert.deepEqual(
+      graph_failure_res._nodes.map((node: any) => [
+        node._id,
+        node._status,
+      ]),
+      [["entity:product", "failed"]],
+    );
+    assert.equal(
+      graph_failure_res._nodes[0]._error?._code,
+      "E_XVIBE_SERVER_XVM_ERROR",
+    );
+    assert.deepEqual(graph_failure_res._summary, {
+      _existing: 0,
+      _created: 0,
+      _skipped: 0,
+      _failed: 1,
+    });
+    assert.equal(graph_failure_set_entity_calls, 1);
+
+    const parent_failure_executor = new ExecutionGraphExecutor(
+      {
+        planCrud: async () => ({
+          _nodes: [
+            {
+              _id: "entity:parent",
+              _artifact_type: "entity",
+              _artifact_id: "parent",
+              _exists: false,
+              _required: true,
+              _depends_on: [],
+              _children: [
+                {
+                  _id: "table:parent-list",
+                  _artifact_type: "table",
+                  _artifact_id: "parent-list",
+                  _exists: false,
+                  _required: false,
+                  _depends_on: [],
+                },
+              ],
+            },
+          ],
+          _summary: {
+            _total: 2,
+            _existing: 0,
+            _missing: 2,
+          },
+        }),
+      } as any,
+      {
+        apply: async () => ({
+          _ok: false,
+          _error: {
+            _code: "E_TEST_PARENT_FAILED",
+            _message: "Parent failed",
+          },
+        }),
+      } as any,
+    );
+    const parent_child_failure_res = await parent_failure_executor.apply({
+      _params: {
+        _app_id: "parent-child-failure-app",
+        _env: "test",
+        _graph_type: "crud",
+        _entity_name: "parent",
+      },
+    } as any);
+    assert.equal(parent_child_failure_res._ok, true);
+    const parent_child_failure_ok_res = parent_child_failure_res as any;
+    assert.equal(parent_child_failure_ok_res._nodes[0]._status, "failed");
+    assert.equal(
+      parent_child_failure_ok_res._nodes[0]._children?.[0]?._status,
+      "skipped",
+    );
+    assert.equal(
+      parent_child_failure_ok_res._nodes[0]._children?.[0]?._reason,
+      "parent_failed",
+    );
+    assert.deepEqual(parent_child_failure_ok_res._summary, {
+      _existing: 0,
+      _created: 0,
+      _skipped: 1,
+      _failed: 1,
+    });
+
+    const missing_entity_flow_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "flows",
+      "create-missing-product.json",
+    );
+    const missing_entity_flow_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "flow",
+          _artifact_request: {
+            _operation: "create",
+            _flow_id: "create-missing-product",
+            _entity_name: "missing-product",
+            _action: "entity-add",
+          },
+        },
+      });
+    assert.equal(missing_entity_flow_res._ok, false);
+    assert.equal(
+      missing_entity_flow_res._error._code,
+      "E_XVIBE_ENTITY_SCHEMA_UNAVAILABLE",
+    );
+    await assert.rejects(access(missing_entity_flow_path));
+
+    const metadata_entity_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "entity",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "Session Log",
+          },
+          _wid: "test-wormhole-id",
+          _from: "client",
+          _to: "server",
+          _auth: {
+            _sub: "test-user",
+          },
+        },
+      });
+    const metadata_entity_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "entities",
+      "session-log.json",
+    );
+    assert.deepEqual(metadata_entity_request_res, {
+      _ok: true,
+      _artifact_type: "entity",
+      _operation: "create",
+      _entity_name: "session-log",
+      _path: metadata_entity_artifact_path,
+    });
+    const metadata_entity_artifact = JSON.parse(
+      await readFile(metadata_entity_artifact_path, "utf-8"),
+    );
+    assert.deepEqual(metadata_entity_artifact, {
+      _id: "session-log",
+      _schema: {},
+    });
+
+    const unknown_top_level_key_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "entity",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "Bad Key Entity",
+          },
+          user_key: true,
+        },
+      });
+    assert.equal(unknown_top_level_key_res._ok, false);
+    assert.equal(
+      unknown_top_level_key_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+    assert.equal(
+      unknown_top_level_key_res._error._message,
+      "Unsupported artifact request field: user_key",
+    );
+
+    const unsupported_artifact_type_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "view",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "invoice",
+          },
+        },
+      });
+    assert.equal(unsupported_artifact_type_res._ok, false);
+    assert.equal(
+      unsupported_artifact_type_res._error._code,
+      "E_XVIBE_ARTIFACT_TYPE_UNSUPPORTED",
+    );
+
+    const unsupported_operation_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "entity",
+          _artifact_request: {
+            _operation: "update",
+            _entity_name: "invoice",
+          },
+        },
+      });
+    assert.equal(unsupported_operation_res._ok, false);
+    assert.equal(
+      unsupported_operation_res._error._code,
+      "E_XVIBE_ARTIFACT_OPERATION_UNSUPPORTED",
+    );
+
+    const entity_artifact_before_duplicate =
+      await readFile(expected_entity_artifact_path, "utf-8");
+    const duplicate_entity_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "entity",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "user",
+            _fields: {
+              name: {
+                _type: "String",
+              },
+            },
+          },
+        },
+      });
+    assert.equal(duplicate_entity_request_res._ok, false);
+    assert.equal(
+      duplicate_entity_request_res._error._code,
+      "E_XVIBE_ENTITY_ARTIFACT_EXISTS",
+    );
+    assert.equal(
+      await readFile(expected_entity_artifact_path, "utf-8"),
+      entity_artifact_before_duplicate,
+    );
+
+    const flow_artifact_before_duplicate =
+      await readFile(expected_flow_artifact_path, "utf-8");
+    const duplicate_flow_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "flow",
+          _artifact_request: {
+            _operation: "create",
+            _flow_id: "create-product-record",
+            _entity_name: "updated-product-type",
+            _action: "entity-add",
+          },
+        },
+      });
+    assert.equal(duplicate_flow_request_res._ok, false);
+    assert.equal(
+      duplicate_flow_request_res._error._code,
+      "E_XVIBE_FLOW_ARTIFACT_EXISTS",
+    );
+    assert.equal(
+      await readFile(expected_flow_artifact_path, "utf-8"),
+      flow_artifact_before_duplicate,
+    );
+
+    const form_artifact_before_duplicate =
+      await readFile(expected_form_artifact_path, "utf-8");
+    const duplicate_form_request_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _artifact_type: "form",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "product",
+            _view_id: "create-product",
+          },
+        },
+      });
+    assert.equal(duplicate_form_request_res._ok, false);
+    assert.equal(
+      duplicate_form_request_res._error._code,
+      "E_XVIBE_FORM_ARTIFACT_EXISTS",
+    );
+    assert.equal(
+      await readFile(expected_form_artifact_path, "utf-8"),
+      form_artifact_before_duplicate,
+    );
+  } finally {
+    (_x as any).execute = original_artifact_request_execute;
+  }
+  assert.equal(artifact_request_ai_calls, 0);
+  assert.equal(artifact_request_studio_calls, 0);
+
   const users_entity_v1 = {
     _id: "users",
     _schema: {
@@ -13994,6 +16754,7 @@ try {
   assert.ok(XVibeModule._ops["analyze-message"]);
   assert.ok(XVibeModule._ops["get-last-messages"]);
   assert.ok(XVibeModule._ops["update-conversation-action"]);
+  assert.ok(XVibeModule._ops["update-conversation-artifact"]);
 
   const create_conversation_res = await (conversation_xvibe as any)._create_conversation({
     _params: {
@@ -14105,15 +16866,52 @@ try {
   assert.equal(append_assistant_res._result._message._id, "assistant-1");
   assert.equal(append_assistant_res._result._conversation._message_count, 2);
 
+  const append_artifact_res = await (conversation_xvibe as any)._append_message({
+    _params: {
+      _app_id: "conversation-app",
+      _env: "test",
+      _conversation_id: "primary-chat",
+      _message: {
+        _id: "artifact-1",
+        _role: "assistant",
+        _text: "Create entity User",
+        _intent: {
+          _message_type: "generate",
+          _execution_level: "artifact",
+          _should_mutate: true,
+          _confidence: 1,
+          _reason: "Create entity artifact request.",
+          _artifact_type: "entity",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "user",
+          },
+          _actions: [
+            {
+              _id: "edit-action-preserved",
+              _title: "Apply edit",
+              _action_type: "apply-view-edit",
+              _status: "suggested",
+            },
+          ],
+        },
+      },
+    },
+  });
+  assert.equal(append_artifact_res._ok, true);
+  assert.equal(append_artifact_res._result._message._id, "artifact-1");
+  assert.equal(append_artifact_res._result._conversation._message_count, 3);
+
   const message_lines =
     (await readFile(path.join(conversation_dir, "messages.jsonl"), "utf-8"))
       .trim()
       .split(/\r?\n/u)
       .map((line) => JSON.parse(line));
-  assert.equal(message_lines.length, 2);
+  assert.equal(message_lines.length, 3);
   assert.equal(message_lines[0]._text, "Hello");
   assert.equal(message_lines[1]._attachments[0]._name, "note.txt");
   assert.equal(message_lines[1]._intent._actions[0]._status, "suggested");
+  assert.equal(message_lines[2]._intent._artifact_type, "entity");
 
   const update_action_done_res = await (conversation_xvibe as any)._update_conversation_action({
     _params: {
@@ -14201,6 +16999,142 @@ try {
     "E_XVIBE_INVALID_CONVERSATION_ACTION_STATUS",
   );
 
+  const artifact_action_before_update =
+    JSON.parse(JSON.stringify(message_lines[2]._intent._actions));
+  const update_artifact_done_res =
+    await (conversation_xvibe as any)._update_conversation_artifact({
+      _params: {
+        _app_id: "conversation-app",
+        _env: "test",
+        _conversation_id: "primary-chat",
+        _message_id: "artifact-1",
+        _artifact_status: "done",
+        _artifact_result: {
+          _ok: true,
+          _artifact_type: "entity",
+          _entity_name: "user",
+        },
+      },
+    });
+  assert.equal(update_artifact_done_res._ok, true);
+  assert.equal(
+    update_artifact_done_res._result._intent._artifact_status,
+    "done",
+  );
+  assert.deepEqual(update_artifact_done_res._result._intent._artifact_result, {
+    _ok: true,
+    _artifact_type: "entity",
+    _entity_name: "user",
+  });
+  assert.equal(
+    update_artifact_done_res._result._intent._artifact_type,
+    "entity",
+  );
+  assert.deepEqual(
+    update_artifact_done_res._result._intent._artifact_request,
+    {
+      _operation: "create",
+      _entity_name: "user",
+    },
+  );
+  assert.equal(
+    update_artifact_done_res._result._intent._message_type,
+    "generate",
+  );
+  assert.equal(
+    update_artifact_done_res._result._intent._execution_level,
+    "artifact",
+  );
+  assert.deepEqual(
+    update_artifact_done_res._result._intent._actions,
+    artifact_action_before_update,
+  );
+
+  const artifact_done_lines =
+    (await readFile(path.join(conversation_dir, "messages.jsonl"), "utf-8"))
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line));
+  const artifact_done_message =
+    artifact_done_lines.find((message) => message._id === "artifact-1");
+  assert.equal(
+    artifact_done_message._intent._artifact_status,
+    "done",
+  );
+  assert.deepEqual(artifact_done_message._intent._artifact_result, {
+    _ok: true,
+    _artifact_type: "entity",
+    _entity_name: "user",
+  });
+  assert.deepEqual(
+    artifact_done_message._intent._actions,
+    artifact_action_before_update,
+  );
+
+  const update_artifact_failed_res =
+    await (conversation_xvibe as any)._update_conversation_artifact({
+      _params: {
+        _app_id: "conversation-app",
+        _env: "test",
+        _conversation_id: "primary-chat",
+        _message_id: "artifact-1",
+        _artifact_status: "failed",
+        _artifact_error: {
+          _code: "E_TEST_ARTIFACT_FAILED",
+          _message: "Artifact failed",
+        },
+      },
+    });
+  assert.equal(update_artifact_failed_res._ok, true);
+  assert.equal(
+    update_artifact_failed_res._result._intent._artifact_status,
+    "failed",
+  );
+  assert.deepEqual(update_artifact_failed_res._result._intent._artifact_error, {
+    _code: "E_TEST_ARTIFACT_FAILED",
+    _message: "Artifact failed",
+  });
+  assert.deepEqual(
+    update_artifact_failed_res._result._intent._actions,
+    artifact_action_before_update,
+  );
+
+  const update_artifact_dismissed_res =
+    await (conversation_xvibe as any)._update_conversation_artifact({
+      _params: {
+        _app_id: "conversation-app",
+        _env: "test",
+        _conversation_id: "primary-chat",
+        _message_id: "artifact-1",
+        _artifact_status: "dismissed",
+      },
+    });
+  assert.equal(update_artifact_dismissed_res._ok, true);
+  assert.equal(
+    update_artifact_dismissed_res._result._intent._artifact_status,
+    "dismissed",
+  );
+  assert.deepEqual(
+    update_artifact_dismissed_res._result._intent._actions,
+    artifact_action_before_update,
+  );
+
+  const missing_artifact_message_res =
+    await (conversation_xvibe as any)._update_conversation_artifact({
+      _params: {
+        _app_id: "conversation-app",
+        _env: "test",
+        _conversation_id: "primary-chat",
+        _message_id: "missing-artifact-message",
+        _artifact_status: "done",
+      },
+    });
+  assert.equal(missing_artifact_message_res._ok, false);
+  assert.equal(
+    missing_artifact_message_res._error._code,
+    "E_XVIBE_CONVERSATION_MESSAGE_NOT_FOUND",
+  );
+
   const index_file = JSON.parse(
     await readFile(path.join(conversations_dir, "index.json"), "utf-8"),
   );
@@ -14208,7 +17142,7 @@ try {
   assert.equal(index_file._env, "test");
   assert.equal(index_file._conversations.length, 1);
   assert.equal(index_file._conversations[0]._id, "primary-chat");
-  assert.equal(index_file._conversations[0]._message_count, 2);
+  assert.equal(index_file._conversations[0]._message_count, 3);
 
   const list_conversations_res = await (conversation_xvibe as any)._list_conversations({
     _params: {
@@ -14249,8 +17183,8 @@ try {
     },
   });
   assert.equal(get_conversation_res._ok, true);
-  assert.equal(get_conversation_res._result._conversation._message_count, 2);
-  assert.equal(get_conversation_res._result._messages.length, 2);
+  assert.equal(get_conversation_res._result._conversation._message_count, 3);
+  assert.equal(get_conversation_res._result._messages.length, 3);
   assert.ok(get_conversation_res._result._attachments_path.endsWith("primary-chat/attachments"));
   const reloaded_assistant_message =
     get_conversation_res._result._messages.find((message: any) => message._id === "assistant-1");
@@ -14269,6 +17203,24 @@ try {
       _ok: true,
     },
   );
+  const reloaded_artifact_message =
+    get_conversation_res._result._messages.find((message: any) => message._id === "artifact-1");
+  assert.ok(reloaded_artifact_message);
+  assert.equal(
+    reloaded_artifact_message._intent._artifact_status,
+    "dismissed",
+  );
+  assert.deepEqual(
+    reloaded_artifact_message._intent._artifact_request,
+    {
+      _operation: "create",
+      _entity_name: "user",
+    },
+  );
+  assert.deepEqual(
+    reloaded_artifact_message._intent._actions,
+    artifact_action_before_update,
+  );
 
   const last_message_res = await (conversation_xvibe as any)._get_last_messages({
     _params: {
@@ -14280,8 +17232,8 @@ try {
   });
   assert.equal(last_message_res._ok, true);
   assert.equal(last_message_res._result._messages.length, 1);
-  assert.equal(last_message_res._result._messages[0]._id, "assistant-1");
-  assert.equal(last_message_res._result._total, 2);
+  assert.equal(last_message_res._result._messages[0]._id, "artifact-1");
+  assert.equal(last_message_res._result._total, 3);
 
   let analyze_message_xai_generate_count = 0;
   try {
@@ -14332,7 +17284,7 @@ try {
       analyze_message_res._result._message._metadata._source,
       "xvibe.analyze-message",
     );
-    assert.equal(analyze_message_res._result._conversation._message_count, 3);
+    assert.equal(analyze_message_res._result._conversation._message_count, 4);
 
     const analyzed_conversation_res = await (conversation_xvibe as any)._get_conversation({
       _params: {
@@ -14342,10 +17294,10 @@ try {
       },
     });
     assert.equal(analyzed_conversation_res._ok, true);
-    assert.equal(analyzed_conversation_res._result._messages.length, 3);
-    assert.equal(analyzed_conversation_res._result._messages[2]._role, "tool");
+    assert.equal(analyzed_conversation_res._result._messages.length, 4);
+    assert.equal(analyzed_conversation_res._result._messages[3]._role, "tool");
     assert.deepEqual(
-      analyzed_conversation_res._result._messages[2]._intent,
+      analyzed_conversation_res._result._messages[3]._intent,
       analyze_message_res._intent,
     );
 
@@ -15213,7 +18165,7 @@ try {
   assert.equal(capped_last_messages_res._ok, true);
   assert.equal(capped_last_messages_res._result._messages.length, 100);
   assert.equal(capped_last_messages_res._result._count, 100);
-  assert.equal(capped_last_messages_res._result._total, 113);
+  assert.equal(capped_last_messages_res._result._total, 114);
   assert.equal(capped_last_messages_res._result._messages[0]._id, "extra-10");
 
   const invalid_role_res = await (conversation_xvibe as any)._append_message({

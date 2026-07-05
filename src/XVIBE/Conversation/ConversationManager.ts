@@ -24,6 +24,7 @@ const XVIBE_CONVERSATION_MESSAGE_NOT_FOUND = "E_XVIBE_CONVERSATION_MESSAGE_NOT_F
 const XVIBE_INVALID_CONVERSATION_ACTION = "E_XVIBE_INVALID_CONVERSATION_ACTION";
 const XVIBE_CONVERSATION_ACTION_NOT_FOUND = "E_XVIBE_CONVERSATION_ACTION_NOT_FOUND";
 const XVIBE_INVALID_CONVERSATION_ACTION_STATUS = "E_XVIBE_INVALID_CONVERSATION_ACTION_STATUS";
+const XVIBE_INVALID_CONVERSATION_ARTIFACT_STATUS = "E_XVIBE_INVALID_CONVERSATION_ARTIFACT_STATUS";
 const XVIBE_INVALID_INTENT_REQUEST = "E_XVIBE_INVALID_INTENT_REQUEST";
 const XVIBE_CONVERSATION_STORAGE_FAILED = "E_XVIBE_CONVERSATION_STORAGE_FAILED";
 const XVIBE_CONVERSATION_LAST_MESSAGES_MAX_LIMIT = 100;
@@ -34,12 +35,22 @@ const XVIBE_CONVERSATION_ACTION_STATUSES = new Set([
   "failed",
   "dismissed",
 ]);
+const XVIBE_CONVERSATION_ARTIFACT_STATUSES = new Set([
+  "done",
+  "failed",
+  "dismissed",
+]);
 
 type XVibeConversationRole = "user" | "assistant" | "system" | "tool";
 
 type XVibeConversationActionStatus =
   | "suggested"
   | "running"
+  | "done"
+  | "failed"
+  | "dismissed";
+
+type XVibeConversationArtifactStatus =
   | "done"
   | "failed"
   | "dismissed";
@@ -383,6 +394,33 @@ function read_conversation_action_status(value: unknown): XVibeConversationActio
   }
 
   return value as XVibeConversationActionStatus;
+}
+
+function read_conversation_artifact_status(value: unknown): XVibeConversationArtifactStatus {
+  if (
+    typeof value !== "string" ||
+    !XVIBE_CONVERSATION_ARTIFACT_STATUSES.has(value)
+  ) {
+    throw_explicit_error(
+      XVIBE_INVALID_CONVERSATION_ARTIFACT_STATUS,
+      "Invalid '_artifact_status': expected done, failed, or dismissed",
+    );
+  }
+
+  return value as XVibeConversationArtifactStatus;
+}
+
+function read_optional_conversation_artifact_error(value: unknown): unknown {
+  if (value === undefined) return undefined;
+  if (typeof value === "string") return value;
+  if (_xu.is_plain_object(value) && is_json_compatible_value(value)) {
+    return value;
+  }
+
+  throw_explicit_error(
+    XVIBE_INVALID_CONVERSATION_MESSAGE,
+    "Invalid '_artifact_error': expected string or JSON-compatible object",
+  );
 }
 
 function clone_json<T>(value: T): T {
@@ -1545,6 +1583,127 @@ export class ConversationManager {
 
       const message = error instanceof Error ? error.message : String(error);
       _xlog.error("[xvibe] update_conversation_action failed", error);
+      return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
+    }
+  }
+
+  static async updateConversationArtifact(xcmd: XCommand) {
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+    _xlog.log("[xvibe] conversation artifact status update received", {
+      _conversation_id:
+        typeof params._conversation_id === "string"
+          ? params._conversation_id
+          : undefined,
+      _message_id:
+        typeof params._message_id === "string"
+          ? params._message_id
+          : undefined,
+      _artifact_status:
+        typeof params._artifact_status === "string"
+          ? params._artifact_status
+          : undefined,
+      _has_artifact_result: params._artifact_result !== undefined,
+      _has_artifact_error: params._artifact_error !== undefined,
+    });
+
+    try {
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env, "_env", XVIBE_INVALID_ENV);
+      const conversation_id =
+        read_safe_path_segment(
+          params._conversation_id,
+          "_conversation_id",
+          XVIBE_INVALID_CONVERSATION_ID,
+        );
+      const message_id =
+        read_safe_path_segment(
+          params._message_id,
+          "_message_id",
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+        );
+      const artifact_status =
+        read_conversation_artifact_status(params._artifact_status);
+      const artifact_result =
+        read_optional_json_object(
+          params._artifact_result,
+          "_artifact_result",
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+        );
+      const artifact_error =
+        read_optional_conversation_artifact_error(params._artifact_error);
+      const { _conversation_dir: conversation_dir } =
+        resolve_existing_conversation({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+        });
+
+      read_conversation_document(conversation_dir);
+      const messages = read_conversation_messages(conversation_dir);
+      const message =
+        messages.find((item) => item._id === message_id);
+      if (!message) {
+        throw_explicit_error(
+          XVIBE_CONVERSATION_MESSAGE_NOT_FOUND,
+          `Conversation message not found: ${message_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+          },
+        );
+      }
+
+      if (!_xu.is_plain_object(message._intent)) {
+        throw_explicit_error(
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+          `Conversation message intent not found: ${message_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+          },
+        );
+      }
+
+      const intent = message._intent as XVibeJsonObject;
+      intent._artifact_status = artifact_status;
+      if (artifact_result !== undefined) {
+        intent._artifact_result = artifact_result;
+      }
+      if (artifact_error !== undefined) {
+        intent._artifact_error = artifact_error;
+      }
+
+      write_conversation_messages(conversation_dir, messages);
+
+      _xlog.log("[xvibe] conversation artifact status updated", {
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+        _message_id: message_id,
+        _artifact_status: artifact_status,
+      });
+
+      return {
+        _ok: true,
+        _result: {
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _message_id: message_id,
+          _artifact_status: artifact_status,
+          _message: message,
+          _intent: intent,
+        },
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] update_conversation_artifact failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] update_conversation_artifact failed", error);
       return explicit_error(XVIBE_CONVERSATION_STORAGE_FAILED, message);
     }
   }

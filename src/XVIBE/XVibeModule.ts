@@ -37,6 +37,8 @@ import {
   type XVibeRuntimeContextInput,
 } from "./Runtime/RuntimeContextManager.js";
 import { StructuredViewEdit } from "./StructuredEditing/StructuredViewEdit.js";
+import { ArtifactExecutor } from "./Artifact/ArtifactExecutor.js";
+import { ExecutionGraphExecutor } from "./ExecutionGraph/ExecutionGraphExecutor.js";
 import type { VibeArtifactFactoryDiagnostic } from "./VibeArtifactFactory.js";
 
 import type {
@@ -7309,6 +7311,35 @@ export class XVibeModule extends XModule {
       }
     },
 
+    "apply-artifact-request": {
+      _name: "apply-artifact-request",
+      _scope: "module",
+      _description:
+        "Apply a structured artifact request intent through explicit server persistence without AI routing.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _artifact_type: "Artifact type. v1 supports entity.",
+        _artifact_request: "Artifact request payload. v1 supports entity create.",
+        _conversation_id: "Optional source conversation id.",
+        _message_id: "Optional source message id."
+      }
+    },
+
+    "execute-execution-graph": {
+      _name: "execute-execution-graph",
+      _scope: "module",
+      _description:
+        "Re-plan and execute a supported XVibe execution graph through explicit artifact request persistence without AI routing.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _graph_type: "Execution graph type. v1 supports crud.",
+        _entity_name: "Target entity name.",
+        _execution_graph: "Optional client graph payload. Ignored by the server executor."
+      }
+    },
+
     "generate-app": {
       _name: "generate-app",
       _scope: "module",
@@ -7448,6 +7479,21 @@ export class XVibeModule extends XModule {
         _metadata: "Optional JSON-compatible action metadata object."
       }
     },
+    "update-conversation-artifact": {
+      _name: "update-conversation-artifact",
+      _scope: "module",
+      _description:
+        "Persist one conversation artifact request status in messages.jsonl without executing it.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _conversation_id: "Conversation id.",
+        _message_id: "Message id containing the artifact request intent.",
+        _artifact_status: "done, failed, or dismissed.",
+        _artifact_result: "Optional JSON-compatible artifact result object.",
+        _artifact_error: "Optional artifact error string or JSON-compatible object."
+      }
+    },
     "sync-skills": {
       _name: "sync-skills",
       _scope: "module",
@@ -7470,6 +7516,8 @@ export class XVibeModule extends XModule {
   private readonly behavior_planner: VibeBehaviorPlanner;
   private readonly intent_engine: XVibeIntentEngine;
   private readonly generation_manager: GenerationManager;
+  private readonly artifact_executor: ArtifactExecutor;
+  private readonly execution_graph_executor: ExecutionGraphExecutor;
 
   constructor() {
     super({ _name: XVibeModule._name });
@@ -7512,6 +7560,11 @@ export class XVibeModule extends XModule {
       _generate_planned_artifacts:
         this.generate_planned_artifacts.bind(this),
     });
+    this.artifact_executor = new ArtifactExecutor();
+    this.execution_graph_executor = new ExecutionGraphExecutor(
+      undefined,
+      this.artifact_executor,
+    );
   }
 
   override async onLoad() {
@@ -13269,6 +13322,14 @@ export class XVibeModule extends XModule {
     });
   }
 
+  async _apply_artifact_request(xcmd: XCommand) {
+    return this.artifact_executor.apply(xcmd);
+  }
+
+  async _execute_execution_graph(xcmd: XCommand) {
+    return this.execution_graph_executor.apply(xcmd);
+  }
+
   async _generate(xcmd: XCommand) {
     return this.generation_manager.generate(xcmd);
   }
@@ -13482,6 +13543,10 @@ export class XVibeModule extends XModule {
 
   async _update_conversation_action(xcmd: XCommand) {
     return ConversationManager.updateConversationAction(xcmd);
+  }
+
+  async _update_conversation_artifact(xcmd: XCommand) {
+    return ConversationManager.updateConversationArtifact(xcmd);
   }
 
   async _get_last_messages(xcmd: XCommand) {
