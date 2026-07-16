@@ -10,6 +10,7 @@ import type {
 } from "../XVibeTypes.js";
 
 const XVIBE_INVALID_INTENT_REQUEST = "E_XVIBE_INVALID_INTENT_REQUEST";
+const XVIBE_INVALID_INTENT_RESULT = "E_XVIBE_INVALID_INTENT_RESULT";
 
 type IntentConversationBridgeAnalyzeInput = {
   _cmd: XCommand;
@@ -53,6 +54,57 @@ function normalize_intent_action_ids(intent: XVibeIntentResult | undefined): voi
       _action_ids: action_ids,
     });
   }
+}
+
+function runtime_type(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value !== "object") return typeof value;
+  return value.constructor?.name ?? "object";
+}
+
+function find_non_json_compatible_value(
+  value: unknown,
+  path = "$",
+): { _path: string; _runtime_type: string } | null {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value)
+      ? null
+      : { _path: path, _runtime_type: runtime_type(value) };
+  }
+
+  if (typeof value !== "object") {
+    return { _path: path, _runtime_type: runtime_type(value) };
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const child =
+        find_non_json_compatible_value(value[index], `${path}[${index}]`);
+      if (child) return child;
+    }
+    return null;
+  }
+
+  if (!_xu.is_plain_object(value)) {
+    return { _path: path, _runtime_type: runtime_type(value) };
+  }
+
+  for (const [key, child_value] of Object.entries(value)) {
+    const child =
+      find_non_json_compatible_value(child_value, `${path}.${key}`);
+    if (child) return child;
+  }
+
+  return null;
 }
 
 function selected_type_from_runtime_context(
@@ -106,6 +158,20 @@ export class IntentConversationBridge {
       }
 
       normalize_intent_action_ids(intent_result._intent);
+      const json_issue =
+        find_non_json_compatible_value(intent_result._intent);
+      if (json_issue) {
+        _xlog.error("[xvibe] intent result is not JSON-compatible before conversation append", {
+          _path: json_issue._path,
+          _runtime_type: json_issue._runtime_type,
+        });
+        return explicit_error(
+          XVIBE_INVALID_INTENT_RESULT,
+          "Intent result must be JSON-compatible before conversation append.",
+          json_issue,
+        );
+      }
+
       const selected_type =
         selected_type_from_runtime_context(request._runtime_context);
 

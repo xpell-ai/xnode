@@ -36,9 +36,17 @@ import {
   RuntimeContextManager,
   type XVibeRuntimeContextInput,
 } from "./Runtime/RuntimeContextManager.js";
-import { StructuredViewEdit } from "./StructuredEditing/StructuredViewEdit.js";
+import {
+  canonicalizeSemanticViewEditParams,
+  isStructuredViewEditAction,
+  StructuredViewEdit,
+} from "./StructuredEditing/StructuredViewEdit.js";
+import { resolveViewTarget } from "./StructuredEditing/ViewTargetResolution.js";
 import { ArtifactExecutor } from "./Artifact/ArtifactExecutor.js";
 import { ExecutionGraphExecutor } from "./ExecutionGraph/ExecutionGraphExecutor.js";
+import { GuideRecommendationEngine } from "./Guide/GuideRecommendationEngine.js";
+import { record_project_memory_achievement } from "../XVM/ProjectMemoryAchievements.js";
+import { complete_project_memory_focus_milestone_item } from "../XVM/ProjectMemoryMilestones.js";
 import type { VibeArtifactFactoryDiagnostic } from "./VibeArtifactFactory.js";
 
 import type {
@@ -50,6 +58,8 @@ import type {
   VibeRequestedArtifactType,
   XVibeInferredArtifactPlan,
   XVibeInferredArtifactType,
+  XVibeGuideRecommendation,
+  XVibeProjectMemory,
   XVibeResolvedTask,
   XVibeRuntimeAssetRef,
   XVibeRuntimeAssets,
@@ -79,9 +89,15 @@ import {
 import { XVibeIntentEngine } from "./XVibeIntentEngine.js";
 
 type VibeAIMode = "full" | "refine";
+type GuideRecommendationCacheEntry = {
+  _expires_at: number;
+  _recommendation: XVibeGuideRecommendation | null;
+};
+
 const DEFAULT_ENV = "default";
 const DEFAULT_VIEW_ID = "view-main";
 const DEFAULT_SCAFFOLD_ROOT_TYPE = "view";
+const GUIDE_RECOMMENDATION_CACHE_TTL_MS = 1000;
 const XVIBE_PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const MAX_VALIDATION_ERRORS = 50;
 const MAX_REPAIR_ERRORS = 20;
@@ -90,6 +106,10 @@ const XVIBE_ARTIFACT_ACTION_NOT_SUPPORTED = "E_XVIBE_ARTIFACT_ACTION_NOT_SUPPORT
 const XVIBE_INVALID_STARTER_ID = "E_XVIBE_INVALID_STARTER_ID";
 const XVIBE_INVALID_APP_ID = "E_XVIBE_INVALID_APP_ID";
 const XVIBE_INVALID_ENV = "E_XVIBE_INVALID_ENV";
+const XVIBE_INVALID_CONVERSATION_ID = "E_XVIBE_INVALID_CONVERSATION_ID";
+const PLANNING_DRAFT_NOT_FOUND = "E_PLANNING_DRAFT_NOT_FOUND";
+const PLANNING_INCOMPLETE = "E_PLANNING_INCOMPLETE";
+const PROJECT_MEMORY_PATCH_FAILED = "E_PROJECT_MEMORY_PATCH_FAILED";
 const XVIBE_STARTER_NOT_FOUND = "E_XVIBE_STARTER_NOT_FOUND";
 const XVIBE_APP_ALREADY_EXISTS = "E_XVIBE_APP_ALREADY_EXISTS";
 const XVIBE_STARTER_COPY_FAILED = "E_XVIBE_STARTER_COPY_FAILED";
@@ -151,12 +171,23 @@ const XVIBE_DETERMINISTIC_HIDE_MECHANISM = "style.display:none";
 const XVIBE_DETERMINISTIC_SHOW_MECHANISM = "remove-style.display:none";
 const XVIBE_DETERMINISTIC_BUILTIN_PROPERTY_NAMES = new Set([
   "_text",
+  "_on",
+  "_once",
+  "_on_mount",
+  "_requires",
   "class",
   "_class",
   "style",
   "_style",
   "disabled",
   "placeholder",
+  "value",
+]);
+const XVIBE_DETERMINISTIC_BUILTIN_JSON_PROPERTY_NAMES = new Set([
+  "_on",
+  "_once",
+  "_on_mount",
+  "_requires",
 ]);
 const XVIBE_DETERMINISTIC_BLOCKED_PROPERTY_NAMES = new Set([
   "_id",
@@ -200,9 +231,43 @@ type XVibeViewMutationArtifact = XVibeJsonObject & {
 };
 
 type XVibeInteractionScope = "_on" | "_once";
+type XVibeMoveObjectPosition = "append" | "prepend" | "before" | "after";
+type XVibeCreateToolbarLocation = "top" | "bottom" | "before" | "after";
+
+type XVibeMutationPlanPrimitive = {
+  _module: "xvibe";
+  _op: "apply-view-edit";
+  _params: XVibeJsonObject;
+};
+
+type XVibeMutationPlanStep = XVibeJsonObject & {
+  _id: string;
+  _title?: string;
+  _status: "planned" | "unsupported" | "running" | "done" | "failed";
+  _primitive?: XVibeMutationPlanPrimitive;
+  _reason?: string;
+};
+
+type XVibeMutationPlanArtifact = XVibeJsonObject & {
+  _type: "mutation-plan";
+  _steps: XVibeMutationPlanStep[];
+  _can_apply: boolean;
+  _unsupported_steps: number;
+};
+
+type XVibeMutationPlanExecutionStep = XVibeJsonObject & {
+  _id: string;
+  _status: "running" | "done" | "failed";
+  _result?: unknown;
+  _error?: XVibeJsonObject;
+};
+
+type XVibeMutationPlanValidationResult =
+  | { _ok: true; _plan: XVibeMutationPlanArtifact; _steps: XVibeMutationPlanStep[] }
+  | { _ok: false; _code: string; _message: string; _details?: XVibeJsonObject };
 
 type XVibeViewEditIntent = XVibeJsonObject & {
-  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
+  _action: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "set-styles" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "update-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "create-toolbar" | "set-interaction" | "bind-flow";
   _target_id?: string;
   _field?: string;
   _target_text?: string;
@@ -212,26 +277,40 @@ type XVibeViewEditIntent = XVibeJsonObject & {
   _new_class_name?: string;
   _style_property?: string;
   _style_value?: string;
+  _styles?: XVibeJsonObject;
   _property_name?: string;
   _property_value?: unknown;
   _interaction_scope?: XVibeInteractionScope;
   _trigger?: string;
   _handler?: Record<string, any> | null;
+  _flow?: { _id: string; _payload?: XVibeJsonObject };
+  _flow_event?: string;
+  _flow_auto?: boolean;
   _object_value?: XVibeJsonObject;
   _move_position?: "before" | "after" | "top" | "bottom";
+  _position?: XVibeMoveObjectPosition;
   _anchor_id?: string;
   _anchor_text?: string;
   _anchor_type?: string;
+  _destination_id?: string;
+  _destination_text?: string;
+  _destination_type?: string;
   _target_type?: string;
   _child?: XVibeJsonObject;
+  _location?: string;
+  _component_type?: string;
+  _props?: XVibeJsonObject;
+  _toolbar_props?: XVibeJsonObject;
   _warnings?: string[];
 };
 
 type XVibeDeterministicViewEditEligibility = {
   _eligible: boolean;
-  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
+  _action?: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "set-styles" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "create-toolbar" | "set-interaction" | "bind-flow";
   _target_id?: string;
+  _target_path?: string[];
   _field?: "_text";
+  _property_name?: string;
   _reason: string;
   _details?: unknown;
 };
@@ -241,8 +320,9 @@ type XVibeDeterministicViewEditResult = {
   _view?: unknown;
   _mutation?: {
     _type: "deterministic-view-edit";
-    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
+    _action: "update-text" | "remove-object" | "hide-object" | "show-object" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "set-styles" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "create-toolbar" | "set-interaction" | "bind-flow";
     _target_id?: string;
+    _target_path?: string[];
     _field?: "_text";
     _previous_text?: string;
     _replacement_text?: string;
@@ -254,6 +334,8 @@ type XVibeDeterministicViewEditResult = {
     _previous_class?: string;
     _next_class?: string;
     _style_property?: string;
+    _styles_applied?: XVibeJsonObject;
+    _previous_styles?: XVibeJsonObject;
     _previous_value?: unknown;
     _next_value?: unknown;
     _property_name?: string;
@@ -262,14 +344,21 @@ type XVibeDeterministicViewEditResult = {
     _handler_removed?: boolean;
     _handler_module?: string;
     _handler_op?: string;
+    _flow?: { _id: string; _payload?: XVibeJsonObject };
+    _flow_event?: string;
+    _flow_auto?: boolean;
     _previous_object?: XVibeJsonObject;
     _next_object?: XVibeJsonObject;
     _move_position?: "before" | "after" | "top" | "bottom";
+    _position?: XVibeMoveObjectPosition;
     _anchor_id?: string;
     _before_id?: string;
     _after_id?: string;
     _anchor_resolved_by?: "id" | "text" | "normalized_text" | "text_type_id";
     _parent_id?: string;
+    _source_parent_id?: string;
+    _destination_parent_id?: string;
+    _moved_id?: string;
     _previous_index?: number;
     _next_index?: number;
     _insert_index?: number;
@@ -283,8 +372,12 @@ type XVibeDeterministicViewEditResult = {
     _source_view_id?: string;
     _requested_view_id?: string;
     _resolved_via?: "xvm-view";
+    _location?: XVibeCreateToolbarLocation;
     _child_id?: string;
     _child_type?: string;
+    _toolbar_id?: string;
+    _created?: boolean;
+    _reason?: string;
     _warnings?: string[];
   };
   _reason?: string;
@@ -1239,6 +1332,7 @@ function generated_module_method_name(op_name: string): string {
 export function build_generated_module_implementation_prompt(input: {
   spec: XVibeModuleCreatorSpec;
   user_request: string;
+  project_memory?: unknown;
   current_or_generated_view?: unknown;
   originating_view?: unknown;
   server_module_call_graph?: XVibeServerModuleCallGraph;
@@ -1253,6 +1347,9 @@ export function build_generated_module_implementation_prompt(input: {
     _original_user_prompt: input.user_request,
     _module_name: input.spec._name,
     _module_ops: module_ops,
+    ...(input.project_memory !== undefined
+      ? { _project_memory: input.project_memory }
+      : {}),
     _server_module_call_graph: input.server_module_call_graph ?? {},
     ...(current_or_generated_view !== undefined
       ? { _current_or_generated_view: current_or_generated_view }
@@ -1679,6 +1776,872 @@ function error_summary(error: unknown): XVibeJsonObject | string {
   return String(error);
 }
 
+function mutation_plan_error_result(input: {
+  _code: string;
+  _message: string;
+  _details?: XVibeJsonObject;
+}): XVibeJsonObject {
+  return {
+    _ok: false,
+    _status: "failed",
+    _completed_steps: 0,
+    _failed_steps: 0,
+    _steps: [],
+    _error: {
+      _code: input._code,
+      _message: input._message,
+      ...(input._details ? { _details: input._details } : {}),
+    },
+  };
+}
+
+function mutation_plan_step_error(value: unknown): XVibeJsonObject {
+  if (_xu.is_plain_object(value)) {
+    const error =
+      _xu.is_plain_object(value._error)
+        ? value._error
+        : _xu.is_plain_object(value._result)
+          ? value._result
+          : value;
+    const code =
+      typeof error._code === "string" && error._code.trim()
+        ? error._code.trim()
+        : typeof error.code === "string" && error.code.trim()
+          ? error.code.trim()
+          : "E_XVIBE_MUTATION_PLAN_STEP_FAILED";
+    const message =
+      typeof error._message === "string" && error._message.trim()
+        ? error._message.trim()
+        : typeof error.message === "string" && error.message.trim()
+          ? error.message.trim()
+          : "Mutation plan step failed.";
+    return {
+      _code: code,
+      _message: message,
+      _details: error,
+    };
+  }
+
+  if (value instanceof Error) {
+    return {
+      _code: "E_XVIBE_MUTATION_PLAN_STEP_FAILED",
+      _message: value.message,
+    };
+  }
+
+  return {
+    _code: "E_XVIBE_MUTATION_PLAN_STEP_FAILED",
+    _message: "Mutation plan step failed.",
+    _details: {
+      _error: String(value),
+    },
+  };
+}
+
+function validate_mutation_plan_primitive(input: {
+  _primitive: unknown;
+  _app_id: string;
+  _env: string;
+  _step_id: string;
+}): XVibeMutationPlanPrimitive | { _error: XVibeJsonObject } {
+  if (!_xu.is_plain_object(input._primitive)) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_INVALID_PRIMITIVE",
+        _message: `Mutation plan step '${input._step_id}' is missing a primitive descriptor.`,
+      },
+    };
+  }
+
+  if (
+    input._primitive._module !== "xvibe" ||
+    input._primitive._op !== "apply-view-edit"
+  ) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_PRIMITIVE_NOT_ALLOWED",
+        _message: `Mutation plan step '${input._step_id}' uses an unsupported primitive.`,
+        _details: {
+          _module: input._primitive._module,
+          _op: input._primitive._op,
+        },
+      },
+    };
+  }
+
+  if (!_xu.is_plain_object(input._primitive._params)) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_INVALID_PRIMITIVE_PARAMS",
+        _message: `Mutation plan step '${input._step_id}' has invalid primitive params.`,
+      },
+    };
+  }
+
+  const canonical =
+    canonicalizeSemanticViewEditParams(input._primitive._params);
+  if (!canonical._ok) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_INVALID_PRIMITIVE_PARAMS",
+        _message: `Mutation plan step '${input._step_id}' failed primitive contract validation.`,
+        _details: {
+          _reason: canonical._reason,
+        },
+      },
+    };
+  }
+
+  const params = canonical._params;
+  if (!isStructuredViewEditAction(params._edit_action)) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_UNSUPPORTED_EDIT_ACTION",
+        _message: `Mutation plan step '${input._step_id}' has an unsupported edit action.`,
+        _details: {
+          _edit_action: params._edit_action,
+        },
+      },
+    };
+  }
+
+  const primitive_app_id =
+    typeof params._app_id === "string" ? params._app_id.trim() : "";
+  const primitive_env =
+    typeof params._env === "string" ? params._env.trim() : "";
+  const primitive_view_id =
+    typeof params._view_id === "string" ? params._view_id.trim() : "";
+  if (!primitive_app_id || !primitive_env || !primitive_view_id) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_PRIMITIVE_CONTEXT_MISSING",
+        _message: `Mutation plan step '${input._step_id}' is missing app/env/view context.`,
+      },
+    };
+  }
+
+  if (primitive_app_id !== input._app_id || primitive_env !== input._env) {
+    return {
+      _error: {
+        _code: "E_XVIBE_MUTATION_PLAN_CONTEXT_MISMATCH",
+        _message: `Mutation plan step '${input._step_id}' does not match the active app/env context.`,
+        _details: {
+          _app_id: input._app_id,
+          _env: input._env,
+          _primitive_app_id: primitive_app_id,
+          _primitive_env: primitive_env,
+        },
+      },
+    };
+  }
+
+  return {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: { ...params },
+  };
+}
+
+function validate_mutation_plan_for_execution(input: {
+  _plan: unknown;
+  _app_id: string;
+  _env: string;
+}): XVibeMutationPlanValidationResult {
+  if (!_xu.is_plain_object(input._plan)) {
+    return {
+      _ok: false,
+      _code: "E_XVIBE_MUTATION_PLAN_INVALID",
+      _message: "Mutation plan is required.",
+    };
+  }
+
+  if (input._plan._type !== "mutation-plan") {
+    return {
+      _ok: false,
+      _code: "E_XVIBE_MUTATION_PLAN_INVALID_TYPE",
+      _message: "Mutation plan must have _type 'mutation-plan'.",
+    };
+  }
+
+  if (input._plan._can_apply !== true) {
+    return {
+      _ok: false,
+      _code: "E_XVIBE_MUTATION_PLAN_NOT_READY",
+      _message: "Mutation plan is not ready to apply.",
+    };
+  }
+
+  const raw_steps =
+    Array.isArray(input._plan._steps) ? input._plan._steps : undefined;
+  if (!raw_steps || raw_steps.length === 0) {
+    return {
+      _ok: false,
+      _code: "E_XVIBE_MUTATION_PLAN_EMPTY",
+      _message: "Mutation plan must contain executable steps.",
+    };
+  }
+
+  const unsupported_steps =
+    raw_steps.filter((step) =>
+      _xu.is_plain_object(step) && step._status === "unsupported"
+    );
+  if (
+    input._plan._unsupported_steps !== 0 ||
+    unsupported_steps.length > 0
+  ) {
+    return {
+      _ok: false,
+      _code: "E_XVIBE_MUTATION_PLAN_UNSUPPORTED_STEPS",
+      _message: "Mutation plan contains unsupported steps.",
+      _details: {
+        _unsupported_steps:
+          unsupported_steps.map((step) => step._id).filter(Boolean),
+      },
+    };
+  }
+
+  const steps: XVibeMutationPlanStep[] = [];
+  for (const [index, raw_step] of raw_steps.entries()) {
+    if (!_xu.is_plain_object(raw_step)) {
+      return {
+        _ok: false,
+        _code: "E_XVIBE_MUTATION_PLAN_INVALID_STEP",
+        _message: `Mutation plan step ${index} is invalid.`,
+      };
+    }
+
+    const step_id =
+      typeof raw_step._id === "string" && raw_step._id.trim()
+        ? raw_step._id.trim()
+        : `step-${index + 1}`;
+    const primitive =
+      validate_mutation_plan_primitive({
+        _primitive: raw_step._primitive,
+        _app_id: input._app_id,
+        _env: input._env,
+        _step_id: step_id,
+      });
+    if ("_error" in primitive) {
+      return {
+        _ok: false,
+        _code: primitive._error._code as string,
+        _message: primitive._error._message as string,
+        _details: _xu.is_plain_object(primitive._error._details)
+          ? primitive._error._details as XVibeJsonObject
+          : undefined,
+      };
+    }
+
+    steps.push({
+      ...raw_step,
+      _id: step_id,
+      _status: "planned",
+      _primitive: primitive,
+    } as XVibeMutationPlanStep);
+  }
+
+  return {
+    _ok: true,
+    _plan: input._plan as XVibeMutationPlanArtifact,
+    _steps: steps,
+  };
+}
+
+function mutation_plan_existing_stable_child_result(input: {
+  _view: XVibeJsonObject;
+  _params: XVibeJsonObject;
+}): XVibeJsonObject | undefined {
+  if (input._params._edit_action !== "add-child") return undefined;
+  if (!_xu.is_plain_object(input._params._child)) return undefined;
+
+  const target_id =
+    typeof input._params._target_id === "string" && input._params._target_id.trim()
+      ? input._params._target_id.trim()
+      : "";
+  const child_id =
+    typeof input._params._child._id === "string" && input._params._child._id.trim()
+      ? input._params._child._id.trim()
+      : "";
+  if (!target_id || !child_id) return undefined;
+
+  const target =
+    find_view_node_by_id(input._view, target_id);
+  if (!target || !Array.isArray(target._children)) {
+    return undefined;
+  }
+
+  const existing_child =
+    target._children.find((child) =>
+      _xu.is_plain_object(child) && child._id === child_id
+    );
+  if (!existing_child) return undefined;
+
+  return {
+    _ok: true,
+    _artifact_type: "view",
+    _artifact_id: input._params._view_id,
+    _view_id: input._params._view_id,
+    _deterministic: true,
+    _mutation_action: "add-child",
+    _target_id: target_id,
+    _child_id: child_id,
+    _created: false,
+    _reason: "already_exists",
+    _idempotent: true,
+  };
+}
+
+function mutation_plan_existing_completed_move_result(input: {
+  _view: XVibeJsonObject;
+  _params: XVibeJsonObject;
+}): XVibeJsonObject | undefined {
+  if (input._params._edit_action !== "move-object") return undefined;
+
+  const destination_id =
+    typeof input._params._destination_id === "string" && input._params._destination_id.trim()
+      ? input._params._destination_id.trim()
+      : "";
+  const target_id =
+    typeof input._params._target_id === "string" && input._params._target_id.trim()
+      ? input._params._target_id.trim()
+      : "";
+  const target_text =
+    typeof input._params._target_text === "string" && input._params._target_text.trim()
+      ? input._params._target_text.trim()
+      : target_id;
+  const target_type =
+    typeof input._params._target_type === "string" && input._params._target_type.trim()
+      ? input._params._target_type.trim()
+      : "";
+  if (!destination_id || (!target_id && !target_text)) return undefined;
+
+  const destination_resolution =
+    resolveViewTarget(input._view, {
+      _target_id: destination_id,
+      _target_text:
+        typeof input._params._destination_text === "string" &&
+        input._params._destination_text.trim()
+          ? input._params._destination_text.trim()
+          : undefined,
+      _target_type:
+        typeof input._params._destination_type === "string" &&
+        input._params._destination_type.trim()
+          ? input._params._destination_type.trim()
+          : undefined,
+      _target_id_text_fallback: true,
+      _include_id: true,
+      _allow_root: false,
+    });
+  if (
+    !destination_resolution._ok ||
+    !Array.isArray(destination_resolution.object._children)
+  ) {
+    return undefined;
+  }
+
+  const source_resolution =
+    resolveViewTarget(input._view, {
+      _target_id: target_id || undefined,
+      _target_text: target_text || undefined,
+      _target_type: target_type || undefined,
+      _target_id_text_fallback: true,
+      _include_id: Boolean(target_id),
+    });
+  if (!source_resolution._ok) return undefined;
+  if (source_resolution.parent !== destination_resolution.object) {
+    return undefined;
+  }
+
+  const moved_id =
+    typeof source_resolution._resolved_target_id === "string" &&
+    source_resolution._resolved_target_id.trim()
+      ? source_resolution._resolved_target_id.trim()
+      : undefined;
+
+  return {
+    _ok: true,
+    _artifact_type: "view",
+    _artifact_id: input._params._view_id,
+    _view_id: input._params._view_id,
+    _deterministic: true,
+    _mutation_action: "move-object",
+    ...(moved_id ? { _target_id: moved_id, _moved_id: moved_id } : {}),
+    ...(moved_id ? {} : { _target_path: source_resolution._resolved_target_path }),
+    _destination_id:
+      typeof destination_resolution._resolved_target_id === "string"
+        ? destination_resolution._resolved_target_id
+        : destination_id,
+    _moved: false,
+    _reason: "already_exists",
+    _idempotent: true,
+  };
+}
+
+function mutation_plan_existing_completed_bind_flow_result(input: {
+  _view: XVibeJsonObject;
+  _params: XVibeJsonObject;
+}): XVibeJsonObject | undefined {
+  if (input._params._edit_action !== "bind-flow") return undefined;
+
+  const target_id =
+    typeof input._params._target_id === "string" && input._params._target_id.trim()
+      ? input._params._target_id.trim()
+      : "";
+  const target_text =
+    typeof input._params._target_text === "string" && input._params._target_text.trim()
+      ? input._params._target_text.trim()
+      : target_id;
+  const target_type =
+    typeof input._params._target_type === "string" && input._params._target_type.trim()
+      ? input._params._target_type.trim()
+      : "";
+  const flow =
+    _xu.is_plain_object(input._params._flow) ? input._params._flow : undefined;
+  const flow_id =
+    typeof flow?._id === "string" && flow._id.trim()
+      ? flow._id.trim()
+      : "";
+  const flow_payload =
+    flow && _xu.is_plain_object(flow._payload) ? flow._payload : {};
+  const flow_event =
+    typeof input._params._flow_event === "string" && input._params._flow_event.trim()
+      ? input._params._flow_event.trim()
+      : "click";
+  const flow_auto =
+    typeof input._params._flow_auto === "boolean"
+      ? input._params._flow_auto
+      : true;
+  if ((!target_id && !target_text) || !flow_id) return undefined;
+
+  const target_resolution =
+    resolveViewTarget(input._view, {
+      _target_id: target_id || undefined,
+      _target_text: target_text || undefined,
+      _target_type: target_type || undefined,
+      _target_id_text_fallback: true,
+      _include_id: Boolean(target_id),
+    });
+  if (!target_resolution._ok) return undefined;
+
+  const existing_flow =
+    _xu.is_plain_object(target_resolution.object._flow)
+      ? target_resolution.object._flow
+      : undefined;
+  if (
+    existing_flow?._id !== flow_id ||
+    JSON.stringify(existing_flow?._payload ?? {}) !== JSON.stringify(flow_payload) ||
+    target_resolution.object._flow_event !== flow_event ||
+    target_resolution.object._flow_auto !== flow_auto
+  ) {
+    return undefined;
+  }
+
+  const resolved_target_id =
+    typeof target_resolution._resolved_target_id === "string" &&
+    target_resolution._resolved_target_id.trim()
+      ? target_resolution._resolved_target_id.trim()
+      : undefined;
+
+  return {
+    _ok: true,
+    _artifact_type: "view",
+    _artifact_id: input._params._view_id,
+    _view_id: input._params._view_id,
+    _deterministic: true,
+    _mutation_action: "bind-flow",
+    ...(resolved_target_id ? { _target_id: resolved_target_id } : {}),
+    ...(resolved_target_id ? {} : { _target_path: target_resolution._resolved_target_path }),
+    _flow: {
+      _id: flow_id,
+      _payload: clone_json(flow_payload),
+    },
+    _flow_event: flow_event,
+    _flow_auto: flow_auto,
+    _created: false,
+    _reason: "already_exists",
+    _idempotent: true,
+  };
+}
+
+function mutation_plan_existing_completed_property_result(input: {
+  _view: XVibeJsonObject;
+  _params: XVibeJsonObject;
+}): XVibeJsonObject | undefined {
+  if (
+    input._params._edit_action !== "set-property" &&
+    input._params._edit_action !== "update-property"
+  ) {
+    return undefined;
+  }
+
+  const property_name =
+    typeof input._params._property_name === "string" &&
+    input._params._property_name.trim()
+      ? input._params._property_name.trim()
+      : "";
+  if (!property_name) return undefined;
+
+  const target_id =
+    typeof input._params._target_id === "string" && input._params._target_id.trim()
+      ? input._params._target_id.trim()
+      : "";
+  const target_text =
+    typeof input._params._target_text === "string" && input._params._target_text.trim()
+      ? input._params._target_text.trim()
+      : target_id;
+  const target_type =
+    typeof input._params._target_type === "string" && input._params._target_type.trim()
+      ? input._params._target_type.trim()
+      : "";
+  if (!target_id && !target_text) return undefined;
+
+  const target_resolution =
+    resolveViewTarget(input._view, {
+      _target_id: target_id || undefined,
+      _target_text: target_text || undefined,
+      _target_type: target_type || undefined,
+      _target_id_text_fallback: true,
+      _include_id: Boolean(target_id),
+      _allow_root: deterministic_target_type_is_view(target_type),
+    });
+  if (!target_resolution._ok) return undefined;
+
+  const current_value =
+    target_resolution.object[property_name];
+  const next_value =
+    input._params._property_value;
+  if (JSON.stringify(current_value) !== JSON.stringify(next_value)) {
+    return undefined;
+  }
+
+  const resolved_target_id =
+    typeof target_resolution._resolved_target_id === "string" &&
+    target_resolution._resolved_target_id.trim()
+      ? target_resolution._resolved_target_id.trim()
+      : undefined;
+
+  return {
+    _ok: true,
+    _artifact_type: "view",
+    _artifact_id: input._params._view_id,
+    _view_id: input._params._view_id,
+    _deterministic: true,
+    _mutation_action: "set-property",
+    ...(resolved_target_id ? { _target_id: resolved_target_id } : {}),
+    ...(resolved_target_id ? {} : { _target_path: target_resolution._resolved_target_path }),
+    _property_name: property_name,
+    _next_value: clone_json(next_value),
+    _created: false,
+    _reason: "already_exists",
+    _idempotent: true,
+  };
+}
+
+function extract_project_memory(value: unknown): Record<string, any> | undefined {
+  if (!_xu.is_plain_object(value)) return undefined;
+
+  if (_xu.is_plain_object(value._memory)) {
+    return value._memory;
+  }
+
+  if (_xu.is_plain_object(value._result)) {
+    return extract_project_memory(value._result);
+  }
+
+  return undefined;
+}
+
+function clone_json<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function planning_answer_is_complete(value: unknown): boolean {
+  if (Array.isArray(value)) return value.length > 0;
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function read_planning_answer(
+  draft: XVibeJsonObject,
+  question: XVibeJsonObject,
+): unknown {
+  if (_xu.is_plain_object(draft._answers)) {
+    const answer = draft._answers[question._id as string];
+    if (planning_answer_is_complete(answer)) return answer;
+  }
+
+  return question._answer;
+}
+
+function is_active_project_plan_question(question_id: unknown): boolean {
+  return question_id !== "runtime";
+}
+
+function validate_project_plan_draft(draft: unknown): {
+  _ok: true;
+  _draft: XVibeJsonObject;
+  _questions: XVibeJsonObject[];
+} | {
+  _ok: false;
+  _errors: string[];
+} {
+  const errors: string[] = [];
+  if (!_xu.is_plain_object(draft)) {
+    return {
+      _ok: false,
+      _errors: ["planning_draft_missing"],
+    };
+  }
+
+  if (draft._type !== "project-plan") errors.push("draft_type_invalid");
+  if (draft._stage !== "planning") errors.push("draft_stage_invalid");
+  const active_unanswered =
+    Array.isArray(draft._unanswered)
+      ? draft._unanswered.filter((question_id) =>
+        is_active_project_plan_question(question_id)
+      )
+      : [];
+  const active_current_question =
+    _xu.is_plain_object(draft._current_question) &&
+    is_active_project_plan_question(draft._current_question._id);
+  if (
+    draft._status !== "ready-for-confirmation" &&
+    (active_unanswered.length > 0 || active_current_question)
+  ) {
+    errors.push("draft_not_ready_for_confirmation");
+  }
+  if (active_unanswered.length > 0) {
+    errors.push("required_questions_unanswered");
+  }
+  if (draft._current_question !== null && active_current_question) {
+    errors.push("current_question_not_cleared");
+  }
+  if (typeof draft._goal !== "string" || draft._goal.trim().length === 0) {
+    errors.push("goal_missing");
+  }
+  if (!Array.isArray(draft._questions)) {
+    errors.push("questions_missing");
+  }
+
+  const questions = Array.isArray(draft._questions)
+    ? draft._questions.filter((question): question is XVibeJsonObject =>
+      _xu.is_plain_object(question) &&
+      typeof question._id === "string" &&
+      typeof question._question === "string",
+    )
+    : [];
+
+  for (const question of questions) {
+    if (!is_active_project_plan_question(question._id)) continue;
+    if (question._required === false) continue;
+    const answer = read_planning_answer(draft, question);
+    if (!planning_answer_is_complete(answer)) {
+      errors.push(`required_question_unanswered:${question._id}`);
+    }
+  }
+
+  if (!_xu.is_plain_object(draft._proposed)) {
+    errors.push("proposed_artifacts_missing");
+  }
+  if (!Array.isArray(draft._milestones) || draft._milestones.length === 0) {
+    errors.push("milestones_missing");
+  }
+
+  return errors.length === 0
+    ? {
+      _ok: true,
+      _draft: draft,
+      _questions: questions,
+    }
+    : {
+      _ok: false,
+      _errors: [...new Set(errors)],
+    };
+}
+
+function unwrap_project_plan_payload(value: unknown): XVibeJsonObject | undefined {
+  if (!_xu.is_plain_object(value)) return undefined;
+
+  if (value._type === "project-plan") {
+    return value;
+  }
+
+  if (
+    value._artifact_type === "project-plan" &&
+    _xu.is_plain_object(value._artifact_request)
+  ) {
+    return unwrap_project_plan_payload(value._artifact_request);
+  }
+
+  if (_xu.is_plain_object(value._project_plan)) {
+    return unwrap_project_plan_payload(value._project_plan);
+  }
+
+  if (_xu.is_plain_object(value._artifact)) {
+    return unwrap_project_plan_payload(value._artifact);
+  }
+
+  return undefined;
+}
+
+function read_confirm_project_plan_fallback(params: XVibeJsonObject): XVibeJsonObject | undefined {
+  return unwrap_project_plan_payload(params._project_plan) ??
+    unwrap_project_plan_payload(params._artifact);
+}
+
+function normalize_project_plan_milestones(value: unknown): XVibeJsonObject[] {
+  if (!Array.isArray(value)) return [];
+
+  const milestones: XVibeJsonObject[] = [];
+  for (const raw_milestone of value) {
+    if (!_xu.is_plain_object(raw_milestone)) continue;
+
+    const title =
+      typeof raw_milestone._title === "string" && raw_milestone._title.trim()
+        ? raw_milestone._title.trim()
+        : typeof raw_milestone._id === "string" && raw_milestone._id.trim()
+          ? raw_milestone._id.trim()
+          : "";
+    const id =
+      _xu.normalize_id(raw_milestone._id) ||
+      _xu.normalize_id(title);
+    if (!id || !title) continue;
+
+    const items: XVibeJsonObject[] = [];
+    const raw_items = Array.isArray(raw_milestone._items)
+      ? raw_milestone._items
+      : [];
+    for (const raw_item of raw_items) {
+      const item_title =
+        typeof raw_item === "string"
+          ? raw_item.trim()
+          : _xu.is_plain_object(raw_item) &&
+              typeof raw_item._title === "string" &&
+              raw_item._title.trim()
+            ? raw_item._title.trim()
+            : _xu.is_plain_object(raw_item) &&
+                typeof raw_item._id === "string" &&
+                raw_item._id.trim()
+              ? raw_item._id.trim()
+              : "";
+      const item_id =
+        _xu.is_plain_object(raw_item)
+          ? _xu.normalize_id(raw_item._id) || _xu.normalize_id(item_title)
+          : _xu.normalize_id(item_title);
+      if (!item_id || !item_title) continue;
+
+      items.push({
+        _id: item_id,
+        _title: item_title,
+        _completed: _xu.is_plain_object(raw_item)
+          ? raw_item._completed === true
+          : false,
+      });
+    }
+
+    milestones.push({
+      _id: id,
+      _title: title,
+      _items: items,
+    });
+  }
+
+  return milestones;
+}
+
+function project_plan_decisions(input: {
+  _draft: XVibeJsonObject;
+  _questions: XVibeJsonObject[];
+}): XVibeJsonObject[] {
+  return input._questions.map((question) => {
+    const answer = read_planning_answer(input._draft, question);
+    return {
+      _id: question._id,
+      _type: "planning-answer",
+      _title: question._question,
+      ...(answer !== undefined ? { _answer: clone_json(answer) } : {}),
+    };
+  });
+}
+
+function project_plan_memory_patch(input: {
+  _draft: XVibeJsonObject;
+  _questions: XVibeJsonObject[];
+}): XVibeJsonObject {
+  const proposed = _xu.is_plain_object(input._draft._proposed)
+    ? input._draft._proposed
+    : {};
+  const milestones = normalize_project_plan_milestones(input._draft._milestones);
+  const first_focus =
+    typeof milestones[0]?._title === "string"
+      ? milestones[0]._title
+      : "";
+
+  return {
+    _stage: "building",
+    _goal: input._draft._goal,
+    ...(typeof input._draft._summary === "string"
+      ? { _summary: input._draft._summary }
+      : {}),
+    _decisions: project_plan_decisions(input),
+    _proposed: {
+      _entities: Array.isArray(proposed._entities)
+        ? clone_json(proposed._entities)
+        : [],
+      _views: Array.isArray(proposed._views)
+        ? clone_json(proposed._views)
+        : [],
+      _flows: Array.isArray(proposed._flows)
+        ? clone_json(proposed._flows)
+        : [],
+      _server_modules: Array.isArray(proposed._server_modules)
+        ? clone_json(proposed._server_modules)
+        : [],
+    },
+    _milestones: milestones,
+    _current_focus: first_focus,
+  };
+}
+
+function guide_recommendation_cache_key(input: {
+  _app_id: string;
+  _env: string;
+  _project_memory: unknown;
+}): string | undefined {
+  if (!_xu.is_plain_object(input._project_memory)) return undefined;
+
+  const current_focus =
+    typeof input._project_memory._current_focus === "string"
+      ? input._project_memory._current_focus.trim()
+      : "";
+  const updated_at =
+    typeof input._project_memory._updated_at === "string"
+      ? input._project_memory._updated_at.trim()
+      : "";
+
+  if (!current_focus || !updated_at) return undefined;
+
+  return [
+    input._app_id,
+    input._env,
+    current_focus,
+    updated_at,
+  ].join("\u0000");
+}
+
+function project_memory_has_achievement(
+  memory: unknown,
+  achievement_id: string,
+): boolean {
+  if (!_xu.is_plain_object(memory) || !Array.isArray(memory._achievements)) {
+    return false;
+  }
+
+  return memory._achievements.some((achievement) =>
+    _xu.is_plain_object(achievement) &&
+    achievement._id === achievement_id
+  );
+}
+
 function generation_artifact_stage_fields(result: unknown): XVibeJsonObject {
   if (!_xu.is_plain_object(result) || !_xu.is_plain_object(result._result)) {
     return {};
@@ -1827,7 +2790,7 @@ export function merge_refined_view(
   return merged;
 }
 
-function server_xvm_has_op(op: "set_flow" | "set_entity"): boolean {
+function server_xvm_has_op(op: "get_flow" | "set_flow" | "set_entity"): boolean {
   const get_module = (_x as unknown as { getModule?: (name: string) => unknown }).getModule;
   if (typeof get_module !== "function") {
     return true;
@@ -1855,6 +2818,50 @@ function explicit_error(code: string, message: string, details?: XVibeJsonObject
 
 function throw_explicit_error(code: string, message: string, details?: XVibeJsonObject): never {
   throw new XVibeStructuredError(explicit_error(code, message, details));
+}
+
+function flow_success_command_equal(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function append_flow_success_command_value(input: {
+  _existing: unknown;
+  _command: XVibeJsonObject;
+}): {
+  _value: unknown;
+  _changed: boolean;
+} {
+  const command = clone_json(input._command);
+
+  if (input._existing === undefined) {
+    return {
+      _value: command,
+      _changed: true,
+    };
+  }
+
+  if (flow_success_command_equal(input._existing, command)) {
+    return {
+      _value: clone_json(input._existing),
+      _changed: false,
+    };
+  }
+
+  const existing_list =
+    Array.isArray(input._existing)
+      ? clone_json(input._existing)
+      : [clone_json(input._existing)];
+  if (existing_list.some((item) => flow_success_command_equal(item, command))) {
+    return {
+      _value: clone_json(input._existing),
+      _changed: false,
+    };
+  }
+
+  return {
+    _value: [...existing_list, command],
+    _changed: true,
+  };
 }
 
 function read_safe_path_segment(
@@ -1923,6 +2930,152 @@ function assert_path_inside(root: string, candidate: string, code: string, messa
 
 function resolve_target_app_dir(env: string, app_id: string): string {
   return RuntimeContextManager.resolveTargetAppDir(env, app_id);
+}
+
+const STARTER_PUBLIC_FOLDERS = new Set(["style", "assets"]);
+
+function resolve_target_public_app_dir(app_id: string): string {
+  const public_root =
+    path.resolve(RuntimeContextManager.resolveXvibeWorkFolder(), "public");
+  const public_app_dir = path.resolve(public_root, app_id);
+  assert_path_inside(
+    public_root,
+    public_app_dir,
+    XVIBE_INVALID_APP_ID,
+    "Invalid target public app path",
+  );
+
+  return public_app_dir;
+}
+
+function copy_starter_runtime_files(starter_dir: string, target_dir: string): void {
+  fs.mkdirSync(target_dir, { recursive: true });
+
+  for (const entry of fs.readdirSync(starter_dir, { withFileTypes: true })) {
+    if (STARTER_PUBLIC_FOLDERS.has(entry.name)) {
+      continue;
+    }
+
+    const src_path = path.join(starter_dir, entry.name);
+    const target_path = path.join(target_dir, entry.name);
+
+    if (entry.isDirectory()) {
+      try {
+        _xu.copyDirRecursive(src_path, target_path);
+      } catch (error) {
+        throw_explicit_error(XVIBE_STARTER_COPY_FAILED, "Failed to copy starter runtime folder", {
+          _path: src_path,
+          _target_path: target_path,
+          _error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } else if (entry.isFile()) {
+      try {
+        fs.copyFileSync(src_path, target_path);
+      } catch (error) {
+        throw_explicit_error(XVIBE_STARTER_COPY_FAILED, "Failed to copy starter runtime file", {
+          _path: src_path,
+          _target_path: target_path,
+          _error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+}
+
+function copy_starter_public_files(
+  starter_dir: string,
+  public_app_dir: string,
+  app_id: string,
+): void {
+  fs.mkdirSync(public_app_dir, { recursive: true });
+
+  for (const folder of STARTER_PUBLIC_FOLDERS) {
+    const src_path = path.join(starter_dir, folder);
+    if (!fs.existsSync(src_path)) {
+      continue;
+    }
+
+    if (!fs.statSync(src_path).isDirectory()) {
+      throw_explicit_error(XVIBE_STARTER_COPY_FAILED, "Starter public path is not a directory", {
+        _app_id: app_id,
+        _path: src_path,
+      });
+    }
+
+    const target_path = path.join(public_app_dir, folder);
+    try {
+      _xu.copyDirRecursive(src_path, target_path);
+    } catch (error) {
+      throw_explicit_error(XVIBE_STARTER_COPY_FAILED, "Failed to copy starter public folder", {
+        _app_id: app_id,
+        _path: src_path,
+        _target_path: target_path,
+        _error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+}
+
+function rewrite_starter_public_reference(value: string, app_id: string): string {
+  for (const folder of STARTER_PUBLIC_FOLDERS) {
+    if (value.startsWith(`${folder}/`)) {
+      return `/public/${app_id}/${value}`;
+    }
+  }
+
+  return value;
+}
+
+function rewrite_starter_public_references(value: unknown, app_id: string): unknown {
+  if (typeof value === "string") {
+    return rewrite_starter_public_reference(value, app_id);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => rewrite_starter_public_references(item, app_id));
+  }
+
+  if (_xu.is_plain_object(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[key] = rewrite_starter_public_references(item, app_id);
+    }
+
+    return out;
+  }
+
+  return value;
+}
+
+function rewrite_json_files_in_dir(dir: string, app_id: string): void {
+  if (!fs.existsSync(dir)) {
+    return;
+  }
+
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const file_path = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      rewrite_json_files_in_dir(file_path, app_id);
+      continue;
+    }
+
+    if (!entry.isFile() || !entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file_path, "utf-8"));
+      const rewritten = rewrite_starter_public_references(parsed, app_id);
+      fs.writeFileSync(file_path, `${JSON.stringify(rewritten, null, 2)}\n`, "utf-8");
+    } catch (error) {
+      throw_explicit_error(XVIBE_STARTER_COPY_FAILED, "Failed to rewrite starter JSON public references", {
+        _app_id: app_id,
+        _path: file_path,
+        _error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 }
 
 function read_json_object_file(file_path: string, code: string, message: string): XVibeJsonObject {
@@ -2926,9 +4079,469 @@ function find_view_node_by_id(current_view: unknown, target_id: string | undefin
     .find((node) => node._id === target_id);
 }
 
-function find_view_nodes_by_exact_text(current_view: unknown, target_text: string): XVibeJsonObject[] {
-  return collect_view_nodes(current_view)
-    .filter((node) => node._text === target_text);
+type XVibeViewTargetResolutionStrategy =
+  | "id"
+  | "root"
+  | "text"
+  | "normalized_id"
+  | "normalized_text"
+  | "text_type_id";
+
+type XVibeViewTargetLocation = {
+  object: XVibeJsonObject;
+  parent?: XVibeJsonObject;
+  index?: number;
+  path: string[];
+};
+
+type XVibeViewTargetResolution =
+  | (XVibeViewTargetLocation & {
+    _ok: true;
+    resolution_strategy: XVibeViewTargetResolutionStrategy;
+    _resolved_target_id?: string;
+    _resolved_target_path: string[];
+  })
+  | {
+    _ok: false;
+    _reason: string;
+    _details?: unknown;
+  };
+
+function view_target_path_segment(node: XVibeJsonObject, index?: number): string {
+  const id =
+    typeof node._id === "string" && node._id.trim()
+      ? node._id.trim()
+      : "";
+  if (id) return id;
+  return typeof index === "number" ? String(index) : "$root";
+}
+
+function collect_view_target_locations(current_view: unknown): XVibeViewTargetLocation[] {
+  if (!_xu.is_plain_object(current_view)) return [];
+
+  const locations: XVibeViewTargetLocation[] = [];
+  const visit = (
+    node: XVibeJsonObject,
+    path: string[],
+    parent?: XVibeJsonObject,
+    index?: number,
+  ) => {
+    locations.push({
+      object: node,
+      ...(parent ? { parent } : {}),
+      ...(typeof index === "number" ? { index } : {}),
+      path,
+    });
+
+    if (!Array.isArray(node._children)) return;
+    for (let child_index = 0; child_index < node._children.length; child_index += 1) {
+      const child = node._children[child_index];
+      if (!_xu.is_plain_object(child)) continue;
+      visit(
+        child,
+        [...path, view_target_path_segment(child, child_index)],
+        node,
+        child_index,
+      );
+    }
+  };
+
+  visit(
+    current_view,
+    [view_target_path_segment(current_view)],
+  );
+
+  return locations;
+}
+
+function resolve_add_child_target_id(input: {
+  _current_view: unknown;
+  _view_id?: string;
+  _target_id?: string;
+}): string | undefined {
+  const target_id =
+    typeof input._target_id === "string" ? input._target_id.trim() : "";
+  if (!target_id) return undefined;
+
+  if (
+    _xu.is_plain_object(input._current_view) &&
+    Array.isArray(input._current_view._children)
+  ) {
+    const root_id =
+      typeof input._current_view._id === "string"
+        ? input._current_view._id.trim()
+        : "";
+    const view_id =
+      typeof input._view_id === "string" ? input._view_id.trim() : "";
+
+    if (
+      target_id === root_id ||
+      (view_id && target_id === view_id) ||
+      target_id === "main"
+    ) {
+      return root_id || view_id || target_id;
+    }
+  }
+
+  return target_id;
+}
+
+const XVIBE_VIEW_TARGET_TEXT_IGNORED_WORDS = new Set([
+  "button",
+  "buttons",
+  "label",
+  "labels",
+  "object",
+  "objects",
+]);
+
+function view_node_visible_target_values(
+  node: XVibeJsonObject,
+  options?: { _include_id?: boolean },
+): string[] {
+  const values = [
+    ...(options?._include_id === true ? [node._id] : []),
+    node._text,
+    node.text,
+    node.label,
+    node.title,
+    node._label,
+    node._title,
+  ];
+
+  return values
+    .filter((value): value is string =>
+      typeof value === "string" && value.trim().length > 0
+    );
+}
+
+function normalized_visible_target_text(value: unknown): string {
+  if (typeof value !== "string") return "";
+
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+    .trim()
+    .split(/\s+/gu)
+    .filter((part) => part.length > 0 && !XVIBE_VIEW_TARGET_TEXT_IGNORED_WORDS.has(part))
+    .join(" ");
+}
+
+function normalized_view_target_type(value: unknown): string {
+  return typeof value === "string"
+    ? value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gu, "")
+    : "";
+}
+
+function view_target_type_aliases(value: unknown): Set<string> {
+  const target_type =
+    normalized_view_target_type(value);
+  if (!target_type) return new Set();
+
+  if (target_type === "button" || target_type === "xbutton") {
+    return new Set(["button", "xbutton"]);
+  }
+  if (
+    target_type === "label" ||
+    target_type === "xlabel" ||
+    target_type === "text" ||
+    target_type === "textlabel" ||
+    target_type === "title" ||
+    target_type === "heading"
+  ) {
+    return new Set(["label", "xlabel", "text", "textlabel", "title", "heading"]);
+  }
+
+  return new Set([
+    target_type,
+    target_type.startsWith("x") ? target_type.slice(1) : `x${target_type}`,
+  ].filter((item) => item.length > 0));
+}
+
+function view_node_matches_target_type(node: XVibeJsonObject, target_type: string | undefined): boolean {
+  const aliases =
+    view_target_type_aliases(target_type);
+  if (aliases.size === 0) return true;
+
+  const node_type =
+    normalized_view_target_type(node._type);
+  return Boolean(node_type) && aliases.has(node_type);
+}
+
+function deterministic_target_type_is_view(value: unknown): boolean {
+  const target_type =
+    normalized_view_target_type(value);
+  return (
+    target_type === "view" ||
+    target_type === "xview" ||
+    target_type === "rootview" ||
+    target_type === "currentview"
+  );
+}
+
+function deterministic_property_target_is_label_or_title(node: XVibeJsonObject): boolean {
+  const node_type =
+    normalized_view_target_type(node._type);
+  return (
+    node_type === "label" ||
+    node_type === "xlabel" ||
+    node_type === "text" ||
+    node_type === "textlabel" ||
+    node_type === "title" ||
+    node_type === "heading" ||
+    typeof node._text === "string"
+  );
+}
+
+function deterministic_normalize_property_name_for_target(
+  node: XVibeJsonObject,
+  property_name: string,
+): string {
+  if (property_name === "title" && deterministic_property_target_is_label_or_title(node)) {
+    return "_text";
+  }
+
+  return property_name;
+}
+
+function filter_view_target_nodes_by_type(
+  nodes: XVibeJsonObject[],
+  target_type: string | undefined,
+): XVibeJsonObject[] {
+  const aliases =
+    view_target_type_aliases(target_type);
+  if (aliases.size === 0) return nodes;
+
+  return nodes.filter((node) => view_node_matches_target_type(node, target_type));
+}
+
+function filter_view_target_locations_by_type(
+  locations: XVibeViewTargetLocation[],
+  target_type: string | undefined,
+): XVibeViewTargetLocation[] {
+  const aliases =
+    view_target_type_aliases(target_type);
+  if (aliases.size === 0) return locations;
+
+  return locations.filter((location) =>
+    view_node_matches_target_type(location.object, target_type)
+  );
+}
+
+function view_target_locations_for_details(
+  locations: XVibeViewTargetLocation[],
+): string[] {
+  return view_target_ids_for_details(locations.map((location) => location.object));
+}
+
+function view_target_identity_resolution(
+  location: XVibeViewTargetLocation,
+  strategy: XVibeViewTargetResolutionStrategy,
+): XVibeViewTargetResolution {
+  const resolved_target_id =
+    typeof location.object._id === "string" && location.object._id.trim()
+      ? location.object._id.trim()
+      : undefined;
+  const resolved_target_path =
+    location.path.length > 0 ? location.path : undefined;
+
+  if (!resolved_target_id && !resolved_target_path) {
+    return {
+      _ok: false,
+      _reason: "target_missing_identity",
+      _details: {
+        _path: location.path,
+      },
+    };
+  }
+
+  return {
+    _ok: true,
+    object: location.object,
+    ...(location.parent ? { parent: location.parent } : {}),
+    ...(typeof location.index === "number" ? { index: location.index } : {}),
+    path: location.path,
+    ...(resolved_target_id ? { _resolved_target_id: resolved_target_id } : {}),
+    _resolved_target_path: resolved_target_path ?? location.path,
+    resolution_strategy: strategy,
+  };
+}
+
+function resolve_unique_view_target_location(input: {
+  _locations: XVibeViewTargetLocation[];
+  _strategy: XVibeViewTargetResolutionStrategy;
+  _target_value: string;
+  _target_type?: string;
+  _ambiguous_reason: string;
+  _not_found_reason: string;
+  _details?: XVibeJsonObject;
+}): XVibeViewTargetResolution {
+  if (input._locations.length > 1) {
+    return {
+      _ok: false,
+      _reason: input._ambiguous_reason,
+      _details: {
+        _target_text: input._target_value,
+        ...(input._target_type ? { _target_type: input._target_type } : {}),
+        _match_count: input._locations.length,
+        _target_ids: view_target_locations_for_details(input._locations),
+        ...(input._details ?? {}),
+      },
+    };
+  }
+
+  const location = input._locations[0];
+  if (!location) {
+    return {
+      _ok: false,
+      _reason: input._not_found_reason,
+      _details: {
+        _target_text: input._target_value,
+        ...(input._target_type ? { _target_type: input._target_type } : {}),
+        ...(input._details ?? {}),
+      },
+    };
+  }
+
+  return view_target_identity_resolution(location, input._strategy);
+}
+
+function deterministic_move_object_position(
+  resolved_task: XVibeResolvedTask,
+): XVibeMoveObjectPosition | undefined {
+  const structured_position =
+    (resolved_task as XVibeJsonObject)._edit_position;
+  if (
+    structured_position === "append" ||
+    structured_position === "prepend" ||
+    structured_position === "before" ||
+    structured_position === "after"
+  ) {
+    return structured_position;
+  }
+
+  if (resolved_task._edit_move_position === "before") return "before";
+  if (resolved_task._edit_move_position === "after") return "after";
+  if (resolved_task._edit_move_position === "top") return "prepend";
+  if (resolved_task._edit_move_position === "bottom") return "append";
+  return undefined;
+}
+
+function deterministic_legacy_move_position(
+  resolved_task: XVibeResolvedTask,
+): "before" | "after" | "top" | "bottom" | undefined {
+  return resolved_task._edit_move_position;
+}
+
+function deterministic_move_destination_fields(input: {
+  _resolved_task: XVibeResolvedTask;
+  _position: XVibeMoveObjectPosition;
+}): {
+  _target_id?: string;
+  _target_text?: string;
+  _target_type?: string;
+  _legacy_anchor: boolean;
+} {
+  const task = input._resolved_task as XVibeJsonObject;
+  const destination_id =
+    typeof task._edit_destination_id === "string"
+      ? task._edit_destination_id
+      : undefined;
+  const destination_text =
+    typeof task._edit_destination_text === "string"
+      ? task._edit_destination_text
+      : undefined;
+  const destination_type =
+    typeof task._edit_destination_type === "string"
+      ? task._edit_destination_type
+      : undefined;
+
+  if (destination_id || destination_text || destination_type) {
+    return {
+      ...(destination_id ? { _target_id: destination_id } : {}),
+      ...(destination_text ? { _target_text: destination_text } : {}),
+      ...(destination_type ? { _target_type: destination_type } : {}),
+      _legacy_anchor: false,
+    };
+  }
+
+  if (input._position === "before" || input._position === "after") {
+    return {
+      ...(input._resolved_task._edit_anchor_id
+        ? { _target_id: input._resolved_task._edit_anchor_id }
+        : {}),
+      ...(input._resolved_task._edit_anchor_text
+        ? { _target_text: input._resolved_task._edit_anchor_text }
+        : {}),
+      ...(input._resolved_task._edit_anchor_type
+        ? { _target_type: input._resolved_task._edit_anchor_type }
+        : {}),
+      _legacy_anchor: true,
+    };
+  }
+
+  return { _legacy_anchor: true };
+}
+
+function deterministic_move_missing_destination_reason(legacy_anchor: boolean): string {
+  return legacy_anchor ? "anchor_not_found" : "destination_not_found";
+}
+
+function deterministic_move_resolution_failure(input: {
+  _resolution: Extract<XVibeViewTargetResolution, { _ok: false }>;
+  _legacy_anchor: boolean;
+}): { _reason: string; _details?: unknown } {
+  if (
+    input._resolution._reason === "ambiguous_text_target" ||
+    input._resolution._reason === "ambiguous_normalized_text_target"
+  ) {
+    return {
+      _reason: input._resolution._reason,
+      ...(input._resolution._details !== undefined
+        ? { _details: input._resolution._details }
+        : {}),
+    };
+  }
+
+  return {
+    _reason: deterministic_move_missing_destination_reason(input._legacy_anchor),
+    ...(input._resolution._details !== undefined
+      ? { _details: input._resolution._details }
+      : {}),
+  };
+}
+
+function view_node_contains_node(
+  parent: XVibeJsonObject,
+  candidate: XVibeJsonObject,
+): boolean {
+  if (parent === candidate) return true;
+  if (!Array.isArray(parent._children)) return false;
+
+  for (const child of parent._children) {
+    if (!_xu.is_plain_object(child)) continue;
+    if (view_node_contains_node(child, candidate)) return true;
+  }
+
+  return false;
+}
+
+function find_view_nodes_by_exact_text(
+  current_view: unknown,
+  target_text: string,
+  target_type?: string,
+  options?: { _include_id?: boolean },
+): XVibeJsonObject[] {
+  const matches =
+    collect_view_nodes(current_view)
+      .filter((node) =>
+        view_node_visible_target_values(node, options).some((value) => value === target_text)
+      );
+
+  return filter_view_target_nodes_by_type(matches, target_type);
 }
 
 function normalized_deterministic_target_text(value: unknown): string {
@@ -2941,15 +4554,30 @@ function normalized_deterministic_target_text(value: unknown): string {
     .replace(/\s+/g, " ");
 }
 
-function find_view_nodes_by_normalized_text(current_view: unknown, target_text: string): XVibeJsonObject[] {
+function find_view_nodes_by_normalized_text(
+  current_view: unknown,
+  target_text: string,
+  target_type?: string,
+  options?: { _include_id?: boolean },
+): XVibeJsonObject[] {
   const normalized_target_text =
-    normalized_deterministic_target_text(target_text);
+    normalized_visible_target_text(target_text);
   if (!normalized_target_text) return [];
 
-  return collect_view_nodes(current_view)
-    .filter((node) =>
-      normalized_deterministic_target_text(node._text) === normalized_target_text
-    );
+  const matches =
+    collect_view_nodes(current_view)
+      .filter((node) =>
+        view_node_visible_target_values(node, options)
+          .some((value) => normalized_visible_target_text(value) === normalized_target_text)
+      );
+
+  return filter_view_target_nodes_by_type(matches, target_type);
+}
+
+function view_target_ids_for_details(nodes: XVibeJsonObject[]): string[] {
+  return nodes
+    .map((node) => typeof node._id === "string" ? node._id : undefined)
+    .filter((id): id is string => Boolean(id));
 }
 
 function deterministic_text_type_target_id(input: {
@@ -2975,6 +4603,151 @@ function deterministic_text_type_target_id(input: {
   if (!text_id || !type_id) return undefined;
 
   return `${text_id}-${type_id}`;
+}
+
+function resolve_deterministic_view_edit_text_target(input: {
+  _current_view: unknown;
+  _target_text: string;
+  _target_type?: string;
+  _include_id?: boolean;
+}): (
+  | {
+    _ok: true;
+    _target_id: string;
+    _target_node: XVibeJsonObject;
+    _resolved_by: "text" | "normalized_text" | "text_type_id";
+    _reason: "eligible_text_match" | "eligible_normalized_text_match" | "eligible_id_from_text_type";
+  }
+  | {
+    _ok: false;
+    _reason: string;
+    _details?: unknown;
+  }
+) {
+  const target_text =
+    typeof input._target_text === "string"
+      ? input._target_text
+      : "";
+  if (!target_text) {
+    return { _ok: false, _reason: "missing_target_id" };
+  }
+
+  const text_matches =
+    find_view_nodes_by_exact_text(
+      input._current_view,
+      target_text,
+      input._target_type,
+      { _include_id: input._include_id === true },
+    );
+  if (text_matches.length > 1) {
+    return {
+      _ok: false,
+      _reason: "ambiguous_text_target",
+      _details: {
+        _target_text: target_text,
+        ...(input._target_type ? { _target_type: input._target_type } : {}),
+        _match_count: text_matches.length,
+        _target_ids: view_target_ids_for_details(text_matches),
+      },
+    };
+  }
+
+  const normalized_text_matches =
+    find_view_nodes_by_normalized_text(
+      input._current_view,
+      target_text,
+      input._target_type,
+      { _include_id: input._include_id === true },
+    );
+  if (normalized_text_matches.length > 1) {
+    return {
+      _ok: false,
+      _reason: "ambiguous_normalized_text_target",
+      _details: {
+        _target_text: target_text,
+        _normalized_text: normalized_visible_target_text(target_text),
+        ...(input._target_type ? { _target_type: input._target_type } : {}),
+        _match_count: normalized_text_matches.length,
+        _target_ids: view_target_ids_for_details(normalized_text_matches),
+      },
+    };
+  }
+
+  let resolved_node = text_matches[0];
+  let resolved_by: "text" | "normalized_text" | "text_type_id" = "text";
+  let resolved_reason: "eligible_text_match" | "eligible_normalized_text_match" | "eligible_id_from_text_type" =
+    "eligible_text_match";
+
+  if (!resolved_node && normalized_text_matches.length === 1) {
+    resolved_node = normalized_text_matches[0];
+    resolved_by = "normalized_text";
+    resolved_reason = "eligible_normalized_text_match";
+  }
+
+  if (!resolved_node) {
+    const text_type_target_id =
+      deterministic_text_type_target_id({
+        _target_text: target_text,
+        _target_type: input._target_type,
+      });
+    const text_type_target_node =
+      find_view_node_by_id(input._current_view, text_type_target_id);
+    if (
+      text_type_target_node &&
+      view_node_matches_target_type(text_type_target_node, input._target_type)
+    ) {
+      resolved_node = text_type_target_node;
+      resolved_by = "text_type_id";
+      resolved_reason = "eligible_id_from_text_type";
+    }
+  }
+
+  if (!resolved_node) {
+    return {
+      _ok: false,
+      _reason: "text_target_not_found",
+      _details: {
+        _target_text: target_text,
+        ...(input._target_type ? { _target_type: input._target_type } : {}),
+      },
+    };
+  }
+
+  const resolved_id =
+    typeof resolved_node._id === "string"
+      ? resolved_node._id.trim()
+      : "";
+  if (!resolved_id) {
+    return { _ok: false, _reason: "missing_target_id" };
+  }
+
+  if (!_xu.is_plain_object(resolved_node)) {
+    return {
+      _ok: false,
+      _reason: "target_not_object",
+      _details: {
+        _target_text: target_text,
+      },
+    };
+  }
+
+  if (resolved_node === input._current_view) {
+    return {
+      _ok: false,
+      _reason: "target_is_root",
+      _details: {
+        _target_id: resolved_id,
+      },
+    };
+  }
+
+  return {
+    _ok: true,
+    _target_id: resolved_id,
+    _target_node: resolved_node,
+    _resolved_by: resolved_by,
+    _reason: resolved_reason,
+  };
 }
 
 function find_view_node_location_by_id(
@@ -3046,6 +4819,268 @@ function clone_deterministic_view_json(value: unknown): unknown {
   }
 
   return clone;
+}
+
+type XVibeProjectViewIdAddition = {
+  _path: string;
+  _type: string;
+  _id: string;
+  _base_id: string;
+  _collision_resolved: boolean;
+};
+
+type XVibeProjectViewFixViewReport = {
+  _view_id: string;
+  _objects_scanned: number;
+  _ids_added: number;
+  _collisions_resolved: number;
+  _updated: boolean;
+  _added_ids: XVibeProjectViewIdAddition[];
+};
+
+type XVibeProjectViewFixReport = {
+  _app_id: string;
+  _env: string;
+  _dry_run: boolean;
+  _views_scanned: number;
+  _views_updated: number;
+  _objects_scanned: number;
+  _ids_added: number;
+  _collisions_resolved: number;
+  _views: XVibeProjectViewFixViewReport[];
+};
+
+function project_view_integrity_string(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function project_view_integrity_slug(value: unknown): string {
+  return typeof value === "string"
+    ? value
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]+/gu, " ")
+      .trim()
+      .split(/\s+/gu)
+      .filter((part) => part.length > 0)
+      .join("-")
+    : "";
+}
+
+function project_view_integrity_type_slug(type: unknown): string {
+  const slug = project_view_integrity_slug(type);
+  return slug || "object";
+}
+
+function project_view_integrity_visible_text(node: XVibeJsonObject): string | undefined {
+  return (
+    project_view_integrity_string(node._text) ??
+    project_view_integrity_string(node.text) ??
+    project_view_integrity_string(node.label) ??
+    project_view_integrity_string(node.title) ??
+    project_view_integrity_string(node._label) ??
+    project_view_integrity_string(node._title)
+  );
+}
+
+function project_view_integrity_id_base(node: XVibeJsonObject): {
+  _base: string;
+  _start_index?: number;
+} {
+  const type_slug =
+    project_view_integrity_type_slug(node._type);
+  const visible_slug =
+    project_view_integrity_slug(project_view_integrity_visible_text(node));
+
+  if (!visible_slug) {
+    return {
+      _base: type_slug,
+      _start_index: 1,
+    };
+  }
+
+  if (
+    type_slug === "label" ||
+    type_slug === "text" ||
+    type_slug === "text-label" ||
+    type_slug === "xlabel"
+  ) {
+    return { _base: visible_slug };
+  }
+
+  if (visible_slug === type_slug || visible_slug.endsWith(`-${type_slug}`)) {
+    return { _base: visible_slug };
+  }
+
+  return {
+    _base: `${visible_slug}-${type_slug}`,
+  };
+}
+
+function project_view_integrity_unique_id(input: {
+  _base: string;
+  _start_index?: number;
+  _used_ids: Set<string>;
+}): {
+  _id: string;
+  _collision_resolved: boolean;
+} {
+  const start_index = input._start_index;
+  if (typeof start_index === "number") {
+    for (let index = start_index; ; index += 1) {
+      const candidate = `${input._base}-${index}`;
+      if (!input._used_ids.has(candidate)) {
+        input._used_ids.add(candidate);
+        return {
+          _id: candidate,
+          _collision_resolved: index !== start_index,
+        };
+      }
+    }
+  }
+
+  if (!input._used_ids.has(input._base)) {
+    input._used_ids.add(input._base);
+    return {
+      _id: input._base,
+      _collision_resolved: false,
+    };
+  }
+
+  for (let index = 2; ; index += 1) {
+    const candidate = `${input._base}-${index}`;
+    if (!input._used_ids.has(candidate)) {
+      input._used_ids.add(candidate);
+      return {
+        _id: candidate,
+        _collision_resolved: true,
+      };
+    }
+  }
+}
+
+function project_view_integrity_visit_nodes(
+  value: unknown,
+  visitor: (node: XVibeJsonObject, path: string) => void,
+  path_value = "$",
+): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      project_view_integrity_visit_nodes(item, visitor, `${path_value}[${index}]`)
+    );
+    return;
+  }
+
+  if (!_xu.is_plain_object(value)) {
+    return;
+  }
+
+  if (project_view_integrity_string(value._type)) {
+    visitor(value, path_value);
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "_id") continue;
+    if (Array.isArray(child) || _xu.is_plain_object(child)) {
+      project_view_integrity_visit_nodes(child, visitor, `${path_value}.${key}`);
+    }
+  }
+}
+
+function project_view_integrity_existing_ids(view: unknown): Set<string> {
+  const ids = new Set<string>();
+  project_view_integrity_visit_nodes(view, (node) => {
+    const id =
+      project_view_integrity_string(node._id);
+    if (id) ids.add(id);
+  });
+  return ids;
+}
+
+function fix_project_view_ids_for_view(input: {
+  _view_id: string;
+  _view: XVibeJsonObject;
+}): XVibeProjectViewFixViewReport {
+  const used_ids =
+    project_view_integrity_existing_ids(input._view);
+  const report: XVibeProjectViewFixViewReport = {
+    _view_id: input._view_id,
+    _objects_scanned: 0,
+    _ids_added: 0,
+    _collisions_resolved: 0,
+    _updated: false,
+    _added_ids: [],
+  };
+
+  project_view_integrity_visit_nodes(input._view, (node, node_path) => {
+    report._objects_scanned += 1;
+
+    const existing_id =
+      project_view_integrity_string(node._id);
+    if (existing_id) {
+      return;
+    }
+
+    const type =
+      project_view_integrity_string(node._type) ?? "object";
+    const id_base =
+      project_view_integrity_id_base(node);
+    const generated =
+      project_view_integrity_unique_id({
+        _base: id_base._base,
+        ...(typeof id_base._start_index === "number"
+          ? { _start_index: id_base._start_index }
+          : {}),
+        _used_ids: used_ids,
+      });
+
+    node._id = generated._id;
+    report._ids_added += 1;
+    report._updated = true;
+    if (generated._collision_resolved) {
+      report._collisions_resolved += 1;
+    }
+    report._added_ids.push({
+      _path: node_path,
+      _type: type,
+      _id: generated._id,
+      _base_id: id_base._base,
+      _collision_resolved: generated._collision_resolved,
+    });
+  });
+
+  return report;
+}
+
+function extract_project_view_list_ids(response: unknown): string[] {
+  if (!_xu.is_plain_object(response) || !_xu.is_plain_object(response._result)) {
+    return [];
+  }
+
+  const views =
+    Array.isArray(response._result._views)
+      ? response._result._views
+      : [];
+  return views
+    .map((view) =>
+      _xu.is_plain_object(view)
+        ? project_view_integrity_string(view._id)
+        : undefined
+    )
+    .filter((id): id is string => Boolean(id));
+}
+
+function extract_project_view_from_response(response: unknown): XVibeJsonObject | undefined {
+  if (
+    _xu.is_plain_object(response) &&
+    _xu.is_plain_object(response._result) &&
+    _xu.is_plain_object(response._result._view)
+  ) {
+    return response._result._view as XVibeJsonObject;
+  }
+
+  return undefined;
 }
 
 function deterministic_duplicate_id_base(value: unknown, fallback_type: unknown): string {
@@ -3185,6 +5220,143 @@ function normalize_added_child_ids(input: {
   return child;
 }
 
+function existing_identical_child_by_id(input: {
+  _parent: XVibeJsonObject;
+  _child: XVibeJsonObject;
+}): XVibeJsonObject | undefined {
+  const child_id =
+    typeof input._child._id === "string" && input._child._id.trim()
+      ? input._child._id.trim()
+      : "";
+  if (!child_id || !Array.isArray(input._parent._children)) {
+    return undefined;
+  }
+
+  return input._parent._children.find((candidate) =>
+    _xu.is_plain_object(candidate) &&
+    candidate._id === child_id &&
+    JSON.stringify(candidate) === JSON.stringify(input._child)
+  ) as XVibeJsonObject | undefined;
+}
+
+function normalize_add_child_location(value: unknown): "top" | "bottom" {
+  if (typeof value !== "string") return "bottom";
+  const normalized = value.trim().toLowerCase().replace(/\s+/gu, " ");
+  if (
+    normalized === "header" ||
+    normalized === "top" ||
+    normalized === "toolbar"
+  ) {
+    return "top";
+  }
+
+  return "bottom";
+}
+
+function normalize_create_toolbar_location(value: unknown): XVibeCreateToolbarLocation {
+  if (typeof value !== "string") return "top";
+  const normalized =
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/gu, "-")
+      .replace(/-+/gu, "-");
+  if (normalized === "bottom" || normalized === "footer") return "bottom";
+  if (normalized === "before" || normalized === "above") return "before";
+  if (normalized === "after" || normalized === "below") return "after";
+  return "top";
+}
+
+function add_child_location_label(value: unknown): "Header" | "Footer" {
+  return normalize_add_child_location(value) === "top" ? "Header" : "Footer";
+}
+
+function synthesized_add_child_text(props: unknown, label: "Header" | "Footer"): string {
+  if (_xu.is_plain_object(props)) {
+    const text =
+      typeof props._text === "string" ? props._text.trim() : "";
+    if (text) return text;
+  }
+
+  return `New ${label} Label`;
+}
+
+function synthesized_add_child_class(props: unknown, label: "Header" | "Footer"): string {
+  if (_xu.is_plain_object(props)) {
+    const class_name =
+      typeof props.class === "string" ? props.class.trim() : "";
+    if (class_name) return class_name;
+  }
+
+  const location_class = label.toLowerCase();
+  return `xvibe-generated-label xvibe-${location_class}-label`;
+}
+
+function synthesized_add_child(input: {
+  _child?: unknown;
+  _component_type?: unknown;
+  _location?: unknown;
+  _props?: unknown;
+}): XVibeJsonObject | undefined {
+  if (_xu.is_plain_object(input._child)) {
+    return input._child;
+  }
+
+  const component_type =
+    typeof input._component_type === "string" && input._component_type.trim()
+      ? input._component_type.trim()
+      : "label";
+  if (component_type !== "label") return undefined;
+
+  const location_label = add_child_location_label(input._location);
+  return {
+    _type: "label",
+    _text: synthesized_add_child_text(input._props, location_label),
+    class: synthesized_add_child_class(input._props, location_label),
+  };
+}
+
+function deterministic_toolbar_id_base(view_id: unknown): string {
+  const normalized =
+    typeof view_id === "string"
+      ? view_id
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/gu, "-")
+        .replace(/-+/gu, "-")
+        .replace(/^-|-$/gu, "")
+      : "";
+  return `${normalized || "main"}-toolbar`;
+}
+
+function deterministic_toolbar_props(value: unknown): XVibeJsonObject {
+  return _xu.is_plain_object(value)
+    ? clone_deterministic_view_json(value) as XVibeJsonObject
+    : {};
+}
+
+function synthesized_create_toolbar(input: {
+  _view_id?: unknown;
+  _toolbar_props?: unknown;
+}): XVibeJsonObject {
+  const props =
+    deterministic_toolbar_props(input._toolbar_props);
+  const toolbar_id =
+    typeof props._id === "string" && props._id.trim()
+      ? props._id.trim()
+      : deterministic_toolbar_id_base(input._view_id);
+  return {
+    ...props,
+    _type: "toolbar",
+    _id: toolbar_id,
+  };
+}
+
+function find_existing_toolbar_node(current_view: unknown): XVibeJsonObject | undefined {
+  return collect_view_nodes(current_view)
+    .find((node) => node._type === "toolbar");
+}
+
 function xvibe_style_has_display_none(style: unknown): boolean {
   return (
     typeof style === "string" &&
@@ -3312,6 +5484,60 @@ function deterministic_style_object(value: unknown): XVibeJsonObject {
 
 function deterministic_style_is_empty(value: XVibeJsonObject): boolean {
   return Object.keys(value).length === 0;
+}
+
+const XVIBE_DETERMINISTIC_STYLE_PROPERTY_ALIASES: Record<string, string> = {
+  fontSize: "font-size",
+  fontWeight: "font-weight",
+  marginBottom: "margin-bottom",
+  backgroundColor: "background-color",
+};
+
+function deterministic_normalize_style_property_name(value: string): string {
+  const trimmed = value.trim();
+  return XVIBE_DETERMINISTIC_STYLE_PROPERTY_ALIASES[trimmed] ?? trimmed;
+}
+
+function deterministic_normalize_set_styles(value: unknown):
+  | { _ok: true; _styles: XVibeJsonObject }
+  | { _ok: false; _reason: string; _details?: XVibeJsonObject } {
+  if (!_xu.is_plain_object(value)) {
+    return { _ok: false, _reason: "invalid_styles" };
+  }
+
+  const entries = Object.entries(value);
+  if (entries.length === 0) {
+    return { _ok: false, _reason: "missing_styles" };
+  }
+
+  const styles: XVibeJsonObject = {};
+  for (const [raw_property, raw_value] of entries) {
+    const style_property =
+      deterministic_normalize_style_property_name(raw_property);
+    if (!style_property) {
+      return {
+        _ok: false,
+        _reason: "missing_style_property",
+        _details: {
+          _style_property: raw_property,
+        },
+      };
+    }
+
+    if (typeof raw_value !== "string" || raw_value.trim().length === 0) {
+      return {
+        _ok: false,
+        _reason: "invalid_style_value",
+        _details: {
+          _style_property: style_property,
+        },
+      };
+    }
+
+    styles[style_property] = raw_value.trim();
+  }
+
+  return { _ok: true, _styles: styles };
 }
 
 function deterministic_is_primitive_or_null(value: unknown): boolean {
@@ -3602,7 +5828,9 @@ function deterministic_set_property_eligibility(input: {
   }
 
   const next_value = input._next_value;
-  const is_json_field = json_field_keys.has(property_name);
+  const is_json_field =
+    json_field_keys.has(property_name) ||
+    XVIBE_DETERMINISTIC_BUILTIN_JSON_PROPERTY_NAMES.has(property_name);
   const next_is_object_or_array =
     typeof next_value === "object" && next_value !== null;
 
@@ -3665,7 +5893,11 @@ function find_first_inline_style_sheet_node(current_view: unknown): XVibeJsonObj
 function deterministic_mutation_allows_inline_style(
   mutation: XVibeDeterministicViewEditResult["_mutation"] | undefined,
 ): boolean {
-  return mutation?._action === "set-style" || mutation?._action === "remove-style";
+  return (
+    mutation?._action === "set-style" ||
+    mutation?._action === "set-styles" ||
+    mutation?._action === "remove-style"
+  );
 }
 
 function deterministic_target_text_is_id_phrase(value: unknown): boolean {
@@ -3705,6 +5937,8 @@ function resolve_deterministic_view_edit_target(input: {
   _target_id?: string;
   _target_text?: string;
   _target_type?: string;
+  _target_id_text_fallback?: boolean;
+  _allow_root?: boolean;
 }): (
   | {
     _ok: true;
@@ -3719,163 +5953,86 @@ function resolve_deterministic_view_edit_target(input: {
     _details?: unknown;
   }
 ) {
-  const target_id =
-    typeof input._target_id === "string"
-      ? input._target_id.trim()
-      : "";
-
-  if (target_id) {
-    const target_node = find_view_node_by_id(input._current_view, target_id);
-    if (!target_node) {
+  const resolution =
+    resolveViewTarget(input._current_view, {
+      _target_id: input._target_id,
+      _target_text: input._target_text,
+      _target_type: input._target_type,
+      _include_id:
+        typeof input._target_id === "string" &&
+        input._target_id.trim().length > 0 &&
+        input._target_id_text_fallback === true,
+      _target_id_text_fallback: input._target_id_text_fallback,
+      _allow_root: input._allow_root,
+    });
+  if (!resolution._ok) {
+    const requested_target_id =
+      typeof input._target_id === "string" ? input._target_id.trim() : "";
+    if (requested_target_id && resolution._reason === "text_target_not_found") {
       return {
         _ok: false,
         _reason: "target_not_found",
         _details: {
-          _target_id: target_id,
-        },
-      };
-    }
-
-    if (!_xu.is_plain_object(target_node)) {
-      return {
-        _ok: false,
-        _reason: "target_not_object",
-        _details: {
-          _target_id: target_id,
-        },
-      };
-    }
-
-    if (target_node === input._current_view) {
-      return {
-        _ok: false,
-        _reason: "target_is_root",
-        _details: {
-          _target_id: target_id,
+          _target_id: requested_target_id,
         },
       };
     }
 
     return {
-      _ok: true,
-      _target_id: target_id,
-      _target_node: target_node,
-      _resolved_by: "id",
-      _reason: "eligible",
+      _ok: false,
+      _reason: resolution._reason,
+      ...(resolution._details !== undefined
+        ? { _details: resolution._details }
+        : {}),
     };
   }
 
-  const target_text =
-    typeof input._target_text === "string"
-      ? input._target_text
+  const target_id =
+    typeof resolution.object._id === "string"
+      ? resolution.object._id.trim()
       : "";
-  if (!target_text) {
+  if (!target_id) {
     return { _ok: false, _reason: "missing_target_id" };
   }
 
-  const text_matches =
-    find_view_nodes_by_exact_text(input._current_view, target_text);
-  if (text_matches.length > 1) {
-    return {
-      _ok: false,
-      _reason: "ambiguous_text_target",
-      _details: {
-        _target_text: target_text,
-        _match_count: text_matches.length,
-        _target_ids: text_matches
-          .map((node) => typeof node._id === "string" ? node._id : undefined)
-          .filter((id): id is string => Boolean(id)),
-      },
-    };
-  }
+  const resolved_by =
+    resolution.resolution_strategy === "text"
+      ? "text"
+      : resolution.resolution_strategy === "text_type_id"
+        ? "text_type_id"
+        : resolution.resolution_strategy === "normalized_text" ||
+          resolution.resolution_strategy === "normalized_id"
+          ? "normalized_text"
+          : "id";
+  const reason =
+    resolved_by === "text"
+      ? "eligible_text_match"
+      : resolved_by === "text_type_id"
+        ? "eligible_id_from_text_type"
+        : resolved_by === "normalized_text"
+          ? "eligible_normalized_text_match"
+          : "eligible";
 
-  const normalized_text_matches =
-    find_view_nodes_by_normalized_text(input._current_view, target_text);
-  if (normalized_text_matches.length > 1) {
-    return {
-      _ok: false,
-      _reason: "ambiguous_normalized_text_target",
-      _details: {
-        _target_text: target_text,
-        _normalized_text: normalized_deterministic_target_text(target_text),
-        _match_count: normalized_text_matches.length,
-        _target_ids: normalized_text_matches
-          .map((node) => typeof node._id === "string" ? node._id : undefined)
-          .filter((id): id is string => Boolean(id)),
-      },
-    };
-  }
-
-  let resolved_node = text_matches[0];
-  let resolved_by: "text" | "normalized_text" | "text_type_id" = "text";
-  let resolved_reason: "eligible_text_match" | "eligible_normalized_text_match" | "eligible_id_from_text_type" =
-    "eligible_text_match";
-
-  if (!resolved_node && normalized_text_matches.length === 1) {
-    resolved_node = normalized_text_matches[0];
-    resolved_by = "normalized_text";
-    resolved_reason = "eligible_normalized_text_match";
-  }
-
-  if (!resolved_node) {
-    const text_type_target_id =
-      deterministic_text_type_target_id({
-        _target_text: target_text,
-        _target_type: input._target_type,
-      });
-    const text_type_target_node =
-      find_view_node_by_id(input._current_view, text_type_target_id);
-    if (text_type_target_node) {
-      resolved_node = text_type_target_node;
-      resolved_by = "text_type_id";
-      resolved_reason = "eligible_id_from_text_type";
-    }
-  }
-
-  if (!resolved_node) {
-    return {
-      _ok: false,
-      _reason: "text_target_not_found",
-      _details: {
-        _target_text: target_text,
-      },
-    };
-  }
-
-  const resolved_id =
-    typeof resolved_node._id === "string"
-      ? resolved_node._id.trim()
-      : "";
-  if (!resolved_id) {
-    return { _ok: false, _reason: "missing_target_id" };
-  }
-
-  if (!_xu.is_plain_object(resolved_node)) {
-    return {
-      _ok: false,
-      _reason: "target_not_object",
-      _details: {
-        _target_text: target_text,
-      },
-    };
-  }
-
-  if (resolved_node === input._current_view) {
-    return {
-      _ok: false,
-      _reason: "target_is_root",
-      _details: {
-        _target_id: resolved_id,
-      },
-    };
+  if (
+    typeof input._target_id === "string" &&
+    input._target_id.trim() &&
+    resolved_by !== "id"
+  ) {
+    _xlog.log("[xvibe] view target resolved by text", {
+      _target_id: input._target_id.trim(),
+      _resolved_target_id: target_id,
+      _resolved_by: resolved_by,
+      _resolution_strategy: resolution.resolution_strategy,
+      ...(input._target_type ? { _target_type: input._target_type } : {}),
+    });
   }
 
   return {
     _ok: true,
-    _target_id: resolved_id,
-    _target_node: resolved_node,
+    _target_id: target_id,
+    _target_node: resolution.object,
     _resolved_by: resolved_by,
-    _reason: resolved_reason,
+    _reason: reason,
   };
 }
 
@@ -3898,6 +6055,28 @@ function deterministic_resolved_by_from_eligibility(
   if (eligibility._reason === "eligible_normalized_text_match") return "normalized_text";
   if (eligibility._reason === "eligible_id_from_text_type") return "text_type_id";
   return "id";
+}
+
+function deterministic_resolved_by_from_view_target_strategy(
+  strategy: XVibeViewTargetResolutionStrategy,
+): "id" | "text" | "normalized_text" | "text_type_id" {
+  if (strategy === "text") return "text";
+  if (strategy === "text_type_id") return "text_type_id";
+  if (strategy === "normalized_text" || strategy === "normalized_id") {
+    return "normalized_text";
+  }
+  return "id";
+}
+
+function deterministic_reason_from_view_target_strategy(
+  strategy: XVibeViewTargetResolutionStrategy,
+): "eligible" | "eligible_text_match" | "eligible_normalized_text_match" | "eligible_id_from_text_type" {
+  const resolved_by =
+    deterministic_resolved_by_from_view_target_strategy(strategy);
+  if (resolved_by === "text") return "eligible_text_match";
+  if (resolved_by === "text_type_id") return "eligible_id_from_text_type";
+  if (resolved_by === "normalized_text") return "eligible_normalized_text_match";
+  return "eligible";
 }
 
 export function can_apply_deterministic_view_edit(input: {
@@ -3924,16 +6103,20 @@ export function can_apply_deterministic_view_edit(input: {
     resolved_task._edit_action !== "replace-class" &&
     resolved_task._edit_action !== "toggle-class" &&
     resolved_task._edit_action !== "set-style" &&
+    resolved_task._edit_action !== "set-styles" &&
     resolved_task._edit_action !== "remove-style" &&
     resolved_task._edit_action !== "set-style-class-rule" &&
     resolved_task._edit_action !== "remove-style-class-rule" &&
     resolved_task._edit_action !== "set-property" &&
+    resolved_task._edit_action !== "update-property" &&
     resolved_task._edit_action !== "remove-property" &&
     resolved_task._edit_action !== "move-object" &&
     resolved_task._edit_action !== "replace-object" &&
     resolved_task._edit_action !== "duplicate-object" &&
     resolved_task._edit_action !== "add-child" &&
-    resolved_task._edit_action !== "set-interaction"
+    resolved_task._edit_action !== "create-toolbar" &&
+    resolved_task._edit_action !== "set-interaction" &&
+    resolved_task._edit_action !== "bind-flow"
   ) {
     return { _eligible: false, _reason: "unsupported_edit_action" };
   }
@@ -3973,6 +6156,7 @@ export function can_apply_deterministic_view_edit(input: {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
       });
     if (!target_resolution._ok) {
       return {
@@ -4010,6 +6194,80 @@ export function can_apply_deterministic_view_edit(input: {
   }
 
   if (
+    resolved_task._edit_action === "set-styles"
+  ) {
+    const styles_value =
+      resolved_task._edit_styles ??
+      (input._edit_intent?._styles as unknown);
+    if (styles_value === undefined || styles_value === null) {
+      return { _eligible: false, _reason: "missing_styles" };
+    }
+
+    const styles_validation =
+      deterministic_normalize_set_styles(styles_value);
+    if (!styles_validation._ok) {
+      return {
+        _eligible: false,
+        _reason: styles_validation._reason,
+        ...(styles_validation._details !== undefined
+          ? { _details: styles_validation._details }
+          : {}),
+      };
+    }
+
+    const target_resolution =
+      resolveViewTarget(input._current_view, {
+        _target_id: target_id,
+        _target_text: resolved_task._edit_target_text,
+        _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(target_id),
+        _include_id: Boolean(target_id),
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    if (target_resolution.object === input._current_view) {
+      return {
+        _eligible: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: target_id,
+        },
+      };
+    }
+
+    const resolved_target_id =
+      typeof target_resolution.object._id === "string" &&
+      target_resolution.object._id.trim()
+        ? target_resolution.object._id.trim()
+        : target_id;
+
+    return {
+      _eligible: true,
+      _action: "set-styles",
+      _target_id: resolved_target_id,
+      _reason: deterministic_reason_from_view_target_strategy(
+        target_resolution.resolution_strategy,
+      ),
+      _details: {
+        _resolved_by: deterministic_resolved_by_from_view_target_strategy(
+          target_resolution.resolution_strategy,
+        ),
+        _styles_applied: styles_validation._styles,
+      },
+    };
+  }
+
+  if (
     resolved_task._edit_action === "set-style" ||
     resolved_task._edit_action === "remove-style"
   ) {
@@ -4036,6 +6294,7 @@ export function can_apply_deterministic_view_edit(input: {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(target_id),
       });
     if (!target_resolution._ok) {
       return {
@@ -4118,8 +6377,12 @@ export function can_apply_deterministic_view_edit(input: {
     };
   }
 
-  if (
+  const is_set_property_action =
     resolved_task._edit_action === "set-property" ||
+    resolved_task._edit_action === "update-property";
+
+  if (
+    is_set_property_action ||
     resolved_task._edit_action === "remove-property"
   ) {
     const property_name =
@@ -4132,35 +6395,58 @@ export function can_apply_deterministic_view_edit(input: {
     }
 
     if (
-      resolved_task._edit_action === "set-property" &&
+      is_set_property_action &&
       resolved_task._edit_property_value === undefined
     ) {
       return { _eligible: false, _reason: "missing_property_value" };
     }
 
     const target_resolution =
-      resolve_deterministic_view_edit_target({
-        _current_view: input._current_view,
+      resolveViewTarget(input._current_view, {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(target_id),
+        _allow_root: deterministic_target_type_is_view(resolved_task._edit_target_type),
+        _view_id: resolved_task._target_id,
       });
     if (!target_resolution._ok) {
       return {
         _eligible: false,
-        _reason: target_resolution._reason,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
         ...(target_resolution._details !== undefined
           ? { _details: target_resolution._details }
           : {}),
       };
     }
 
+    const resolved_target_id =
+      typeof target_resolution.object._id === "string" &&
+      target_resolution.object._id.trim()
+        ? target_resolution.object._id.trim()
+        : target_id;
+    const resolved_by =
+      deterministic_resolved_by_from_view_target_strategy(
+        target_resolution.resolution_strategy,
+      );
+    const resolved_reason =
+      deterministic_reason_from_view_target_strategy(
+        target_resolution.resolution_strategy,
+      );
+    const normalized_property_name =
+      deterministic_normalize_property_name_for_target(
+        target_resolution.object,
+        property_name,
+      );
     const property_eligibility =
       deterministic_set_property_eligibility({
-        _target_node: target_resolution._target_node,
-        _property_name: property_name,
+        _target_node: target_resolution.object,
+        _property_name: normalized_property_name,
         _next_value: resolved_task._edit_property_value,
-        _is_set: resolved_task._edit_action === "set-property",
+        _is_set: is_set_property_action,
       });
     if (!property_eligibility._ok) {
       return {
@@ -4174,11 +6460,17 @@ export function can_apply_deterministic_view_edit(input: {
 
     return {
       _eligible: true,
-      _action: resolved_task._edit_action,
-      _target_id: target_resolution._target_id,
-      _reason: target_resolution._reason,
+      _action: is_set_property_action ? "set-property" : "remove-property",
+      _target_id: resolved_target_id,
+      _target_path: target_resolution.path,
+      _property_name: normalized_property_name,
+      _reason: resolved_reason,
       _details: {
-        _resolved_by: target_resolution._resolved_by,
+        _resolved_by: resolved_by,
+        _resolution_strategy: target_resolution.resolution_strategy,
+        ...(normalized_property_name !== property_name
+          ? { _property_name: normalized_property_name, _requested_property_name: property_name }
+          : {}),
       },
     };
   }
@@ -4237,6 +6529,7 @@ export function can_apply_deterministic_view_edit(input: {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(target_id),
       });
     if (!target_resolution._ok) {
       return {
@@ -4273,6 +6566,103 @@ export function can_apply_deterministic_view_edit(input: {
     };
   }
 
+  if (resolved_task._edit_action === "bind-flow") {
+    const flow =
+      resolved_task._edit_flow;
+    const flow_id =
+      _xu.is_plain_object(flow) && typeof flow._id === "string"
+        ? flow._id.trim()
+        : "";
+    if (!flow_id) {
+      return { _eligible: false, _reason: "missing_flow_id" };
+    }
+
+    const flow_payload =
+      _xu.is_plain_object(flow) && _xu.is_plain_object(flow._payload)
+        ? flow._payload
+        : {};
+    if (!_xu.is_plain_object(flow_payload)) {
+      return { _eligible: false, _reason: "invalid_flow_payload" };
+    }
+
+    const flow_event =
+      typeof resolved_task._edit_flow_event === "string"
+        ? resolved_task._edit_flow_event.trim()
+        : "click";
+    if (!flow_event) {
+      return { _eligible: false, _reason: "missing_flow_event" };
+    }
+
+    const flow_auto =
+      resolved_task._edit_flow_auto;
+    if (flow_auto !== undefined && typeof flow_auto !== "boolean") {
+      return { _eligible: false, _reason: "invalid_flow_auto" };
+    }
+
+    const target_resolution =
+      resolveViewTarget(input._current_view, {
+        _target_id: target_id,
+        _target_text: resolved_task._edit_target_text,
+        _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(target_id),
+        _view_id: resolved_task._target_id,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    if (target_resolution.object === input._current_view) {
+      return {
+        _eligible: false,
+        _reason: "target_is_root",
+        _details: {
+          _target_id: target_id,
+        },
+      };
+    }
+
+    const resolved_target_id =
+      typeof target_resolution._resolved_target_id === "string" &&
+      target_resolution._resolved_target_id.trim()
+        ? target_resolution._resolved_target_id.trim()
+        : undefined;
+    const resolved_target_path =
+      target_resolution._resolved_target_path.length > 0
+        ? target_resolution._resolved_target_path
+        : target_resolution.path;
+    if (!resolved_target_id && resolved_target_path.length === 0) {
+      return { _eligible: false, _reason: "target_missing_identity" };
+    }
+
+    return {
+      _eligible: true,
+      _action: "bind-flow",
+      ...(resolved_target_id ? { _target_id: resolved_target_id } : {}),
+      _target_path: resolved_target_path,
+      _reason: deterministic_reason_from_view_target_strategy(
+        target_resolution.resolution_strategy,
+      ),
+      _details: {
+        _resolved_by: deterministic_resolved_by_from_view_target_strategy(
+          target_resolution.resolution_strategy,
+        ),
+        _resolution_strategy: target_resolution.resolution_strategy,
+        _flow_id: flow_id,
+        _flow_event: flow_event,
+        _flow_auto: flow_auto ?? true,
+      },
+    };
+  }
+
   if (resolved_task._edit_action === "replace-object") {
     const object_value = input._edit_intent?._object_value;
 
@@ -4286,6 +6676,7 @@ export function can_apply_deterministic_view_edit(input: {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(target_id),
       });
     if (!target_resolution._ok) {
       return {
@@ -4373,13 +6764,222 @@ export function can_apply_deterministic_view_edit(input: {
     };
   }
 
+  if (resolved_task._edit_action === "create-toolbar") {
+    const existing_toolbar =
+      find_existing_toolbar_node(input._current_view);
+    const requested_location =
+      input._edit_intent?._location ??
+      (resolved_task as XVibeJsonObject)._edit_location;
+    const location =
+      normalize_create_toolbar_location(requested_location);
+    if (existing_toolbar) {
+      const existing_toolbar_id =
+        typeof existing_toolbar._id === "string" && existing_toolbar._id.trim()
+          ? existing_toolbar._id.trim()
+          : "toolbar";
+      return {
+        _eligible: true,
+        _action: "create-toolbar",
+        _target_id: existing_toolbar_id,
+        _reason: "already_exists",
+        _details: {
+          _toolbar_id: existing_toolbar_id,
+          _created: false,
+          _location: location,
+        },
+      };
+    }
+
+    const toolbar_value =
+      synthesized_create_toolbar({
+        _view_id: resolved_task._target_id,
+        _toolbar_props:
+          input._edit_intent?._toolbar_props ??
+          (resolved_task as XVibeJsonObject)._edit_toolbar_props,
+      });
+    const toolbar_id =
+      typeof toolbar_value._id === "string" ? toolbar_value._id.trim() : "";
+    if (!toolbar_id) {
+      return { _eligible: false, _reason: "missing_toolbar_id" };
+    }
+
+    if (location === "before" || location === "after") {
+      const anchor_id =
+        target_id && target_id !== resolved_task._target_id
+          ? target_id
+          : typeof resolved_task._edit_anchor_id === "string"
+            ? resolved_task._edit_anchor_id.trim()
+            : "";
+      if (!anchor_id && typeof resolved_task._edit_target_text !== "string") {
+        return { _eligible: false, _reason: "missing_target_id" };
+      }
+      const anchor_resolution =
+        resolveViewTarget(input._current_view, {
+          ...(anchor_id ? { _target_id: anchor_id } : {}),
+          _target_text: resolved_task._edit_target_text,
+          _target_type: resolved_task._edit_target_type,
+          _target_id_text_fallback: true,
+          _include_id: true,
+          _view_id: resolved_task._target_id,
+        });
+      if (!anchor_resolution._ok) {
+        return {
+          _eligible: false,
+          _reason: anchor_resolution._reason === "text_target_not_found"
+            ? "target_not_found"
+            : anchor_resolution._reason,
+          ...(anchor_resolution._details !== undefined
+            ? { _details: anchor_resolution._details }
+            : {}),
+        };
+      }
+      const anchor_target_id =
+        typeof anchor_resolution.object._id === "string"
+          ? anchor_resolution.object._id.trim()
+          : anchor_id;
+      const anchor_location =
+        find_view_node_location_by_id(input._current_view, anchor_target_id);
+      if (
+        !anchor_location?._parent ||
+        !Array.isArray(anchor_location._children) ||
+        typeof anchor_location._index !== "number"
+      ) {
+        return {
+          _eligible: false,
+          _reason: "target_is_root",
+          _details: {
+            _target_id: anchor_target_id,
+          },
+        };
+      }
+      return {
+        _eligible: true,
+        _action: "create-toolbar",
+        _target_id:
+          typeof anchor_location._parent._id === "string"
+            ? anchor_location._parent._id
+            : resolved_task._target_id,
+        _reason: deterministic_reason_from_view_target_strategy(
+          anchor_resolution.resolution_strategy,
+        ),
+        _details: {
+          _resolved_by: deterministic_resolved_by_from_view_target_strategy(
+            anchor_resolution.resolution_strategy,
+          ),
+          _toolbar_id: toolbar_id,
+          _created: true,
+          _location: location,
+          _anchor_id: anchor_target_id,
+        },
+      };
+    }
+
+    const root_target_id =
+      resolve_add_child_target_id({
+        _current_view: input._current_view,
+        _view_id: resolved_task._target_id,
+        _target_id: resolved_task._target_id,
+      });
+    const target_resolution =
+      resolveViewTarget(input._current_view, {
+        _target_id: root_target_id,
+        _target_type: "view",
+        _target_id_text_fallback: true,
+        _include_id: true,
+        _allow_root: true,
+        _view_id: resolved_task._target_id,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+    const target_node = target_resolution.object;
+    if (!Array.isArray(target_node._children)) {
+      return {
+        _eligible: false,
+        _reason: "target_without_children",
+        _details: {
+          _target_id:
+            typeof target_node._id === "string" ? target_node._id : root_target_id,
+        },
+      };
+    }
+
+    return {
+      _eligible: true,
+      _action: "create-toolbar",
+      _target_id:
+        typeof target_node._id === "string" ? target_node._id : root_target_id,
+      _reason: "eligible",
+      _details: {
+        _resolved_by: "id",
+        _toolbar_id: toolbar_id,
+        _created: true,
+        _location: location,
+      },
+    };
+  }
+
   if (resolved_task._edit_action === "add-child") {
-    const child_value = input._edit_intent?._child;
+    const resolved_add_target_id =
+      resolve_add_child_target_id({
+        _current_view: input._current_view,
+        _view_id: resolved_task._target_id,
+        _target_id: target_id,
+      });
+    const target_resolution =
+      resolveViewTarget(input._current_view, {
+        _target_id: resolved_add_target_id,
+        _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: true,
+        _allow_root: true,
+        _view_id: resolved_task._target_id,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _eligible: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_node = target_resolution.object;
+    if (!Array.isArray(target_node._children)) {
+      return {
+        _eligible: false,
+        _reason: "target_without_children",
+        _details: {
+          _target_id:
+            typeof target_node._id === "string" ? target_node._id : resolved_add_target_id,
+        },
+      };
+    }
+
+    const child_value =
+      synthesized_add_child({
+        _child: input._edit_intent?._child,
+        _component_type:
+          input._edit_intent?._component_type ??
+          (resolved_task as XVibeJsonObject)._edit_component_type,
+        _location:
+          input._edit_intent?._location ??
+          (resolved_task as XVibeJsonObject)._edit_location,
+        _props:
+          input._edit_intent?._props ??
+          (resolved_task as XVibeJsonObject)._edit_props,
+      });
 
     if (!_xu.is_plain_object(child_value)) {
       return { _eligible: false, _reason: "missing_child" };
     }
-
     const child_type =
       typeof child_value._type === "string" ? child_value._type.trim() : "";
     if (!child_type) {
@@ -4393,29 +6993,7 @@ export function can_apply_deterministic_view_edit(input: {
         _eligible: false,
         _reason: "duplicate_child_id",
         _details: {
-          _id: duplicate_child_id,
-        },
-      };
-    }
-
-    const target_node =
-      find_view_node_by_id(input._current_view, target_id);
-    if (!target_node) {
-      return {
-        _eligible: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: target_id,
-        },
-      };
-    }
-
-    if (!Array.isArray(target_node._children)) {
-      return {
-        _eligible: false,
-        _reason: "target_without_children",
-        _details: {
-          _target_id: target_id,
+        _id: duplicate_child_id,
         },
       };
     }
@@ -4423,141 +7001,352 @@ export function can_apply_deterministic_view_edit(input: {
     return {
       _eligible: true,
       _action: "add-child",
-      _target_id: target_id,
-      _reason: "eligible",
+      _target_id:
+        typeof target_node._id === "string" ? target_node._id : resolved_add_target_id,
+      _reason: target_resolution.resolution_strategy === "id" ||
+        target_resolution.resolution_strategy === "root"
+        ? "eligible"
+        : target_resolution.resolution_strategy === "text"
+          ? "eligible_text_match"
+          : target_resolution.resolution_strategy === "text_type_id"
+            ? "eligible_id_from_text_type"
+            : "eligible_normalized_text_match",
       _details: {
-        _resolved_by: "id",
+        _resolved_by:
+          target_resolution.resolution_strategy === "text"
+            ? "text"
+            : target_resolution.resolution_strategy === "text_type_id"
+              ? "text_type_id"
+              : target_resolution.resolution_strategy === "normalized_text" ||
+                target_resolution.resolution_strategy === "normalized_id"
+                ? "normalized_text"
+                : "id",
+        _resolution_strategy: target_resolution.resolution_strategy,
         _child_type: child_type,
         _previous_index: target_node._children.length,
+        _location: normalize_add_child_location(
+          input._edit_intent?._location ??
+          (resolved_task as XVibeJsonObject)._edit_location,
+        ),
       },
     };
   }
 
   if (resolved_task._edit_action === "move-object") {
-    const move_position = resolved_task._edit_move_position;
-    if (
-      move_position !== "before" &&
-      move_position !== "after" &&
-      move_position !== "top" &&
-      move_position !== "bottom"
-    ) {
+    const move_position =
+      deterministic_move_object_position(resolved_task);
+    if (!move_position) {
       return { _eligible: false, _reason: "missing_move_position" };
     }
+    const destination_fields =
+      deterministic_move_destination_fields({
+        _resolved_task: resolved_task,
+        _position: move_position,
+      });
+    const edit_intent_target_id =
+      typeof input._edit_intent?._target_id === "string" &&
+      input._edit_intent._target_id.trim()
+        ? input._edit_intent._target_id.trim()
+        : undefined;
+    const resolved_task_target_id =
+      typeof resolved_task._edit_target_id === "string" &&
+      resolved_task._edit_target_id.trim()
+        ? resolved_task._edit_target_id.trim()
+        : undefined;
 
-    const target_resolution =
-      resolve_deterministic_view_edit_target({
-        _current_view: input._current_view,
+    _xlog.log("[xvibe] move object eligibility input", {
+      _target_id: target_id,
+      _target_text: resolved_task._edit_target_text,
+      _target_type: resolved_task._edit_target_type,
+      _destination_id: destination_fields._target_id,
+      _edit_intent_target_id: edit_intent_target_id,
+      _resolved_task_target_id: resolved_task_target_id,
+    });
+
+    const source_candidates: Array<{
+      _requested_source: string;
+      _target_id?: string;
+      _target_text?: string;
+      _include_id: boolean;
+    }> = [];
+    const add_source_candidate = (candidate: {
+      _requested_source?: string;
+      _target_id?: string;
+      _target_text?: string;
+      _include_id: boolean;
+    }) => {
+      const requested_source =
+        typeof candidate._requested_source === "string" &&
+        candidate._requested_source.trim()
+          ? candidate._requested_source.trim()
+          : undefined;
+      if (!requested_source) return;
+      if (source_candidates.some((item) => item._requested_source === requested_source)) {
+        return;
+      }
+      source_candidates.push({
+        _requested_source: requested_source,
+        ...(candidate._target_id ? { _target_id: candidate._target_id } : {}),
+        ...(candidate._target_text ? { _target_text: candidate._target_text } : {}),
+        _include_id: candidate._include_id,
+      });
+    };
+    const explicit_target_text =
+      typeof resolved_task._edit_target_text === "string" &&
+      resolved_task._edit_target_text.trim()
+        ? resolved_task._edit_target_text.trim()
+        : undefined;
+    add_source_candidate({
+      _requested_source: explicit_target_text,
+      _target_text: explicit_target_text,
+      _include_id: false,
+    });
+    const original_target_id =
+      edit_intent_target_id ?? resolved_task_target_id;
+    add_source_candidate({
+      _requested_source: original_target_id,
+      _target_id: original_target_id,
+      _include_id: true,
+    });
+    add_source_candidate({
+      _requested_source: target_id,
+      _target_id: target_id,
+      _include_id: true,
+    });
+
+    let requested_source =
+      source_candidates[0]?._requested_source ?? target_id ?? "";
+    let target_resolution: XVibeViewTargetResolution | undefined;
+    for (const candidate of source_candidates) {
+      requested_source = candidate._requested_source;
+      const resolution =
+        resolveViewTarget(input._current_view, {
+          _target_id: candidate._target_id,
+          _target_text: candidate._target_text,
+          _target_type: resolved_task._edit_target_type,
+          _target_id_text_fallback: true,
+          _include_id: candidate._include_id,
+        });
+      target_resolution = resolution;
+      if (resolution._ok) break;
+    }
+    target_resolution ??=
+      resolveViewTarget(input._current_view, {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(target_id),
       });
+    _xlog.log("[xvibe] move object eligibility resolution", {
+      _requested_source: requested_source,
+      _ok: target_resolution._ok,
+      ...(target_resolution._ok
+        ? {
+          _resolved_target_id: target_resolution._resolved_target_id,
+          _resolved_target_path: target_resolution._resolved_target_path,
+          _strategy: target_resolution.resolution_strategy,
+        }
+        : {
+          _reason: target_resolution._reason,
+        }),
+    });
     if (!target_resolution._ok) {
       return {
         _eligible: false,
-        _reason: target_resolution._reason,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
         ...(target_resolution._details !== undefined
           ? { _details: target_resolution._details }
           : {}),
       };
     }
 
-    const target_location =
-      find_view_node_location_by_id(input._current_view, target_resolution._target_id);
-    if (!target_location?._parent || !Array.isArray(target_location._children)) {
+    if (
+      target_resolution.object === input._current_view ||
+      !target_resolution.parent ||
+      !Array.isArray(target_resolution.parent._children) ||
+      typeof target_resolution.index !== "number"
+    ) {
       return {
         _eligible: false,
         _reason: "target_is_root",
         _details: {
-          _target_id: target_resolution._target_id,
+          _target_id:
+            typeof target_resolution.object._id === "string"
+              ? target_resolution.object._id
+              : target_id,
         },
       };
     }
 
-    if (move_position === "top" || move_position === "bottom") {
+    const moved_id =
+      typeof target_resolution._resolved_target_id === "string" &&
+      target_resolution._resolved_target_id.trim()
+        ? target_resolution._resolved_target_id.trim()
+        : "";
+    const moved_path =
+      target_resolution._resolved_target_path.length > 0
+        ? target_resolution._resolved_target_path
+        : target_resolution.path;
+    if (!moved_id && moved_path.length === 0) {
+      return { _eligible: false, _reason: "target_missing_identity" };
+    }
+
+    const source_parent = target_resolution.parent;
+    const source_parent_id =
+      typeof source_parent._id === "string" ? source_parent._id : undefined;
+
+    if (
+      (move_position === "append" || move_position === "prepend") &&
+      !destination_fields._target_id &&
+      !destination_fields._target_text &&
+      !destination_fields._target_type
+    ) {
       return {
         _eligible: true,
         _action: "move-object",
-        _target_id: target_resolution._target_id,
-        _reason: target_resolution._reason,
+        ...(moved_id ? { _target_id: moved_id } : {}),
+        _target_path: moved_path,
+        _reason: deterministic_reason_from_view_target_strategy(
+          target_resolution.resolution_strategy,
+        ),
         _details: {
-          _resolved_by: target_resolution._resolved_by,
-          _move_position: move_position,
-          _parent_id: typeof target_location._parent._id === "string"
-            ? target_location._parent._id
-            : undefined,
-          _previous_index: target_location._index,
+          _resolved_by: deterministic_resolved_by_from_view_target_strategy(
+            target_resolution.resolution_strategy,
+          ),
+          _resolution_strategy: target_resolution.resolution_strategy,
+          _position: move_position,
+          ...(deterministic_legacy_move_position(resolved_task)
+            ? { _move_position: deterministic_legacy_move_position(resolved_task) }
+            : {}),
+          _source_parent_id: source_parent_id,
+          _destination_parent_id: source_parent_id,
+          _previous_index: target_resolution.index,
+          ...(moved_id ? {} : { _target_missing_id: true }),
         },
       };
     }
 
-    const anchor_resolution =
-      resolve_deterministic_view_edit_target({
-        _current_view: input._current_view,
-        _target_id: resolved_task._edit_anchor_id,
-        _target_text: resolved_task._edit_anchor_text,
-        _target_type: resolved_task._edit_anchor_type,
+    const destination_resolution =
+      resolveViewTarget(input._current_view, {
+        _target_id: destination_fields._target_id,
+        _target_text: destination_fields._target_text,
+        _target_type: destination_fields._target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(destination_fields._target_id),
+        _allow_root: move_position === "append" || move_position === "prepend",
+        _view_id: resolved_task._target_id,
       });
-    if (!anchor_resolution._ok) {
+    if (!destination_resolution._ok) {
+      const failure =
+        deterministic_move_resolution_failure({
+          _resolution: destination_resolution,
+          _legacy_anchor: destination_fields._legacy_anchor,
+        });
       return {
         _eligible: false,
-        _reason: anchor_resolution._reason === "target_not_found" ||
-          anchor_resolution._reason === "text_target_not_found" ||
-          anchor_resolution._reason === "missing_target_id"
-          ? "anchor_not_found"
-          : anchor_resolution._reason,
-        ...(anchor_resolution._details !== undefined
-          ? { _details: anchor_resolution._details }
+        _reason: failure._reason,
+        ...(failure._details !== undefined
+          ? { _details: failure._details }
           : {}),
       };
     }
 
-    if (target_resolution._target_id === anchor_resolution._target_id) {
+    if (destination_resolution.object === target_resolution.object) {
       return {
         _eligible: false,
-        _reason: "target_is_anchor",
+        _reason: "target_is_destination",
         _details: {
-          _target_id: target_resolution._target_id,
+          _target_id: moved_id,
         },
       };
     }
 
-    const anchor_location =
-      find_view_node_location_by_id(input._current_view, anchor_resolution._target_id);
-    if (!anchor_location?._parent || !Array.isArray(anchor_location._children)) {
+    const destination_parent =
+      move_position === "append" || move_position === "prepend"
+        ? destination_resolution.object
+        : destination_resolution.parent;
+    const destination_index =
+      move_position === "append" || move_position === "prepend"
+        ? undefined
+        : destination_resolution.index;
+
+    if (
+      !destination_parent ||
+      !Array.isArray(destination_parent._children) ||
+      (
+        (move_position === "before" || move_position === "after") &&
+        typeof destination_index !== "number"
+      )
+    ) {
       return {
         _eligible: false,
-        _reason: "anchor_not_found",
+        _reason:
+          move_position === "before" || move_position === "after"
+            ? deterministic_move_missing_destination_reason(destination_fields._legacy_anchor)
+            : "destination_without_children",
         _details: {
-          _anchor_id: anchor_resolution._target_id,
+          _destination_id:
+            typeof destination_resolution.object._id === "string"
+              ? destination_resolution.object._id
+              : destination_fields._target_id,
         },
       };
     }
 
-    if (target_location._parent !== anchor_location._parent) {
+    if (view_node_contains_node(target_resolution.object, destination_parent)) {
       return {
         _eligible: false,
-        _reason: "different_parent",
+        _reason: "destination_is_descendant",
         _details: {
-          _target_id: target_resolution._target_id,
-          _anchor_id: anchor_resolution._target_id,
+        _target_id: moved_id,
+        _destination_parent_id:
+            typeof destination_parent._id === "string"
+              ? destination_parent._id
+              : undefined,
         },
       };
     }
+
+    const destination_parent_id =
+      typeof destination_parent._id === "string" ? destination_parent._id : undefined;
+    const destination_id =
+      typeof destination_resolution.object._id === "string"
+        ? destination_resolution.object._id
+        : undefined;
 
     return {
       _eligible: true,
       _action: "move-object",
-      _target_id: target_resolution._target_id,
-      _reason: target_resolution._reason,
+      ...(moved_id ? { _target_id: moved_id } : {}),
+      _target_path: moved_path,
+      _reason: deterministic_reason_from_view_target_strategy(
+        target_resolution.resolution_strategy,
+      ),
       _details: {
-        _resolved_by: target_resolution._resolved_by,
-        _move_position: move_position,
-        _anchor_id: anchor_resolution._target_id,
-        _anchor_resolved_by: anchor_resolution._resolved_by,
-        _parent_id: typeof target_location._parent._id === "string"
-          ? target_location._parent._id
-          : undefined,
-        _previous_index: target_location._index,
+        _resolved_by: deterministic_resolved_by_from_view_target_strategy(
+          target_resolution.resolution_strategy,
+        ),
+        _resolution_strategy: target_resolution.resolution_strategy,
+        _position: move_position,
+        ...(deterministic_legacy_move_position(resolved_task)
+          ? { _move_position: deterministic_legacy_move_position(resolved_task) }
+          : {}),
+        ...(destination_id ? { _destination_id: destination_id } : {}),
+        ...(move_position === "before" || move_position === "after"
+          ? {
+            _anchor_id: destination_id,
+            _anchor_resolved_by: deterministic_resolved_by_from_view_target_strategy(
+              destination_resolution.resolution_strategy,
+            ),
+          }
+          : {}),
+        _source_parent_id: source_parent_id,
+        _destination_parent_id: destination_parent_id,
+        _previous_index: target_resolution.index,
+        ...(moved_id ? {} : { _target_missing_id: true }),
       },
     };
   }
@@ -4697,6 +7486,7 @@ export function can_apply_deterministic_view_edit(input: {
         _target_id: target_id,
         _target_text: resolved_task._edit_target_text,
         _target_type: resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(target_id),
       });
     if (!target_resolution._ok) {
       return {
@@ -4725,6 +7515,9 @@ export function can_apply_deterministic_view_edit(input: {
       _target_id: target_id,
       _target_text: resolved_task._edit_target_text,
       _target_type: resolved_task._edit_target_type,
+      _target_id_text_fallback:
+        resolved_task._edit_action === "remove" ||
+        resolved_task._edit_action === "hide",
     });
   if (!target_resolution._ok) {
     return {
@@ -4790,7 +7583,8 @@ function deterministic_view_edit_should_search_references(
     eligibility._reason === "missing_target_id" ||
     (
       resolved_task._edit_action === "move-object" &&
-      eligibility._reason === "anchor_not_found"
+      (eligibility._reason === "anchor_not_found" ||
+        eligibility._reason === "destination_not_found")
     )
   );
 }
@@ -4890,7 +7684,10 @@ function resolve_deterministic_view_edit_source(input: {
 
   const current_move_target_with_missing_anchor =
     input._resolved_task._edit_action === "move-object" &&
-    current_eligibility._reason === "anchor_not_found";
+    (
+      current_eligibility._reason === "anchor_not_found" ||
+      current_eligibility._reason === "destination_not_found"
+    );
   const referenced_eligible: Array<{
     _view_id: string;
     _view: unknown;
@@ -4994,12 +7791,26 @@ function resolve_deterministic_view_edit_source(input: {
       };
     }
 
+    const move_position =
+      deterministic_move_object_position(input._resolved_task);
+    const destination_fields: {
+      _target_id?: string;
+      _target_text?: string;
+      _target_type?: string;
+      _legacy_anchor: boolean;
+    } =
+      move_position
+        ? deterministic_move_destination_fields({
+          _resolved_task: input._resolved_task,
+          _position: move_position,
+        })
+        : { _legacy_anchor: true };
     const anchor_matches =
       resolve_deterministic_view_edit_target_sources({
         _sources: sources,
-        _target_id: input._resolved_task._edit_anchor_id,
-        _target_text: input._resolved_task._edit_anchor_text,
-        _target_type: input._resolved_task._edit_anchor_type,
+        _target_id: destination_fields._target_id,
+        _target_text: destination_fields._target_text,
+        _target_type: destination_fields._target_type,
       });
 
     const target_match_for_source_check =
@@ -5024,6 +7835,8 @@ function resolve_deterministic_view_edit_source(input: {
             _target_id: target_match_for_source_check._target_id,
             _anchor_view_id: anchor_matches[0]._view_id,
             _anchor_id: anchor_matches[0]._target_id,
+            _destination_view_id: anchor_matches[0]._view_id,
+            _destination_id: anchor_matches[0]._target_id,
           },
         },
         _warnings: input._reference_warnings,
@@ -5069,9 +7882,13 @@ function resolved_task_is_explicit_view_child_edit(
     typeof resolved_task._edit_property_name === "string" ||
     Object.prototype.hasOwnProperty.call(resolved_task, "_edit_property_value") ||
     typeof resolved_task._edit_move_position === "string" ||
+    typeof (resolved_task as XVibeJsonObject)._edit_position === "string" ||
     typeof resolved_task._edit_anchor_id === "string" ||
     typeof resolved_task._edit_anchor_text === "string" ||
-    typeof resolved_task._edit_anchor_type === "string"
+    typeof resolved_task._edit_anchor_type === "string" ||
+    typeof (resolved_task as XVibeJsonObject)._edit_destination_id === "string" ||
+    typeof (resolved_task as XVibeJsonObject)._edit_destination_text === "string" ||
+    typeof (resolved_task as XVibeJsonObject)._edit_destination_type === "string"
   );
 }
 
@@ -5102,7 +7919,8 @@ export function apply_deterministic_view_edit(input: {
     eligibility._action !== "remove-style-class-rule" &&
     eligibility._action !== "set-property" &&
     eligibility._action !== "remove-property" &&
-    eligibility._action !== "move-object"
+    eligibility._action !== "move-object" &&
+    eligibility._action !== "bind-flow"
   ) {
     return {
       _ok: false,
@@ -5113,6 +7931,186 @@ export function apply_deterministic_view_edit(input: {
 
   const next_view =
     clone_deterministic_view_json(input._current_view);
+
+  if (eligibility._action === "create-toolbar") {
+    const requested_location =
+      input._edit_intent?._location ??
+      (input._resolved_task as XVibeJsonObject)._edit_location;
+    const location =
+      normalize_create_toolbar_location(requested_location);
+    const existing_toolbar =
+      find_existing_toolbar_node(next_view);
+    if (existing_toolbar) {
+      const existing_toolbar_id =
+        typeof existing_toolbar._id === "string" && existing_toolbar._id.trim()
+          ? existing_toolbar._id.trim()
+          : "toolbar";
+      return {
+        _ok: true,
+        _view: next_view,
+        _mutation: {
+          _type: "deterministic-view-edit",
+          _action: "create-toolbar",
+          _target_id: existing_toolbar_id,
+          _resolved_by: "id",
+          _toolbar_id: existing_toolbar_id,
+          _created: false,
+          _location: location,
+          _reason: "already_exists",
+        },
+      };
+    }
+
+    const toolbar_value =
+      synthesized_create_toolbar({
+        _view_id: input._resolved_task._target_id,
+        _toolbar_props:
+          input._edit_intent?._toolbar_props ??
+          (input._resolved_task as XVibeJsonObject)._edit_toolbar_props,
+      });
+    const duplicate_child_id =
+      first_duplicate_child_declared_id(toolbar_value);
+    if (duplicate_child_id) {
+      return {
+        _ok: false,
+        _reason: "duplicate_child_id",
+        _details: {
+          _id: duplicate_child_id,
+        },
+      };
+    }
+
+    const used_ids = new Set(
+      collect_view_nodes(next_view)
+        .map((node) => typeof node._id === "string" ? node._id.trim() : "")
+        .filter((id) => id.length > 0),
+    );
+    const next_toolbar =
+      normalize_added_child_ids({
+        _child: toolbar_value,
+        _used_ids: used_ids,
+      });
+    const toolbar_id =
+      typeof next_toolbar._id === "string" ? next_toolbar._id : "";
+
+    let parent_id = eligibility._target_id;
+    let insert_index = 0;
+    let anchor_id: string | undefined;
+    let children: unknown[] | undefined;
+
+    if (location === "before" || location === "after") {
+      const target_id =
+        deterministic_edit_target_id({
+          _resolved_task: input._resolved_task,
+          _edit_intent: input._edit_intent,
+        });
+      const requested_anchor_id =
+        target_id && target_id !== input._resolved_task._target_id
+          ? target_id
+          : typeof input._resolved_task._edit_anchor_id === "string"
+            ? input._resolved_task._edit_anchor_id.trim()
+            : "";
+      const anchor_resolution =
+        resolveViewTarget(next_view, {
+          ...(requested_anchor_id ? { _target_id: requested_anchor_id } : {}),
+          _target_text: input._resolved_task._edit_target_text,
+          _target_type: input._resolved_task._edit_target_type,
+          _target_id_text_fallback: true,
+          _include_id: true,
+          _view_id: input._resolved_task._target_id,
+        });
+      if (!anchor_resolution._ok) {
+        return {
+          _ok: false,
+          _reason: anchor_resolution._reason,
+          ...(anchor_resolution._details !== undefined
+            ? { _details: anchor_resolution._details }
+            : {}),
+        };
+      }
+      const resolved_anchor_id =
+        typeof anchor_resolution.object._id === "string"
+          ? anchor_resolution.object._id.trim()
+          : requested_anchor_id;
+      const anchor_location =
+        find_view_node_location_by_id(next_view, resolved_anchor_id);
+      if (
+        !anchor_location?._parent ||
+        !Array.isArray(anchor_location._children) ||
+        typeof anchor_location._index !== "number"
+      ) {
+        return {
+          _ok: false,
+          _reason: "target_is_root",
+          _details: {
+            _target_id: resolved_anchor_id,
+          },
+        };
+      }
+      anchor_id = resolved_anchor_id;
+      parent_id =
+        typeof anchor_location._parent._id === "string"
+          ? anchor_location._parent._id
+          : parent_id;
+      children = anchor_location._children;
+      insert_index =
+        location === "before"
+          ? anchor_location._index
+          : anchor_location._index + 1;
+    } else {
+      const target_resolution =
+        resolveViewTarget(next_view, {
+          _target_id: eligibility._target_id,
+          _allow_root: true,
+        });
+      if (!target_resolution._ok) {
+        return {
+          _ok: false,
+          _reason: target_resolution._reason,
+          ...(target_resolution._details !== undefined
+            ? { _details: target_resolution._details }
+            : {}),
+        };
+      }
+      const target_node = target_resolution.object;
+      if (!Array.isArray(target_node._children)) {
+        return {
+          _ok: false,
+          _reason: "target_without_children",
+          _details: {
+            _target_id: eligibility._target_id,
+          },
+        };
+      }
+      children = target_node._children;
+      parent_id =
+        typeof target_node._id === "string" ? target_node._id : parent_id;
+      insert_index =
+        location === "top" ? 0 : target_node._children.length;
+    }
+
+    children.splice(insert_index, 0, next_toolbar);
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "create-toolbar",
+        _target_id: parent_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        _parent_id: parent_id,
+        _insert_index: insert_index,
+        _location: location,
+        ...(anchor_id ? { _anchor_id: anchor_id } : {}),
+        _toolbar_id: toolbar_id,
+        _created: true,
+        _child_id: toolbar_id,
+        _child_type: "toolbar",
+        _next_object: next_toolbar,
+      },
+    };
+  }
 
   if (eligibility._action === "set-interaction") {
     const target_node =
@@ -5225,19 +8223,150 @@ export function apply_deterministic_view_edit(input: {
     };
   }
 
-  if (eligibility._action === "add-child") {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+  if (eligibility._action === "bind-flow") {
+    const flow =
+      input._resolved_task._edit_flow;
+    const flow_id =
+      _xu.is_plain_object(flow) && typeof flow._id === "string"
+        ? flow._id.trim()
+        : "";
+    if (!flow_id) {
+      return { _ok: false, _reason: "missing_flow_id" };
+    }
+
+    const flow_payload =
+      _xu.is_plain_object(flow) && _xu.is_plain_object(flow._payload)
+        ? flow._payload
+        : {};
+    if (!_xu.is_plain_object(flow_payload)) {
+      return { _ok: false, _reason: "invalid_flow_payload" };
+    }
+
+    const flow_event =
+      typeof input._resolved_task._edit_flow_event === "string" &&
+      input._resolved_task._edit_flow_event.trim()
+        ? input._resolved_task._edit_flow_event.trim()
+        : "click";
+    const flow_auto =
+      typeof input._resolved_task._edit_flow_auto === "boolean"
+        ? input._resolved_task._edit_flow_auto
+        : true;
+    const requested_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(requested_target_id),
+        _view_id: input._resolved_task._target_id,
+      });
+    if (!target_resolution._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const resolved_target_id =
+      typeof target_resolution._resolved_target_id === "string" &&
+      target_resolution._resolved_target_id.trim()
+        ? target_resolution._resolved_target_id.trim()
+        : undefined;
+    const resolved_target_path =
+      target_resolution._resolved_target_path.length > 0
+        ? target_resolution._resolved_target_path
+        : target_resolution.path;
+    const eligibility_path = eligibility._target_path ?? [];
+    const target_identity_matches =
+      eligibility._target_id
+        ? resolved_target_id === eligibility._target_id
+        : JSON.stringify(resolved_target_path) === JSON.stringify(eligibility_path);
+    if (!target_identity_matches) {
+      return {
+        _ok: false,
+        _reason: "target_resolution_mismatch",
+        _details: {
+          _eligibility_target_id: eligibility._target_id,
+          _eligibility_target_path: eligibility_path,
+          _execution_target_id: resolved_target_id,
+          _execution_target_path: resolved_target_path,
+        },
+      };
+    }
+
+    const target_node = target_resolution.object;
+    if (target_node === next_view) {
+      return {
+        _ok: false,
+        _reason: "target_is_root",
         _details: {
           _target_id: eligibility._target_id,
         },
       };
     }
 
+    const previous_flow =
+      target_node._flow;
+    const previous_flow_event =
+      target_node._flow_event;
+    const previous_flow_auto =
+      target_node._flow_auto;
+    const next_flow = {
+      _id: flow_id,
+      _payload: clone_deterministic_view_json(flow_payload) as XVibeJsonObject,
+    };
+    target_node._flow = next_flow;
+    target_node._flow_event = flow_event;
+    target_node._flow_auto = flow_auto;
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "bind-flow",
+        ...(resolved_target_id ? { _target_id: resolved_target_id } : {}),
+        ...(resolved_target_id ? {} : { _target_path: resolved_target_path }),
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        _flow: next_flow,
+        _flow_event: flow_event,
+        _flow_auto: flow_auto,
+        _previous_object: {
+          ...(previous_flow !== undefined ? { _flow: previous_flow } : {}),
+          ...(previous_flow_event !== undefined ? { _flow_event: previous_flow_event } : {}),
+          ...(previous_flow_auto !== undefined ? { _flow_auto: previous_flow_auto } : {}),
+        },
+      },
+    };
+  }
+
+  if (eligibility._action === "add-child") {
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: eligibility._target_id,
+        _allow_root: true,
+      });
+    if (!target_resolution._ok) {
+      return {
+        _ok: false,
+        _reason: target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_node = target_resolution.object;
     if (!Array.isArray(target_node._children)) {
       return {
         _ok: false,
@@ -5248,7 +8377,19 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    const child_value = input._edit_intent?._child;
+    const child_value =
+      synthesized_add_child({
+        _child: input._edit_intent?._child,
+        _component_type:
+          input._edit_intent?._component_type ??
+          (input._resolved_task as XVibeJsonObject)._edit_component_type,
+        _location:
+          input._edit_intent?._location ??
+          (input._resolved_task as XVibeJsonObject)._edit_location,
+        _props:
+          input._edit_intent?._props ??
+          (input._resolved_task as XVibeJsonObject)._edit_props,
+      });
     if (!_xu.is_plain_object(child_value)) {
       return { _ok: false, _reason: "missing_child" };
     }
@@ -5271,6 +8412,39 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
+    const existing_identical_child =
+      existing_identical_child_by_id({
+        _parent: target_node,
+        _child: child_value,
+      });
+    if (existing_identical_child) {
+      const child_id =
+        typeof existing_identical_child._id === "string"
+          ? existing_identical_child._id
+          : "";
+      return {
+        _ok: true,
+        _view: next_view,
+        _mutation: {
+          _type: "deterministic-view-edit",
+          _action: "add-child",
+          _target_id: eligibility._target_id,
+          _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+          _parent_id: eligibility._target_id,
+          _insert_index: target_node._children.indexOf(existing_identical_child),
+          _location: normalize_add_child_location(
+            input._edit_intent?._location ??
+            (input._resolved_task as XVibeJsonObject)._edit_location,
+          ),
+          _child_id: child_id,
+          _child_type: child_type,
+          _next_object: existing_identical_child,
+          _created: false,
+          _reason: "already_exists",
+        },
+      };
+    }
+
     const used_ids = new Set(
       collect_view_nodes(next_view)
         .map((node) => typeof node._id === "string" ? node._id.trim() : "")
@@ -5283,8 +8457,14 @@ export function apply_deterministic_view_edit(input: {
       });
     const child_id =
       typeof next_child._id === "string" ? next_child._id : "";
-    const insert_index = target_node._children.length;
-    target_node._children.push(next_child);
+    const insert_location =
+      normalize_add_child_location(
+        input._edit_intent?._location ??
+        (input._resolved_task as XVibeJsonObject)._edit_location,
+      );
+    const insert_index =
+      insert_location === "top" ? 0 : target_node._children.length;
+    target_node._children.splice(insert_index, 0, next_child);
 
     return {
       _ok: true,
@@ -5296,6 +8476,7 @@ export function apply_deterministic_view_edit(input: {
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
         _parent_id: eligibility._target_id,
         _insert_index: insert_index,
+        _location: insert_location,
         _child_id: child_id,
         _child_type: child_type,
         _next_object: next_child,
@@ -5442,22 +8623,66 @@ export function apply_deterministic_view_edit(input: {
   }
 
   if (eligibility._action === "move-object") {
-    const move_position = input._resolved_task._edit_move_position;
-    if (
-      move_position !== "before" &&
-      move_position !== "after" &&
-      move_position !== "top" &&
-      move_position !== "bottom"
-    ) {
+    const move_position =
+      deterministic_move_object_position(input._resolved_task);
+    if (!move_position) {
       return { _ok: false, _reason: "missing_move_position" };
     }
 
-    const target_location =
-      find_view_node_location_by_id(next_view, eligibility._target_id);
+    const requested_target =
+      typeof input._resolved_task._edit_target_text === "string" &&
+      input._resolved_task._edit_target_text.trim()
+        ? input._resolved_task._edit_target_text.trim()
+        : typeof input._resolved_task._edit_target_id === "string" &&
+          input._resolved_task._edit_target_id.trim()
+          ? input._resolved_task._edit_target_id.trim()
+          : eligibility._target_id;
+    const requested_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    let target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: true,
+      });
+    if (!target_resolution._ok && requested_target_id !== eligibility._target_id) {
+      target_resolution =
+        resolveViewTarget(next_view, {
+          _target_id: eligibility._target_id,
+          _target_text: input._resolved_task._edit_target_text,
+          _target_type: input._resolved_task._edit_target_type,
+          _target_id_text_fallback: true,
+          _include_id: true,
+        });
+    }
+    if (!target_resolution._ok) {
+      return {
+        _ok: false,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+    _xlog.log("[xvibe] move object source resolved", {
+      _requested_target: requested_target,
+      _resolved_target_id: target_resolution._resolved_target_id,
+      _resolved_target_path: target_resolution._resolved_target_path,
+      _strategy: target_resolution.resolution_strategy,
+    });
+
     if (
-      !target_location?._parent ||
-      !Array.isArray(target_location._children) ||
-      typeof target_location._index !== "number"
+      target_resolution.object === next_view ||
+      !target_resolution.parent ||
+      !Array.isArray(target_resolution.parent._children) ||
+      typeof target_resolution.index !== "number"
     ) {
       return {
         _ok: false,
@@ -5468,97 +8693,201 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    const siblings = target_location._children;
-    const previous_index = target_location._index;
-    let next_index: number;
-    let anchor_id: string | undefined;
-    let anchor_resolved_by:
+    const moved_id =
+      typeof target_resolution._resolved_target_id === "string" &&
+      target_resolution._resolved_target_id.trim()
+        ? target_resolution._resolved_target_id.trim()
+        : undefined;
+    const moved_path =
+      target_resolution._resolved_target_path.length > 0
+        ? target_resolution._resolved_target_path
+        : target_resolution.path;
+    const eligibility_path = eligibility._target_path ?? [];
+    const target_identity_matches =
+      eligibility._target_id
+        ? moved_id === eligibility._target_id
+        : JSON.stringify(moved_path) === JSON.stringify(eligibility_path);
+    if (!target_identity_matches) {
+      return {
+        _ok: false,
+        _reason: "target_resolution_mismatch",
+        _details: {
+          _eligibility_target_id: eligibility._target_id,
+          _eligibility_target_path: eligibility_path,
+          _execution_target_id: moved_id,
+          _execution_target_path: moved_path,
+          _requested_target: requested_target,
+        },
+      };
+    }
+    const source_parent = target_resolution.parent;
+    const source_children = source_parent._children as XVibeJsonObject[];
+    const previous_index = target_resolution.index;
+    const source_parent_id =
+      typeof source_parent._id === "string" ? source_parent._id : undefined;
+    const destination_fields =
+      deterministic_move_destination_fields({
+        _resolved_task: input._resolved_task,
+        _position: move_position,
+      });
+    let destination_parent: XVibeJsonObject = source_parent;
+    let destination_index: number | undefined;
+    let destination_id: string | undefined;
+    let destination_resolved_by:
       | "id"
       | "text"
       | "normalized_text"
       | "text_type_id"
       | undefined;
 
-    if (move_position === "before" || move_position === "after") {
-      const anchor_resolution =
-        resolve_deterministic_view_edit_target({
-          _current_view: next_view,
-          _target_id: input._resolved_task._edit_anchor_id,
-          _target_text: input._resolved_task._edit_anchor_text,
-          _target_type: input._resolved_task._edit_anchor_type,
+    if (
+      destination_fields._target_id ||
+      destination_fields._target_text ||
+      destination_fields._target_type
+    ) {
+      const requested_destination =
+        destination_fields._target_text ??
+        destination_fields._target_id ??
+        destination_fields._target_type;
+      const destination_resolution =
+        resolveViewTarget(next_view, {
+          _target_id: destination_fields._target_id,
+          _target_text: destination_fields._target_text,
+          _target_type: destination_fields._target_type,
+          _target_id_text_fallback: true,
+          _include_id: Boolean(destination_fields._target_id),
+          _allow_root: move_position === "append" || move_position === "prepend",
+          _view_id: input._resolved_task._target_id,
         });
-      if (!anchor_resolution._ok) {
+      if (!destination_resolution._ok) {
+        const failure =
+          deterministic_move_resolution_failure({
+            _resolution: destination_resolution,
+            _legacy_anchor: destination_fields._legacy_anchor,
+          });
         return {
           _ok: false,
-          _reason: anchor_resolution._reason === "target_not_found" ||
-            anchor_resolution._reason === "text_target_not_found" ||
-            anchor_resolution._reason === "missing_target_id"
-            ? "anchor_not_found"
-            : anchor_resolution._reason,
-          ...(anchor_resolution._details !== undefined
-            ? { _details: anchor_resolution._details }
+          _reason: failure._reason,
+          ...(failure._details !== undefined
+            ? { _details: failure._details }
             : {}),
         };
       }
+      _xlog.log("[xvibe] move object destination resolved", {
+        _requested_destination: requested_destination,
+        _resolved_destination_id: destination_resolution._resolved_target_id,
+        _resolved_destination_path: destination_resolution._resolved_target_path,
+        _strategy: destination_resolution.resolution_strategy,
+      });
 
-      if (anchor_resolution._target_id === eligibility._target_id) {
+      if (destination_resolution.object === target_resolution.object) {
         return {
           _ok: false,
-          _reason: "target_is_anchor",
+          _reason: "target_is_destination",
           _details: {
-            _target_id: eligibility._target_id,
+            _target_id: moved_id,
           },
         };
       }
 
-      const anchor_location =
-        find_view_node_location_by_id(next_view, anchor_resolution._target_id);
       if (
-        !anchor_location?._parent ||
-        !Array.isArray(anchor_location._children) ||
-        typeof anchor_location._index !== "number"
+        (move_position === "append" || move_position === "prepend") &&
+        !Array.isArray(destination_resolution.object._children)
       ) {
         return {
           _ok: false,
-          _reason: "anchor_not_found",
+          _reason: "destination_without_children",
           _details: {
-            _anchor_id: anchor_resolution._target_id,
+            _destination_id:
+              typeof destination_resolution.object._id === "string"
+                ? destination_resolution.object._id
+                : destination_fields._target_id,
           },
         };
       }
 
-      if (anchor_location._parent !== target_location._parent) {
+      destination_parent =
+        move_position === "append" || move_position === "prepend"
+          ? destination_resolution.object
+          : destination_resolution.parent as XVibeJsonObject;
+      destination_index =
+        move_position === "append" || move_position === "prepend"
+          ? undefined
+          : destination_resolution.index;
+      destination_id =
+        typeof destination_resolution.object._id === "string"
+          ? destination_resolution.object._id
+          : undefined;
+      destination_resolved_by =
+        deterministic_resolved_by_from_view_target_strategy(
+          destination_resolution.resolution_strategy,
+        );
+
+      if (
+        !destination_parent ||
+        !Array.isArray(destination_parent._children) ||
+        (
+          (move_position === "before" || move_position === "after") &&
+          typeof destination_index !== "number"
+        )
+      ) {
         return {
           _ok: false,
-          _reason: "different_parent",
+          _reason:
+            move_position === "before" || move_position === "after"
+              ? deterministic_move_missing_destination_reason(destination_fields._legacy_anchor)
+              : "destination_without_children",
           _details: {
-            _target_id: eligibility._target_id,
-            _anchor_id: anchor_resolution._target_id,
+            _destination_id: destination_id ?? destination_fields._target_id,
           },
         };
       }
+    }
 
-      anchor_id = anchor_resolution._target_id;
-      anchor_resolved_by = anchor_resolution._resolved_by;
-      const adjusted_anchor_index =
-        previous_index < anchor_location._index
-          ? anchor_location._index - 1
-          : anchor_location._index;
-      next_index =
-        move_position === "before"
-          ? adjusted_anchor_index
-          : adjusted_anchor_index + 1;
+    if (view_node_contains_node(target_resolution.object, destination_parent)) {
+      return {
+        _ok: false,
+        _reason: "destination_is_descendant",
+        _details: {
+          _target_id: moved_id,
+          _destination_parent_id:
+            typeof destination_parent._id === "string"
+              ? destination_parent._id
+              : undefined,
+        },
+      };
+    }
+
+    let next_index: number;
+    const destination_children =
+      destination_parent._children as XVibeJsonObject[];
+
+    if (move_position === "prepend") {
+      next_index = 0;
+    } else if (move_position === "append") {
+      next_index = destination_children.length;
     } else {
-      next_index = move_position === "top" ? 0 : siblings.length - 1;
+      next_index = destination_index ?? 0;
+      if (move_position === "after") {
+        next_index += 1;
+      }
     }
 
-    const [target_node] = siblings.splice(previous_index, 1);
-    if (move_position === "bottom") {
-      next_index = siblings.length;
+    if (source_parent === destination_parent && previous_index < next_index) {
+      next_index -= 1;
     }
+
+    const [target_node] = source_children.splice(previous_index, 1);
     if (next_index < 0) next_index = 0;
-    if (next_index > siblings.length) next_index = siblings.length;
-    siblings.splice(next_index, 0, target_node);
+    if (next_index > destination_children.length) {
+      next_index = destination_children.length;
+    }
+    destination_children.splice(next_index, 0, target_node);
+
+    const destination_parent_id =
+      typeof destination_parent._id === "string" ? destination_parent._id : undefined;
+    const legacy_move_position =
+      deterministic_legacy_move_position(input._resolved_task);
 
     return {
       _ok: true,
@@ -5566,16 +8895,20 @@ export function apply_deterministic_view_edit(input: {
       _mutation: {
         _type: "deterministic-view-edit",
         _action: "move-object",
-        _target_id: eligibility._target_id,
+        ...(moved_id ? { _target_id: moved_id, _moved_id: moved_id } : {}),
+        ...(moved_id ? {} : { _target_path: moved_path }),
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
-        _move_position: move_position,
-        ...(anchor_id ? { _anchor_id: anchor_id } : {}),
-        ...(move_position === "before" && anchor_id ? { _before_id: anchor_id } : {}),
-        ...(move_position === "after" && anchor_id ? { _after_id: anchor_id } : {}),
-        ...(anchor_resolved_by ? { _anchor_resolved_by: anchor_resolved_by } : {}),
-        ...(typeof target_location._parent._id === "string"
-          ? { _parent_id: target_location._parent._id }
+        _position: move_position,
+        ...(legacy_move_position ? { _move_position: legacy_move_position } : {}),
+        ...(destination_id ? { _destination_id: destination_id } : {}),
+        ...(move_position === "before" && destination_id ? { _anchor_id: destination_id, _before_id: destination_id } : {}),
+        ...(move_position === "after" && destination_id ? { _anchor_id: destination_id, _after_id: destination_id } : {}),
+        ...(destination_resolved_by ? { _anchor_resolved_by: destination_resolved_by } : {}),
+        ...(destination_parent_id
+          ? { _parent_id: destination_parent_id }
           : {}),
+        ...(source_parent_id ? { _source_parent_id: source_parent_id } : {}),
+        ...(destination_parent_id ? { _destination_parent_id: destination_parent_id } : {}),
         _previous_index: previous_index,
         _next_index: next_index,
       },
@@ -5674,19 +9007,37 @@ export function apply_deterministic_view_edit(input: {
   }
 
   if (eligibility._action === "set-property" || eligibility._action === "remove-property") {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+    const requested_property_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_property_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: true,
+        _include_id: Boolean(requested_property_target_id),
+        _allow_root: deterministic_target_type_is_view(input._resolved_task._edit_target_type),
+      });
+    if (!target_resolution._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: eligibility._target_id,
-        },
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
       };
     }
 
-    if (target_node === next_view) {
+    const target_node = target_resolution.object;
+    if (
+      target_node === next_view &&
+      !deterministic_target_type_is_view(input._resolved_task._edit_target_type)
+    ) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -5697,9 +9048,11 @@ export function apply_deterministic_view_edit(input: {
     }
 
     const property_name =
-      typeof input._resolved_task._edit_property_name === "string"
-        ? input._resolved_task._edit_property_name.trim()
-        : "";
+      typeof eligibility._property_name === "string" && eligibility._property_name.trim()
+        ? eligibility._property_name.trim()
+        : typeof input._resolved_task._edit_property_name === "string"
+          ? input._resolved_task._edit_property_name.trim()
+          : "";
     if (!property_name) {
       return { _ok: false, _reason: "missing_property_name" };
     }
@@ -5762,19 +9115,118 @@ export function apply_deterministic_view_edit(input: {
     };
   }
 
-  if (eligibility._action === "set-style" || eligibility._action === "remove-style") {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+  if (eligibility._action === "set-styles") {
+    const requested_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    const styles_value =
+      input._resolved_task._edit_styles ??
+      (input._edit_intent?._styles as unknown);
+    if (styles_value === undefined || styles_value === null) {
+      return { _ok: false, _reason: "missing_styles" };
+    }
+
+    const styles_validation =
+      deterministic_normalize_set_styles(styles_value);
+    if (!styles_validation._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
+        _reason: styles_validation._reason,
+        ...(styles_validation._details !== undefined
+          ? { _details: styles_validation._details }
+          : {}),
+      };
+    }
+
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(requested_target_id),
+        _include_id: Boolean(requested_target_id),
+      });
+    if (!target_resolution._ok) {
+      return {
+        _ok: false,
+        _reason: target_resolution._reason === "text_target_not_found"
+          ? "target_not_found"
+          : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_node = target_resolution.object;
+    if (target_node === next_view) {
+      return {
+        _ok: false,
+        _reason: "target_is_root",
         _details: {
           _target_id: eligibility._target_id,
         },
       };
     }
 
+    const style_object =
+      deterministic_style_object(target_node._style);
+    const previous_styles: XVibeJsonObject = {};
+    for (const style_property of Object.keys(styles_validation._styles)) {
+      if (Object.prototype.hasOwnProperty.call(style_object, style_property)) {
+        previous_styles[style_property] = style_object[style_property];
+      }
+    }
+
+    target_node._style = {
+      ...style_object,
+      ...styles_validation._styles,
+    };
+
+    return {
+      _ok: true,
+      _view: next_view,
+      _mutation: {
+        _type: "deterministic-view-edit",
+        _action: "set-styles",
+        _target_id: eligibility._target_id,
+        _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
+        _styles_applied: styles_validation._styles,
+        _previous_styles: previous_styles,
+      },
+    };
+  }
+
+  if (eligibility._action === "set-style" || eligibility._action === "remove-style") {
+    const requested_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(requested_target_id),
+        _include_id: Boolean(requested_target_id),
+      });
+    if (!target_resolution._ok) {
+      return {
+        _ok: false,
+        _reason:
+          target_resolution._reason === "text_target_not_found"
+            ? "target_not_found"
+            : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
+      };
+    }
+
+    const target_node = target_resolution.object;
     if (target_node === next_view) {
       return {
         _ok: false,
@@ -5851,18 +9303,33 @@ export function apply_deterministic_view_edit(input: {
     eligibility._action === "replace-class" ||
     eligibility._action === "toggle-class"
   ) {
-    const target_node =
-      find_view_node_by_id(next_view, eligibility._target_id);
-    if (!target_node) {
+    const requested_target_id =
+      typeof input._resolved_task._edit_target_id === "string" &&
+      input._resolved_task._edit_target_id.trim()
+        ? input._resolved_task._edit_target_id.trim()
+        : eligibility._target_id;
+    const target_resolution =
+      resolveViewTarget(next_view, {
+        _target_id: requested_target_id,
+        _target_text: input._resolved_task._edit_target_text,
+        _target_type: input._resolved_task._edit_target_type,
+        _target_id_text_fallback: Boolean(requested_target_id),
+        _include_id: Boolean(requested_target_id),
+      });
+    if (!target_resolution._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: eligibility._target_id,
-        },
+        _reason:
+          target_resolution._reason === "text_target_not_found"
+            ? "target_not_found"
+            : target_resolution._reason,
+        ...(target_resolution._details !== undefined
+          ? { _details: target_resolution._details }
+          : {}),
       };
     }
 
+    const target_node = target_resolution.object;
     if (target_node === next_view) {
       return {
         _ok: false,
@@ -5947,18 +9414,20 @@ export function apply_deterministic_view_edit(input: {
 
   if (eligibility._action === "hide-object") {
     const target_location =
-      find_view_node_location_by_id(next_view, eligibility._target_id);
-    if (!target_location) {
+      resolveViewTarget(next_view, {
+        _target_id: eligibility._target_id,
+      });
+    if (!target_location._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: eligibility._target_id,
-        },
+        _reason: target_location._reason,
+        ...(target_location._details !== undefined
+          ? { _details: target_location._details }
+          : {}),
       };
     }
 
-    if (target_location._node === next_view) {
+    if (target_location.object === next_view) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -5968,7 +9437,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    const target_node = target_location._node;
+    const target_node = target_location.object;
     target_node.style =
       xvibe_deterministic_hide_style(target_node.style);
     target_node._visible = false;
@@ -5982,8 +9451,8 @@ export function apply_deterministic_view_edit(input: {
         _action: "hide-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
-        ...(typeof target_location._parent?._id === "string"
-          ? { _parent_id: target_location._parent._id }
+        ...(typeof target_location.parent?._id === "string"
+          ? { _parent_id: target_location.parent._id }
           : {}),
         _hide_mechanism: XVIBE_DETERMINISTIC_HIDE_MECHANISM,
       },
@@ -5992,18 +9461,20 @@ export function apply_deterministic_view_edit(input: {
 
   if (eligibility._action === "show-object") {
     const target_location =
-      find_view_node_location_by_id(next_view, eligibility._target_id);
-    if (!target_location) {
+      resolveViewTarget(next_view, {
+        _target_id: eligibility._target_id,
+      });
+    if (!target_location._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: eligibility._target_id,
-        },
+        _reason: target_location._reason,
+        ...(target_location._details !== undefined
+          ? { _details: target_location._details }
+          : {}),
       };
     }
 
-    if (target_location._node === next_view) {
+    if (target_location.object === next_view) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -6013,7 +9484,7 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    const target_node = target_location._node;
+    const target_node = target_location.object;
     if (typeof target_node.style === "string") {
       const next_style =
         xvibe_style_without_display_none(target_node.style);
@@ -6033,8 +9504,8 @@ export function apply_deterministic_view_edit(input: {
         _action: "show-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
-        ...(typeof target_location._parent?._id === "string"
-          ? { _parent_id: target_location._parent._id }
+        ...(typeof target_location.parent?._id === "string"
+          ? { _parent_id: target_location.parent._id }
           : {}),
         _show_mechanism: XVIBE_DETERMINISTIC_SHOW_MECHANISM,
       },
@@ -6043,18 +9514,20 @@ export function apply_deterministic_view_edit(input: {
 
   if (eligibility._action === "remove-object") {
     const target_location =
-      find_view_node_location_by_id(next_view, eligibility._target_id);
-    if (!target_location) {
+      resolveViewTarget(next_view, {
+        _target_id: eligibility._target_id,
+      });
+    if (!target_location._ok) {
       return {
         _ok: false,
-        _reason: "target_not_found",
-        _details: {
-          _target_id: eligibility._target_id,
-        },
+        _reason: target_location._reason,
+        ...(target_location._details !== undefined
+          ? { _details: target_location._details }
+          : {}),
       };
     }
 
-    if (target_location._node === next_view) {
+    if (target_location.object === next_view) {
       return {
         _ok: false,
         _reason: "target_is_root",
@@ -6065,9 +9538,9 @@ export function apply_deterministic_view_edit(input: {
     }
 
     if (
-      !target_location._parent ||
-      !Array.isArray(target_location._children) ||
-      typeof target_location._index !== "number"
+      !target_location.parent ||
+      !Array.isArray(target_location.parent._children) ||
+      typeof target_location.index !== "number"
     ) {
       return {
         _ok: false,
@@ -6078,8 +9551,8 @@ export function apply_deterministic_view_edit(input: {
       };
     }
 
-    const removed_node = target_location._node;
-    target_location._children.splice(target_location._index, 1);
+    const removed_node = target_location.object;
+    target_location.parent._children.splice(target_location.index, 1);
 
     return {
       _ok: true,
@@ -6089,8 +9562,8 @@ export function apply_deterministic_view_edit(input: {
         _action: "remove-object",
         _target_id: eligibility._target_id,
         _resolved_by: deterministic_resolved_by_from_eligibility(eligibility),
-        ...(typeof target_location._parent._id === "string"
-          ? { _parent_id: target_location._parent._id }
+        ...(typeof target_location.parent._id === "string"
+          ? { _parent_id: target_location.parent._id }
           : {}),
         ...(typeof removed_node._type === "string"
           ? { _removed_type: removed_node._type }
@@ -6312,10 +9785,12 @@ function build_view_edit_intent(input: {
       action !== "replace-class" &&
       action !== "toggle-class" &&
       action !== "set-style" &&
+      action !== "set-styles" &&
       action !== "remove-style" &&
       action !== "set-style-class-rule" &&
       action !== "remove-style-class-rule" &&
       action !== "set-property" &&
+      action !== "update-property" &&
       action !== "remove-property" &&
       action !== "move-object"
     )
@@ -6361,6 +9836,30 @@ function build_view_edit_intent(input: {
   const target_type =
     prompt_edit_target_types(input.prompt)[0] ??
     view_node_type_by_id(input.current_view, target_id);
+  const resolved_task_json = input.resolved_task as XVibeJsonObject;
+  const edit_position =
+    resolved_task_json._edit_position === "append" ||
+    resolved_task_json._edit_position === "prepend" ||
+    resolved_task_json._edit_position === "before" ||
+    resolved_task_json._edit_position === "after"
+      ? resolved_task_json._edit_position
+      : undefined;
+  const edit_destination_id =
+    typeof resolved_task_json._edit_destination_id === "string"
+      ? resolved_task_json._edit_destination_id
+      : undefined;
+  const edit_destination_text =
+    typeof resolved_task_json._edit_destination_text === "string"
+      ? resolved_task_json._edit_destination_text
+      : undefined;
+  const edit_destination_type =
+    typeof resolved_task_json._edit_destination_type === "string"
+      ? resolved_task_json._edit_destination_type
+      : undefined;
+  const edit_styles =
+    _xu.is_plain_object(resolved_task_json._edit_styles)
+      ? resolved_task_json._edit_styles
+      : undefined;
 
   return {
     _action: action,
@@ -6383,6 +9882,9 @@ function build_view_edit_intent(input: {
     ...(input.resolved_task._edit_style_value
       ? { _style_value: input.resolved_task._edit_style_value }
       : {}),
+    ...(edit_styles
+      ? { _styles: edit_styles }
+      : {}),
     ...(input.resolved_task._edit_property_name
       ? { _property_name: input.resolved_task._edit_property_name }
       : {}),
@@ -6392,6 +9894,9 @@ function build_view_edit_intent(input: {
     ...(input.resolved_task._edit_move_position
       ? { _move_position: input.resolved_task._edit_move_position }
       : {}),
+    ...(edit_position
+      ? { _position: edit_position }
+      : {}),
     ...(input.resolved_task._edit_anchor_id
       ? { _anchor_id: input.resolved_task._edit_anchor_id }
       : {}),
@@ -6400,6 +9905,15 @@ function build_view_edit_intent(input: {
       : {}),
     ...(input.resolved_task._edit_anchor_type
       ? { _anchor_type: input.resolved_task._edit_anchor_type }
+      : {}),
+    ...(edit_destination_id
+      ? { _destination_id: edit_destination_id }
+      : {}),
+    ...(edit_destination_text
+      ? { _destination_text: edit_destination_text }
+      : {}),
+    ...(edit_destination_type
+      ? { _destination_type: edit_destination_type }
       : {}),
     ...(target_type ? { _target_type: target_type } : {}),
     ...(warnings.length > 0 ? { _warnings: Array.from(new Set(warnings)) } : {}),
@@ -7282,6 +10796,32 @@ export class XVibeModule extends XModule {
       }
     },
 
+    "get-guide-recommendation": {
+      _name: "get-guide-recommendation",
+      _scope: "module",
+      _description:
+        "Return one deterministic next suggested development step from Project Memory and current app state without AI generation.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default."
+      }
+    },
+
+    "confirm-project-plan": {
+      _name: "confirm-project-plan",
+      _scope: "module",
+      _description:
+        "Confirm the current conversation planning draft and persist it into Project Memory without creating app artifacts.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default.",
+        _conversation_id: "Conversation id containing the current planning draft.",
+        _message_id: "Optional message id for caller correlation.",
+        _artifact: "Optional project-plan artifact fallback.",
+        _project_plan: "Optional project-plan payload fallback."
+      }
+    },
+
     "apply-view-edit": {
       _name: "apply-view-edit",
       _scope: "module",
@@ -7291,7 +10831,7 @@ export class XVibeModule extends XModule {
         _app_id: "Target app id.",
         _env: "Target environment.",
         _view_id: "Target/source view id.",
-        _edit_action: "set-property, remove-property, set-interaction, set-style, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, duplicate-object, or add-child.",
+        _edit_action: "set-property, update-property, remove-property, set-interaction, bind-flow, set-style, set-styles, remove-style, add-class, remove-class, replace-class, toggle-class, remove-object, hide-object, show-object, move-object, replace-object, duplicate-object, add-child, or create-toolbar.",
         _target_id: "Target XUI object id.",
         _target_type: "Optional target XUI type.",
         _before_id: "Anchor XUI object id for move-object or duplicate-object before placement.",
@@ -7302,12 +10842,53 @@ export class XVibeModule extends XModule {
         _interaction_scope: "Interaction scope for set-interaction: _on or _once. Default: _on.",
         _trigger: "Interaction trigger for set-interaction. V1 supports click.",
         _handler: "Interaction handler object for set-interaction, or null to remove the trigger.",
+        _flow: "Flow binding for bind-flow: string flow id or { _id, _payload } object.",
+        _flow_event: "Flow event for bind-flow. Default: click.",
+        _flow_auto: "Whether XUI auto-binds the flow. Default: true.",
         _style_property: "Style property for style edits.",
         _style_value: "Style value for set-style.",
+        _styles: "Style object for set-styles.",
         _class_name: "Class name for add/remove/toggle class edits.",
         _old_class_name: "Old class name for replace-class.",
         _new_class_name: "New class name for replace-class.",
         _object_value: "Replacement object for replace-object."
+      }
+    },
+
+    "apply-mutation-plan": {
+      _name: "apply-mutation-plan",
+      _scope: "module",
+      _description:
+        "Apply a compiled mutation-plan artifact by executing its validated primitive descriptors sequentially. Stops on first failure and does not roll back completed steps.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _conversation_id: "Optional conversation id for caller correlation.",
+        _message_id: "Optional message id for caller correlation.",
+        _action_id: "Optional action id inside the conversation message for action-state persistence.",
+        _plan: "Compiled mutation-plan artifact with _can_apply true and executable primitive descriptors."
+      }
+    },
+
+    "fix-project-views": {
+      _name: "fix-project-views",
+      _scope: "module",
+      _description:
+        "Scan all persisted project views and add deterministic stable _id values to XUI objects that are missing them.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default."
+      }
+    },
+
+    "analyze-project-views": {
+      _name: "analyze-project-views",
+      _scope: "module",
+      _description:
+        "Analyze all persisted project views for missing XUI object _id values without persisting fixes.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Optional environment. Default: default."
       }
     },
 
@@ -7323,6 +10904,19 @@ export class XVibeModule extends XModule {
         _artifact_request: "Artifact request payload. v1 supports entity create.",
         _conversation_id: "Optional source conversation id.",
         _message_id: "Optional source message id."
+      }
+    },
+
+    "append-flow-success-command": {
+      _name: "append-flow-success-command",
+      _scope: "module",
+      _description:
+        "Append a local XUI command to a persisted flow _on_success handler without changing the flow steps.",
+      _params: {
+        _app_id: "Target app id.",
+        _env: "Target environment.",
+        _flow_id: "Persisted flow id.",
+        _command: "Local XUI command object to run after successful flow completion."
       }
     },
 
@@ -7489,6 +11083,8 @@ export class XVibeModule extends XModule {
         _env: "Target environment.",
         _conversation_id: "Conversation id.",
         _message_id: "Message id containing the artifact request intent.",
+        _artifact_type: "Optional artifact type identity check.",
+        _artifact_request: "Optional artifact request identity check.",
         _artifact_status: "done, failed, or dismissed.",
         _artifact_result: "Optional JSON-compatible artifact result object.",
         _artifact_error: "Optional artifact error string or JSON-compatible object."
@@ -7518,6 +11114,9 @@ export class XVibeModule extends XModule {
   private readonly generation_manager: GenerationManager;
   private readonly artifact_executor: ArtifactExecutor;
   private readonly execution_graph_executor: ExecutionGraphExecutor;
+  private readonly guide_recommendation_engine: GuideRecommendationEngine;
+  private readonly guide_recommendation_cache =
+    new Map<string, GuideRecommendationCacheEntry>();
 
   constructor() {
     super({ _name: XVibeModule._name });
@@ -7565,6 +11164,7 @@ export class XVibeModule extends XModule {
       undefined,
       this.artifact_executor,
     );
+    this.guide_recommendation_engine = new GuideRecommendationEngine();
   }
 
   override async onLoad() {
@@ -7578,6 +11178,198 @@ export class XVibeModule extends XModule {
     mode?: string,
   ) {
     return this.generation_manager.getRuntimeSkills(app_id, env, mode);
+  }
+
+  private get_cached_guide_recommendation(
+    cache_key: string | undefined,
+  ): XVibeGuideRecommendation | null | undefined {
+    if (!cache_key) return undefined;
+
+    const cached = this.guide_recommendation_cache.get(cache_key);
+    if (!cached) return undefined;
+
+    if (cached._expires_at < Date.now()) {
+      this.guide_recommendation_cache.delete(cache_key);
+      return undefined;
+    }
+
+    return cached._recommendation;
+  }
+
+  private set_cached_guide_recommendation(input: {
+    _cache_key: string | undefined;
+    _recommendation: XVibeGuideRecommendation | null;
+  }) {
+    if (!input._cache_key) return;
+
+    if (this.guide_recommendation_cache.size > 100) {
+      this.guide_recommendation_cache.clear();
+    }
+
+    this.guide_recommendation_cache.set(input._cache_key, {
+      _expires_at: Date.now() + GUIDE_RECOMMENDATION_CACHE_TTL_MS,
+      _recommendation: input._recommendation,
+    });
+  }
+
+  async getGuideRecommendation(input: {
+    _app_id: string;
+    _env?: string;
+    _project_memory?: Partial<XVibeProjectMemory> | null;
+    _runtime_assets?: Partial<XVibeRuntimeAssets> | null;
+  }): Promise<XVibeGuideRecommendation | null> {
+    const app_id = _xu.ensure_string(input._app_id, "_app_id");
+    const env =
+      typeof input._env === "string" && input._env.trim().length > 0
+        ? input._env.trim()
+        : DEFAULT_ENV;
+
+    const has_project_memory_override =
+      Object.prototype.hasOwnProperty.call(input, "_project_memory");
+    const project_memory =
+      has_project_memory_override
+        ? (_xu.is_plain_object(input._project_memory)
+          ? input._project_memory
+          : undefined)
+        : await RuntimeContextManager.loadProjectMemory({
+          _app_id: app_id,
+          _env: env,
+        });
+
+    const cache_key = guide_recommendation_cache_key({
+      _app_id: app_id,
+      _env: env,
+      _project_memory: project_memory,
+    });
+    const cached_recommendation =
+      this.get_cached_guide_recommendation(cache_key);
+    if (cached_recommendation !== undefined) {
+      return cached_recommendation;
+    }
+
+    const has_runtime_assets_override =
+      Object.prototype.hasOwnProperty.call(input, "_runtime_assets");
+    const runtime_assets =
+      has_runtime_assets_override
+        ? (_xu.is_plain_object(input._runtime_assets)
+          ? input._runtime_assets
+          : undefined)
+        : await RuntimeContextManager.collectRuntimeAssets({
+          _app_id: app_id,
+          _env: env,
+          _runtime_skills: this.get_runtime_skills(app_id, env),
+        });
+
+    const recommendation =
+      this.guide_recommendation_engine.recommend({
+        _project_memory: project_memory,
+        _runtime_assets: runtime_assets,
+      });
+
+    if (recommendation) {
+      _xlog.log("[xvibe] guide recommendation", {
+        _title: recommendation._title,
+        _reason: recommendation._reason,
+        _priority: recommendation._priority,
+      });
+      if (
+        !project_memory_has_achievement(
+          project_memory,
+          "first-guide-recommendation",
+        )
+      ) {
+        const achievement_result = await record_project_memory_achievement({
+          _app_id: app_id,
+          _env: env,
+          _achievement_id: "first-guide-recommendation",
+        });
+        const achievement_cache_key = guide_recommendation_cache_key({
+          _app_id: app_id,
+          _env: env,
+          _project_memory: achievement_result?._memory,
+        });
+        this.set_cached_guide_recommendation({
+          _cache_key: achievement_cache_key,
+          _recommendation: recommendation,
+        });
+      }
+    }
+
+    this.set_cached_guide_recommendation({
+      _cache_key: cache_key,
+      _recommendation: recommendation,
+    });
+
+    return recommendation;
+  }
+
+  private async record_crud_milestone_completion(input: {
+    _app_id: string;
+    _env: string;
+    _entity_name: string;
+    _result: unknown;
+  }): Promise<void> {
+    if (!_xu.is_plain_object(input._result)) return;
+    if (input._result._ok !== true) return;
+    if (!_xu.is_plain_object(input._result._summary)) return;
+    if (input._result._summary._failed !== 0) return;
+
+    const entity_id = _xu.normalize_id(input._entity_name);
+    if (!entity_id) return;
+
+    try {
+      const memory_response = await _x.execute({
+        _module: "server-xvm",
+        _op: "get-project-memory",
+        _params: {
+          _app_id: input._app_id,
+          _env: input._env,
+        },
+      } as any);
+
+      if (_xu.is_plain_object(memory_response) && memory_response._ok === false) {
+        return;
+      }
+
+      const memory = extract_project_memory(memory_response);
+      if (!memory) return;
+
+      const completion = complete_project_memory_focus_milestone_item({
+        _memory: memory,
+        _item_id: `${entity_id}-crud`,
+      });
+      if (!completion._completed) return;
+
+      const patch_response = await _x.execute({
+        _module: "server-xvm",
+        _op: "patch-project-memory",
+        _params: {
+          _app_id: input._app_id,
+          _env: input._env,
+          _patch: {
+            _milestones: completion._memory._milestones,
+          },
+        },
+      } as any);
+
+      if (_xu.is_plain_object(patch_response) && patch_response._ok === false) {
+        return;
+      }
+
+      _xlog.log("[xvibe] project memory milestone item completed", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _milestone_id: completion._milestone?._id,
+        _item_id: completion._item?._id,
+      });
+    } catch (error) {
+      _xlog.log("[xvibe] project memory milestone item completion skipped", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _entity_name: entity_id,
+        _error: error_summary(error),
+      });
+    }
   }
 
   private resolve_starters_root(): string {
@@ -7751,6 +11543,7 @@ export class XVibeModule extends XModule {
   private async implement_generated_module_from_spec(input: {
     spec: XVibeModuleCreatorSpec;
     user_request: string;
+    project_memory?: unknown;
     current_or_generated_view?: unknown;
     originating_view?: unknown;
     server_module_call_graph?: XVibeServerModuleCallGraph;
@@ -7814,6 +11607,9 @@ export class XVibeModule extends XModule {
         build_generated_module_implementation_prompt({
           spec: input.spec,
           user_request: input.user_request,
+          ...(input.project_memory !== undefined
+            ? { project_memory: input.project_memory }
+            : {}),
           server_module_call_graph,
           ...(current_or_generated_view !== undefined
             ? { current_or_generated_view }
@@ -8149,6 +11945,11 @@ export class XVibeModule extends XModule {
       await this.implement_generated_module_from_spec({
         spec,
         user_request: input.prompt,
+        project_memory:
+          await RuntimeContextManager.loadProjectMemory({
+            _app_id: input.app_id,
+            _env: input.env,
+          }),
         server_module_call_graph: {},
         _progress: input._progress,
         _archive: input._archive,
@@ -8238,6 +12039,11 @@ export class XVibeModule extends XModule {
     const archive_validation: XVibeRunValidationArchive = {
       _implementation_attempts: [],
     };
+    const project_memory =
+      await RuntimeContextManager.loadProjectMemory({
+        _app_id: input.app_id,
+        _env: input.env,
+      });
     const archive: XVibeRunArchiveData = {
       _generation_id: input.generation_id,
       _app_id: input.app_id,
@@ -8250,6 +12056,9 @@ export class XVibeModule extends XModule {
       _runtime_context: {
         _runtime_mode: input.runtime_mode,
         _runtime_skills: input.runtime_skills,
+        ...(project_memory !== undefined
+          ? { _project_memory: project_memory }
+          : {}),
       },
       _validation: archive_validation,
     };
@@ -9161,6 +12970,10 @@ export class XVibeModule extends XModule {
       runtime_plan: input.runtime_plan,
       resolved_task: input.resolved_task,
       generation_id: input.generation_id,
+      project_memory:
+        _xu.is_plain_object(input.archive._runtime_context)
+          ? input.archive._runtime_context._project_memory
+          : undefined,
       deterministic_mutation:
         input.archive._deterministic_mutation as XVibeDeterministicViewEditResult["_mutation"],
       include_artifact_type: true,
@@ -9794,6 +13607,11 @@ export class XVibeModule extends XModule {
       this.intent_planner.extract_runtime_capabilities(runtime_skills);
     const inferred_intent =
       this.intent_planner.infer_intent_plan(params.prompt, params.app_plan, runtime_capabilities);
+    const project_memory =
+      await RuntimeContextManager.loadProjectMemory({
+        _app_id: params.app_id,
+        _env: params.env,
+      });
 
     verbose_log("[xvibe] intent planning:start", {
       _app_id: params.app_id,
@@ -9843,6 +13661,13 @@ export class XVibeModule extends XModule {
       "Runtime capability registry:",
       JSON.stringify(runtime_capabilities),
       "",
+      ...(project_memory
+        ? [
+          "Project Memory:",
+          JSON.stringify(project_memory),
+          "",
+        ]
+        : []),
       "User prompt:",
       params.prompt,
       "",
@@ -10799,6 +14624,7 @@ export class XVibeModule extends XModule {
     _artifact_type: VibeArtifactType;
     _artifact: XVibeGeneratedArtifact;
     _validation_errors: string[];
+    _project_memory?: unknown;
   }): Promise<XVibeGeneratedArtifact> {
     const repair_prompt = [
       "You are an Xpell JSON artifact repairer.",
@@ -10839,6 +14665,13 @@ export class XVibeModule extends XModule {
       "Original prompt:",
       input._prompt,
       "",
+      ...(input._project_memory !== undefined
+        ? [
+          "Project Memory:",
+          JSON.stringify(input._project_memory),
+          "",
+        ]
+        : []),
       "Generated JSON:",
       JSON.stringify(this.artifact_envelope(input._artifact_type, input._artifact), null, 2),
       "",
@@ -10886,6 +14719,7 @@ export class XVibeModule extends XModule {
     _generated_artifacts?: unknown;
     _planned_flow_ids?: string[];
     _deterministic_mutation?: XVibeDeterministicViewEditResult["_mutation"];
+    _project_memory?: unknown;
     _archive_validation?: XVibeRunValidationArchive;
     _progress?: XVibeGenerationProgressCallback;
   }): Promise<XVibeGeneratedArtifact> {
@@ -10932,6 +14766,9 @@ export class XVibeModule extends XModule {
         _artifact_type: input._artifact_type,
         _artifact: input._artifact,
         _validation_errors: validation._errors,
+        ...(input._project_memory !== undefined
+          ? { _project_memory: input._project_memory }
+          : {}),
       });
     } catch (error) {
       _xlog.warn("[xvibe] repair failed", {
@@ -12284,6 +16121,7 @@ export class XVibeModule extends XModule {
 
         _runtime_skills: runtime_skills,
       });
+      const project_memory = runtime_context._project_memory;
       if (edit_intent) {
         runtime_context._edit_intent = edit_intent;
       }
@@ -12583,6 +16421,9 @@ export class XVibeModule extends XModule {
           runtime_plan,
           resolved_task,
           generation_id: effective_generation_id,
+          ...(project_memory !== undefined
+            ? { project_memory }
+            : {}),
           include_artifact_type: forced_artifact_type !== "view",
           archive,
           archive_started_at,
@@ -12617,6 +16458,9 @@ export class XVibeModule extends XModule {
           _artifact: parsed._flow,
           _runtime_skills: runtime_skills,
           _runtime_plan: runtime_plan,
+          ...(project_memory !== undefined
+            ? { _project_memory: project_memory }
+            : {}),
           _archive_validation: archive_validation,
           _progress: stage,
         }) as XVibeFlowArtifact;
@@ -12684,6 +16528,9 @@ export class XVibeModule extends XModule {
           _artifact: parsed._entity,
           _runtime_skills: runtime_skills,
           _runtime_plan: runtime_plan,
+          ...(project_memory !== undefined
+            ? { _project_memory: project_memory }
+            : {}),
           _archive_validation: archive_validation,
           _progress: stage,
         }) as XVibeEntityArtifact;
@@ -12750,6 +16597,9 @@ export class XVibeModule extends XModule {
         _artifact: parsed._command,
         _runtime_skills: runtime_skills,
         _runtime_plan: runtime_plan,
+        ...(project_memory !== undefined
+          ? { _project_memory: project_memory }
+          : {}),
         _archive_validation: archive_validation,
         _progress: stage,
       }) as XVibeCommandArtifact;
@@ -12861,6 +16711,7 @@ export class XVibeModule extends XModule {
     runtime_plan?: XVibeRuntimePlan;
     resolved_task?: XVibeResolvedTask;
     generation_id?: string;
+    project_memory?: unknown;
     deterministic_mutation?: XVibeDeterministicViewEditResult["_mutation"];
     source_view_id?: string;
     include_artifact_type: boolean;
@@ -12980,6 +16831,9 @@ export class XVibeModule extends XModule {
         _generated_artifacts: input.generated_artifacts,
         _planned_flow_ids: input.planned_flow_ids,
         _deterministic_mutation: input.deterministic_mutation,
+        ...(input.project_memory !== undefined
+          ? { _project_memory: input.project_memory }
+          : {}),
         _archive_validation:
           input.archive?._validation as XVibeRunValidationArchive | undefined,
         _progress: input.progress,
@@ -13088,6 +16942,9 @@ export class XVibeModule extends XModule {
             _deterministic: true,
             _mutation_action: input.deterministic_mutation._action,
             _mutation_target_id: input.deterministic_mutation._target_id,
+            ...(input.deterministic_mutation._target_path
+              ? { _mutation_target_path: input.deterministic_mutation._target_path }
+              : {}),
           }
           : {}),
         ...(persisted_version !== undefined
@@ -13131,6 +16988,9 @@ export class XVibeModule extends XModule {
           _deterministic: true,
           _mutation_action: input.deterministic_mutation._action,
           _mutation_target_id: input.deterministic_mutation._target_id,
+          ...(input.deterministic_mutation._target_path
+            ? { _mutation_target_path: input.deterministic_mutation._target_path }
+            : {}),
         }
         : input.include_artifact_type
         ? {
@@ -13308,6 +17168,17 @@ export class XVibeModule extends XModule {
     return StructuredViewEdit.apply({
       _cmd: xcmd,
       _deps: {
+        _list_project_view_ids: async (input) => {
+          const list_response = await _x.execute({
+            _module: "server-xvm",
+            _op: "list_views",
+            _params: {
+              _app_id: input._app_id,
+              _env: input._env,
+            },
+          } as any);
+          return extract_project_view_list_ids(list_response);
+        },
         _load_current_view_for_refine:
           this.load_current_view_for_refine.bind(this),
         _load_xvm_view_references_for_refine:
@@ -13322,12 +17193,656 @@ export class XVibeModule extends XModule {
     });
   }
 
+  async _apply_mutation_plan(xcmd: XCommand) {
+    const params =
+      _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+    const app_id =
+      read_required_string(params._app_id, "_app_id");
+    const env =
+      read_required_string(params._env ?? DEFAULT_ENV, "_env");
+    const conversation_id =
+      read_optional_string(params._conversation_id, "_conversation_id");
+    const message_id =
+      read_optional_string(params._message_id, "_message_id");
+    const action_id =
+      read_optional_string(params._action_id, "_action_id");
+
+    const validation =
+      validate_mutation_plan_for_execution({
+        _plan: params._plan,
+        _app_id: app_id,
+        _env: env,
+      });
+    if (!validation._ok) {
+      const result =
+        mutation_plan_error_result({
+        _code: validation._code,
+        _message: validation._message,
+        ...(validation._details ? { _details: validation._details } : {}),
+        });
+      await this.persist_mutation_plan_conversation_execution({
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+        _message_id: message_id,
+        _action_id: action_id,
+        _plan: params._plan,
+        _result: result,
+      });
+      return result;
+    }
+
+    const execution_steps: XVibeMutationPlanExecutionStep[] = [];
+    let completed_steps = 0;
+
+    _xlog.log("[xvibe] mutation plan execution started", {
+      _step_count: validation._steps.length,
+      _app_id: app_id,
+      _env: env,
+    });
+
+    for (const [index, step] of validation._steps.entries()) {
+      const running_step: XVibeMutationPlanExecutionStep = {
+        _id: step._id,
+        _status: "running",
+      };
+      execution_steps.push(running_step);
+      _xlog.log("[xvibe] mutation plan step", {
+        _step_id: step._id,
+        _index: index,
+        _status: "running",
+      });
+
+      try {
+        const primitive =
+          step._primitive as XVibeMutationPlanPrimitive;
+        let result: unknown;
+        const existing_completed_result =
+          await this.mutation_plan_existing_completed_result(primitive._params);
+        if (existing_completed_result) {
+          result = existing_completed_result;
+        } else {
+          const command_context =
+            (xcmd as any)?._ctx;
+          result = await _x.execute({
+            _module: primitive._module,
+            _op: primitive._op,
+            _params: primitive._params,
+            ...(command_context ? { _ctx: command_context } : {}),
+          } as any);
+        }
+
+        if (_xu.is_plain_object(result) && result._ok === false) {
+          const error =
+            mutation_plan_step_error(result);
+          running_step._status = "failed";
+          running_step._result = result;
+          running_step._error = error;
+          _xlog.log("[xvibe] mutation plan step", {
+            _step_id: step._id,
+            _index: index,
+            _status: "failed",
+          });
+          _xlog.log("[xvibe] mutation plan execution completed", {
+            _completed_steps: completed_steps,
+            _failed_steps: 1,
+            _status: "failed",
+          });
+          const terminal_result: XVibeJsonObject = {
+            _ok: false,
+            _status: "failed",
+            _completed_steps: completed_steps,
+            _failed_steps: 1,
+            _failed_step_id: step._id,
+            _error: error,
+            _steps: execution_steps,
+          };
+          await this.persist_mutation_plan_conversation_execution({
+            _app_id: app_id,
+            _env: env,
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+            _action_id: action_id,
+            _plan: validation._plan,
+            _result: terminal_result,
+          });
+          return terminal_result;
+        }
+
+        running_step._status = "done";
+        running_step._result = result;
+        completed_steps += 1;
+        _xlog.log("[xvibe] mutation plan step", {
+          _step_id: step._id,
+          _index: index,
+          _status: "done",
+        });
+      } catch (error) {
+        const step_error =
+          mutation_plan_step_error(error);
+        running_step._status = "failed";
+        running_step._error = step_error;
+        _xlog.log("[xvibe] mutation plan step", {
+          _step_id: step._id,
+          _index: index,
+          _status: "failed",
+        });
+        _xlog.log("[xvibe] mutation plan execution completed", {
+          _completed_steps: completed_steps,
+          _failed_steps: 1,
+          _status: "failed",
+        });
+        const result: XVibeJsonObject = {
+          _ok: false,
+          _status: "failed",
+          _completed_steps: completed_steps,
+          _failed_steps: 1,
+          _failed_step_id: step._id,
+          _error: step_error,
+          _steps: execution_steps,
+        };
+        await this.persist_mutation_plan_conversation_execution({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _message_id: message_id,
+          _action_id: action_id,
+          _plan: validation._plan,
+          _result: result,
+        });
+        return result;
+      }
+    }
+
+    _xlog.log("[xvibe] mutation plan execution completed", {
+      _completed_steps: completed_steps,
+      _failed_steps: 0,
+      _status: "done",
+    });
+
+    const result: XVibeJsonObject = {
+      _ok: true,
+      _status: "done",
+      _completed_steps: completed_steps,
+      _failed_steps: 0,
+      _steps: execution_steps,
+    };
+    await this.persist_mutation_plan_conversation_execution({
+      _app_id: app_id,
+      _env: env,
+      _conversation_id: conversation_id,
+      _message_id: message_id,
+      _action_id: action_id,
+      _plan: validation._plan,
+      _result: result,
+    });
+    return result;
+  }
+
+  private mutation_plan_execution_artifact_result(input: {
+    _result: XVibeJsonObject;
+    _completed_at: string;
+  }): XVibeJsonObject {
+    const result =
+      clone_json(input._result) as XVibeJsonObject;
+    const steps =
+      Array.isArray(result._steps)
+        ? result._steps
+        : [];
+    const status =
+      result._status === "done" && result._ok === true
+        ? "done"
+        : "failed";
+    const completed_steps =
+      typeof result._completed_steps === "number" && Number.isFinite(result._completed_steps)
+        ? result._completed_steps
+        : steps.filter((step) =>
+          _xu.is_plain_object(step) && step._status === "done").length;
+    const failed_steps =
+      typeof result._failed_steps === "number" && Number.isFinite(result._failed_steps)
+        ? result._failed_steps
+        : steps.filter((step) =>
+          _xu.is_plain_object(step) && step._status === "failed").length;
+
+    return {
+      ...result,
+      _status: status,
+      _completed_steps: completed_steps,
+      _failed_steps: failed_steps,
+      _completed_at: input._completed_at,
+    };
+  }
+
+  private mutation_plan_execution_error_payload(
+    result: XVibeJsonObject,
+  ): unknown {
+    if (result._status !== "failed" && result._ok !== false) return undefined;
+    if (result._error !== undefined) return result._error;
+    return {
+      _code: "E_XVIBE_MUTATION_PLAN_FAILED",
+      _message: "Mutation plan failed.",
+    };
+  }
+
+  private async persist_mutation_plan_conversation_execution(input: {
+    _app_id: string;
+    _env: string;
+    _conversation_id?: string;
+    _message_id?: string;
+    _action_id?: string;
+    _plan: unknown;
+    _result: XVibeJsonObject;
+  }): Promise<void> {
+    if (!input._conversation_id || !input._message_id) return;
+
+    const completed_at =
+      new Date().toISOString();
+    const artifact_result =
+      this.mutation_plan_execution_artifact_result({
+        _result: input._result,
+        _completed_at: completed_at,
+      });
+    const status =
+      artifact_result._status === "done" ? "done" : "failed";
+    const artifact_error =
+      this.mutation_plan_execution_error_payload(artifact_result);
+    const artifact_params: XVibeJsonObject = {
+      _app_id: input._app_id,
+      _env: input._env,
+      _conversation_id: input._conversation_id,
+      _message_id: input._message_id,
+      _artifact_type: "mutation-plan",
+      _artifact_status: status,
+      _artifact_result: artifact_result,
+      ...(artifact_error !== undefined ? { _artifact_error: artifact_error } : {}),
+      ...(_xu.is_plain_object(input._plan)
+        ? { _artifact_request: input._plan }
+        : {}),
+    };
+    const artifact_update =
+      await ConversationManager.updateConversationArtifact({
+        _params: artifact_params,
+      } as any);
+    if (!_xu.is_plain_object(artifact_update) || artifact_update._ok !== true) {
+      _xlog.warn("[xvibe] mutation plan conversation artifact persistence skipped", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _conversation_id: input._conversation_id,
+        _message_id: input._message_id,
+        _status: status,
+        _error:
+          _xu.is_plain_object(artifact_update) && _xu.is_plain_object(artifact_update._error)
+            ? artifact_update._error
+            : artifact_update,
+      });
+      return;
+    }
+
+    if (!input._action_id) return;
+    const action_update =
+      await ConversationManager.updateConversationAction({
+        _params: {
+          _app_id: input._app_id,
+          _env: input._env,
+          _conversation_id: input._conversation_id,
+          _message_id: input._message_id,
+          _action_id: input._action_id,
+          _status: status,
+          _result: artifact_result,
+          ...(artifact_error !== undefined ? { _error: JSON.stringify(artifact_error) } : {}),
+          _metadata: {
+            _source: "xvibe.apply-mutation-plan",
+            _artifact_type: "mutation-plan",
+            _completed_at: completed_at,
+          },
+        },
+      } as any);
+    if (!_xu.is_plain_object(action_update) || action_update._ok !== true) {
+      _xlog.warn("[xvibe] mutation plan conversation action persistence skipped", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _conversation_id: input._conversation_id,
+        _message_id: input._message_id,
+        _action_id: input._action_id,
+        _status: status,
+        _error:
+          _xu.is_plain_object(action_update) && _xu.is_plain_object(action_update._error)
+            ? action_update._error
+            : action_update,
+      });
+    }
+  }
+
+  private async mutation_plan_existing_completed_result(
+    params: XVibeJsonObject,
+  ): Promise<XVibeJsonObject | undefined> {
+    try {
+      const app_id =
+        read_required_string(params._app_id, "_app_id");
+      const env =
+        read_required_string(params._env ?? DEFAULT_ENV, "_env");
+      const view_id =
+        read_required_string(params._view_id, "_view_id");
+      const current_view =
+        await this.load_current_view_for_refine({
+          _app_id: app_id,
+          _env: env,
+          _view_id: view_id,
+        });
+      return (
+        mutation_plan_existing_stable_child_result({
+          _view: current_view,
+          _params: params,
+        }) ??
+        mutation_plan_existing_completed_move_result({
+          _view: current_view,
+          _params: params,
+        }) ??
+        mutation_plan_existing_completed_bind_flow_result({
+          _view: current_view,
+          _params: params,
+        }) ??
+        mutation_plan_existing_completed_property_result({
+          _view: current_view,
+          _params: params,
+        })
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async fix_project_views_internal(input: {
+    _app_id: string;
+    _env: string;
+    _dry_run: boolean;
+  }): Promise<XVibeProjectViewFixReport> {
+    const list_response = await _x.execute({
+      _module: "server-xvm",
+      _op: "list_views",
+      _params: {
+        _app_id: input._app_id,
+        _env: input._env,
+      },
+    } as any);
+    if (_xu.is_plain_object(list_response) && list_response._ok === false) {
+      throw new Error("server-xvm.list_views failed");
+    }
+
+    const view_ids =
+      extract_project_view_list_ids(list_response);
+    const report: XVibeProjectViewFixReport = {
+      _app_id: input._app_id,
+      _env: input._env,
+      _dry_run: input._dry_run,
+      _views_scanned: 0,
+      _views_updated: 0,
+      _objects_scanned: 0,
+      _ids_added: 0,
+      _collisions_resolved: 0,
+      _views: [],
+    };
+
+    for (const view_id of view_ids) {
+      const view_response = await _x.execute({
+        _module: "server-xvm",
+        _op: "get_view",
+        _params: {
+          _app_id: input._app_id,
+          _env: input._env,
+          _view_id: view_id,
+        },
+      } as any);
+      if (_xu.is_plain_object(view_response) && view_response._ok === false) {
+        throw new Error(`server-xvm.get_view failed: ${view_id}`);
+      }
+
+      const current_view =
+        extract_project_view_from_response(view_response);
+      if (!current_view) {
+        throw new Error(`server-xvm.get_view returned no view: ${view_id}`);
+      }
+
+      const next_view =
+        clone_deterministic_view_json(current_view) as XVibeJsonObject;
+      const view_report =
+        fix_project_view_ids_for_view({
+          _view_id: view_id,
+          _view: next_view,
+        });
+
+      report._views_scanned += 1;
+      report._objects_scanned += view_report._objects_scanned;
+      report._ids_added += view_report._ids_added;
+      report._collisions_resolved += view_report._collisions_resolved;
+      report._views.push(view_report);
+
+      if (view_report._updated && !input._dry_run) {
+        await _x.execute({
+          _module: "server-xvm",
+          _op: "push_update",
+          _params: {
+            _app_id: input._app_id,
+            _env: input._env,
+            _view: next_view,
+          },
+        } as any);
+        report._views_updated += 1;
+      }
+    }
+
+    return report;
+  }
+
+  async _fix_project_views(xcmd: XCommand) {
+    try {
+      const params = _xu.ensure_params(xcmd?._params);
+      const app_id = _xu.ensure_string(params._app_id, "_app_id");
+      const env =
+        read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
+
+      const report =
+        await this.fix_project_views_internal({
+          _app_id: app_id,
+          _env: env,
+          _dry_run: false,
+        });
+
+      _xlog.log("[xvibe] project views fixed", {
+        _app_id: app_id,
+        _env: env,
+        _views_scanned: report._views_scanned,
+        _views_updated: report._views_updated,
+        _objects_scanned: report._objects_scanned,
+        _ids_added: report._ids_added,
+        _collisions_resolved: report._collisions_resolved,
+      });
+
+      return {
+        _ok: true,
+        _result: report,
+        ...report,
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) return structured;
+
+      return explicit_error(
+        "E_XVIBE_FIX_PROJECT_VIEWS_FAILED",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  async _analyze_project_views(xcmd: XCommand) {
+    try {
+      const params = _xu.ensure_params(xcmd?._params);
+      const app_id = _xu.ensure_string(params._app_id, "_app_id");
+      const env =
+        read_optional_string(params._env, "_env") ?? DEFAULT_ENV;
+
+      const report =
+        await this.fix_project_views_internal({
+          _app_id: app_id,
+          _env: env,
+          _dry_run: true,
+        });
+
+      return {
+        _ok: true,
+        _result: report,
+        ...report,
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) return structured;
+
+      return explicit_error(
+        "E_XVIBE_ANALYZE_PROJECT_VIEWS_FAILED",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  async _append_flow_success_command(xcmd: XCommand) {
+    try {
+      const params = _xu.ensure_params(xcmd?._params);
+      const app_id =
+        read_required_string(params._app_id, "_app_id");
+      const env =
+        read_required_string(params._env ?? DEFAULT_ENV, "_env");
+      const flow_id =
+        read_required_string(params._flow_id, "_flow_id");
+      if (!_xu.is_plain_object(params._command)) {
+        return explicit_error(
+          "E_XVIBE_FLOW_SUCCESS_COMMAND_INVALID",
+          "Invalid '_command': expected a command object.",
+        );
+      }
+      const command = params._command as XVibeJsonObject;
+
+      if (!server_xvm_has_op("get_flow") || !server_xvm_has_op("set_flow")) {
+        return explicit_error(
+          "E_VIBE_AI_SERVER_XVM_OP_MISSING",
+          "server-xvm flow persistence ops are not available",
+        );
+      }
+
+      let flow_response: any;
+      try {
+        flow_response = await _x.execute({
+          _module: "server-xvm",
+          _op: "get_flow",
+          _params: {
+            _app_id: app_id,
+            _env: env,
+            _flow_id: flow_id,
+          },
+        } as any);
+      } catch (error) {
+        return explicit_error(
+          "E_XVIBE_FLOW_NOT_FOUND",
+          `Flow not found: ${flow_id}`,
+          { _error: error instanceof Error ? error.message : String(error) },
+        );
+      }
+
+      const flow =
+        _xu.is_plain_object(flow_response?._result) &&
+        _xu.is_plain_object(flow_response._result._flow)
+          ? clone_json(flow_response._result._flow as XVibeJsonObject)
+          : null;
+      if (!flow) {
+        return explicit_error(
+          "E_XVIBE_FLOW_NOT_FOUND",
+          `Flow not found: ${flow_id}`,
+        );
+      }
+
+      const success_handler =
+        append_flow_success_command_value({
+          _existing: flow._on_success,
+          _command: command,
+        });
+      if (!success_handler._changed) {
+        return {
+          _ok: true,
+          _artifact_type: "flow",
+          _operation: "append-on-success-command",
+          _flow_id: flow_id,
+          _changed: false,
+          _already_exists: true,
+        };
+      }
+
+      flow._on_success = success_handler._value;
+      const persist_response = await _x.execute({
+        _module: "server-xvm",
+        _op: "set_flow",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _flow: flow,
+        },
+      } as any);
+      if (!persist_response?._ok) {
+        return explicit_error(
+          "E_XVIBE_SERVER_XVM_ERROR",
+          "Failed to persist flow success handler.",
+          { _error: persist_response?._result ?? persist_response?._error },
+        );
+      }
+
+      _xem.fire("vibe:flow-updated", {
+        _app_id: app_id,
+        _env: env,
+        _flow_id: flow_id,
+      });
+
+      return {
+        _ok: true,
+        _artifact_type: "flow",
+        _operation: "append-on-success-command",
+        _flow_id: flow_id,
+        _changed: true,
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) return structured;
+
+      return explicit_error(
+        "E_XVIBE_FLOW_SUCCESS_COMMAND_FAILED",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   async _apply_artifact_request(xcmd: XCommand) {
     return this.artifact_executor.apply(xcmd);
   }
 
   async _execute_execution_graph(xcmd: XCommand) {
-    return this.execution_graph_executor.apply(xcmd);
+    const result = await this.execution_graph_executor.apply(xcmd);
+    const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+    if (params._graph_type === "crud") {
+      await this.record_crud_milestone_completion({
+        _app_id:
+          typeof params._app_id === "string" && params._app_id.trim().length > 0
+            ? params._app_id.trim()
+            : "",
+        _env:
+          typeof params._env === "string" && params._env.trim().length > 0
+            ? params._env.trim()
+            : DEFAULT_ENV,
+        _entity_name:
+          typeof params._entity_name === "string"
+            ? params._entity_name
+            : "",
+        _result: result,
+      });
+    }
+
+    return result;
   }
 
   async _generate(xcmd: XCommand) {
@@ -13348,6 +17863,44 @@ export class XVibeModule extends XModule {
 
   async _generate_module_spec(xcmd: XCommand): Promise<XVibeGenerateModuleSpecResult> {
     return this.generation_manager.generateModuleSpec(xcmd) as Promise<XVibeGenerateModuleSpecResult>;
+  }
+
+  async _get_guide_recommendation(xcmd: XCommand) {
+    try {
+      const params = _xu.ensure_params(xcmd?._params);
+      const recommendation =
+        await this.getGuideRecommendation({
+          _app_id: _xu.ensure_string(params._app_id, "_app_id"),
+          _env:
+            typeof params._env === "string" && params._env.trim().length > 0
+              ? params._env.trim()
+              : DEFAULT_ENV,
+          ...(_xu.is_plain_object(params._project_memory)
+            ? { _project_memory: params._project_memory as Partial<XVibeProjectMemory> }
+            : {}),
+          ...(_xu.is_plain_object(params._runtime_assets)
+            ? { _runtime_assets: params._runtime_assets as Partial<XVibeRuntimeAssets> }
+            : {}),
+        });
+
+      return {
+        _ok: true,
+        _result: {
+          _recommendation: recommendation,
+        },
+        _recommendation: recommendation,
+      };
+    } catch (error) {
+      const structured = structured_error_payload(error);
+      if (structured) {
+        _xlog.error("[xvibe] guide recommendation failed", error);
+        return structured;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] guide recommendation failed", error);
+      return explicit_error("E_XVIBE_GUIDE_RECOMMENDATION_FAILED", message);
+    }
   }
 
   async _create_app_from_starter(xcmd: XCommand) {
@@ -13383,18 +17936,53 @@ export class XVibeModule extends XModule {
       }
 
       const target_dir = resolve_target_app_dir(env, app_id);
+      const public_app_dir = resolve_target_public_app_dir(app_id);
       if (fs.existsSync(target_dir)) {
         throw_explicit_error(XVIBE_APP_ALREADY_EXISTS, `Target app already exists: ${app_id}`, {
           _app_id: app_id,
           _env: env,
         });
       }
+      if (fs.existsSync(public_app_dir)) {
+        throw_explicit_error(XVIBE_APP_ALREADY_EXISTS, `Target app public folder already exists: ${app_id}`, {
+          _app_id: app_id,
+          _env: env,
+          _path: public_app_dir,
+        });
+      }
 
       try {
-        _xu.copyDirRecursive(starter_dir, target_dir);
+        copy_starter_runtime_files(starter_dir, target_dir);
+        copy_starter_public_files(starter_dir, public_app_dir, app_id);
+        rewrite_json_files_in_dir(target_dir, app_id);
       } catch (error) {
+        const structured = structured_error_payload(error);
+        const structured_error =
+          _xu.is_plain_object(structured?._error)
+            ? structured?._error
+            : undefined;
+        const structured_details =
+          _xu.is_plain_object(structured_error)
+            ? structured_error._details
+            : undefined;
+        const failure_details =
+          _xu.is_plain_object(structured_details)
+            ? structured_details
+            : undefined;
+        _xlog.error("[xvibe] starter copy/rewrite failed", {
+          _starter_id: starter_id,
+          _app_id: app_id,
+          _env: env,
+          _target_dir: target_dir,
+          _public_app_dir: public_app_dir,
+          ...(failure_details ? { _failed_path: failure_details._path } : {}),
+          ...(failure_details ? { _failed_target_path: failure_details._target_path } : {}),
+          _error: error instanceof Error ? error.message : String(error),
+        });
+
         try {
           fs.rmSync(target_dir, { recursive: true, force: true });
+          fs.rmSync(public_app_dir, { recursive: true, force: true });
         } catch {
           // Best effort cleanup of a failed deterministic starter copy.
         }
@@ -13403,6 +17991,10 @@ export class XVibeModule extends XModule {
           _starter_id: starter_id,
           _app_id: app_id,
           _env: env,
+          _target_dir: target_dir,
+          _public_app_dir: public_app_dir,
+          ...(failure_details ? { _failed_path: failure_details._path } : {}),
+          ...(failure_details ? { _failed_target_path: failure_details._target_path } : {}),
           _error: error instanceof Error ? error.message : String(error),
         });
       }
@@ -13411,6 +18003,8 @@ export class XVibeModule extends XModule {
         _starter_id: starter_id,
         _app_id: app_id,
         _env: env,
+        _target_dir: target_dir,
+        _public_app_dir: public_app_dir,
       });
 
       const app_file_path = path.join(target_dir, "app.json");
@@ -13539,6 +18133,117 @@ export class XVibeModule extends XModule {
       _intent_engine: this.intent_engine,
       _structured_error_payload: structured_error_payload,
     });
+  }
+
+  async _confirm_project_plan(xcmd: XCommand) {
+    try {
+      const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
+      const app_id = normalize_safe_app_id(params._app_id);
+      const env = read_safe_path_segment(params._env ?? DEFAULT_ENV, "_env", XVIBE_INVALID_ENV);
+      const conversation_id =
+        read_safe_path_segment(
+          params._conversation_id,
+          "_conversation_id",
+          XVIBE_INVALID_CONVERSATION_ID,
+        );
+      const message_id = read_optional_string(params._message_id, "_message_id");
+      _xlog.log("[xvibe] confirm project plan requested", {
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+        ...(message_id ? { _message_id: message_id } : {}),
+      });
+
+      const stored_draft = ConversationManager.readPlanningDraft({
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+      });
+      const fallback_draft = read_confirm_project_plan_fallback(params);
+      const draft = stored_draft ?? fallback_draft;
+      if (!draft) {
+        return explicit_error(
+          PLANNING_DRAFT_NOT_FOUND,
+          "Current conversation planning draft was not found.",
+          {
+            _app_id: app_id,
+            _env: env,
+            _conversation_id: conversation_id,
+            _fallback_provided: fallback_draft !== undefined,
+          },
+        );
+      }
+
+      const validation = validate_project_plan_draft(draft);
+      if (!validation._ok) {
+        return explicit_error(
+          PLANNING_INCOMPLETE,
+          "Project plan draft is not ready for confirmation.",
+          {
+            _errors: validation._errors,
+            _source: stored_draft ? "conversation-draft" : "fallback-payload",
+          },
+        );
+      }
+
+      const patch = project_plan_memory_patch({
+        _draft: validation._draft,
+        _questions: validation._questions,
+      });
+      const patch_result = await _x.execute({
+        _module: "server-xvm",
+        _op: "patch-project-memory",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _patch: patch,
+        },
+      });
+      if (!_xu.is_plain_object(patch_result) || patch_result._ok !== true) {
+        return explicit_error(
+          PROJECT_MEMORY_PATCH_FAILED,
+          "Project Memory patch failed.",
+          {
+            _result: patch_result,
+          },
+        );
+      }
+
+      if (stored_draft) {
+        ConversationManager.clearPlanningDraft({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+        });
+      }
+
+      const memory = extract_project_memory(patch_result);
+      _xlog.log("[xvibe] project plan confirmed", {
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+      });
+
+      return {
+        _ok: true,
+        _result: {
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+          _confirmed: true,
+          _memory: memory,
+        },
+      };
+    } catch (error) {
+      const structured =
+        structured_error_payload(error) ??
+        ConversationManager.errorPayload(error);
+      if (structured) return structured;
+
+      const message = error instanceof Error ? error.message : String(error);
+      _xlog.error("[xvibe] confirm_project_plan failed", error);
+      return explicit_error(PROJECT_MEMORY_PATCH_FAILED, message);
+    }
   }
 
   async _update_conversation_action(xcmd: XCommand) {

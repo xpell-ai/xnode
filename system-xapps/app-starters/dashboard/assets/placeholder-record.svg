@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360" role="img" aria-labelledby="title desc">
+  <title id="title">Dashboard record placeholder</title>
+  <desc id="desc">Neutral placeholder graphic for a dashboard card.</desc>
+  <rect width="640" height="360" rx="28" fill="#0f172a"/>
+  <rect x="48" y="52" width="220" height="24" rx="12" fill="#67e8f9"/>
+  <rect x="48" y="102" width="544" height="34" rx="12" fill="#1f2937"/>
+  <rect x="48" y="154" width="544" height="34" rx="12" fill="#1f2937"/>
+  <rect x="48" y="206" width="544" height="34" rx="12" fill="#1f2937"/>
+  <rect x="48" y="274" width="146" height="34" rx="17" fill="#a7f3d0"/>
+</svg>

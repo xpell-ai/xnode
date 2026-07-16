@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160" viewBox="0 0 160 160" role="img" aria-labelledby="title desc">
+  <title id="title">Xpell Dashboard Starter logo</title>
+  <desc id="desc">A simple geometric dashboard mark.</desc>
+  <rect width="160" height="160" rx="32" fill="#111827"/>
+  <path d="M38 44h84v16H38z" fill="#67e8f9"/>
+  <path d="M38 74h36v42H38z" fill="#a7f3d0"/>
+  <path d="M88 74h34v18H88z" fill="#fef3c7"/>
+  <path d="M88 104h34v12H88z" fill="#fca5a5"/>
+  <path d="M38 128h84" stroke="#e5e7eb" stroke-width="8" stroke-linecap="round"/>
+</svg>

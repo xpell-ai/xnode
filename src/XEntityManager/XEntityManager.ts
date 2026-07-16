@@ -65,6 +65,12 @@ const XENTITY_MANAGER_OPS = {
             }
         },
 
+        _aggregate: {
+            _name: "_aggregate",
+            _scope: "module",
+            _description: "Aggregate records."
+        },
+
         _update: {
             _name: "_update",
             _scope: "module",
@@ -632,10 +638,71 @@ export class XEntityManager extends XModule {
                 params._filter ??
                 {};
 
+            const rawSkip =
+                params._skip ??
+                params.skip;
+            const skip =
+                typeof rawSkip === "number" &&
+                Number.isInteger(rawSkip)
+                    ? Math.max(0, rawSkip)
+                    : 0;
+
+            const rawLimit =
+                params._limit ??
+                params.limit;
+            const limit =
+                typeof rawLimit === "number" &&
+                Number.isInteger(rawLimit)
+                    ? Math.max(0, rawLimit)
+                    : 100000;
+
+            const reverseOrder =
+                params._reverse_order === true ||
+                params.reverseOrder === true ||
+                params.reverse_order === true;
+
+            const sortInput =
+                params._sort ??
+                params.sort;
+
+            const xdataDestination =
+                typeof params._xdata_destination === "string"
+                    ? params._xdata_destination
+                    : undefined;
+
+            _xlog.log("[entity-manager] find query", {
+                _app_id:
+                    params._app_id,
+                _env:
+                    params._env,
+                _entity:
+                    params._entity ??
+                    params._entity_id,
+                _filter:
+                    filter,
+                _sort:
+                    sortInput,
+                _skip:
+                    skip,
+                _limit:
+                    limit,
+                _reverse_order:
+                    reverseOrder,
+                _xdata_destination:
+                    xdataDestination,
+            });
+
             const result =
                 stored
                     ._xdb_entity
-                    .find(filter);
+                    .find(
+                        filter,
+                        skip,
+                        limit,
+                        false,
+                        reverseOrder,
+                        sortInput
+                    );
 
             await this.applyHashFilter(
                 stored._xdb_entity,
@@ -643,9 +710,188 @@ export class XEntityManager extends XModule {
                 params._hash_filter
             );
 
+            _xlog.log("[entity-manager] find result", {
+                _app_id:
+                    params._app_id,
+                _env:
+                    params._env,
+                _entity:
+                    params._entity ??
+                    params._entity_id,
+                _records:
+                    Array.isArray(result?._data)
+                        ? result._data.length
+                        : 0,
+                _xdata_destination:
+                    xdataDestination,
+            });
+
             return new XResponseOK({
                 _records: result
             }).toXData();
+
+        } catch (err) {
+
+            return new XResponseError(err)
+                .toXData();
+        }
+    }
+
+    /* -------------------------------------------------- */
+    /* AGGREGATE                                          */
+    /* -------------------------------------------------- */
+
+    async _aggregate(xcmd: XCommand) {
+
+        try {
+
+            const params =
+                xcmd?._params || {};
+
+            const aggregation =
+                params._aggregation &&
+                typeof params._aggregation === "object" &&
+                !Array.isArray(params._aggregation)
+                    ? params._aggregation as Record<string, any>
+                    : (
+                        params.aggregation &&
+                        typeof params.aggregation === "object" &&
+                        !Array.isArray(params.aggregation)
+                    )
+                        ? params.aggregation as Record<string, any>
+                        : {};
+
+            const op =
+                String(
+                    aggregation?._op ??
+                    aggregation?.op ??
+                    params._aggregation_op ??
+                    params.aggregation_op ??
+                    params._op ??
+                    params.op ??
+                    ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+            const field =
+                String(
+                    aggregation?._field ??
+                    aggregation?.field ??
+                    params._field ??
+                    params.field ??
+                    ""
+                )
+                    .trim();
+
+            if (op !== "sum") {
+                throw new Error("Unsupported aggregation op");
+            }
+
+            if (!field) {
+                throw new Error("Missing aggregation field");
+            }
+
+            const records =
+                Array.isArray(params._records)
+                    ? params._records
+                    : Array.isArray(params.records)
+                        ? params.records
+                        : [];
+
+            let value = 0;
+
+            for (const record of records) {
+                if (!record || typeof record !== "object") continue;
+                const raw =
+                    record[field];
+                if (raw === undefined || raw === null || raw === "") continue;
+                const numeric =
+                    Number(raw);
+                if (!Number.isFinite(numeric)) {
+                    throw new Error(`Field ${field} contains a non-numeric value`);
+                }
+                value += numeric;
+            }
+
+            _xlog.log("[entity-manager] aggregate result", {
+                _entity:
+                    params._entity ??
+                    params._entity_id,
+                _op:
+                    op,
+                _field:
+                    field,
+                _records:
+                    records.length,
+                _value:
+                    value,
+                _xdata_key:
+                    typeof params._result_xdata_key === "string"
+                        ? params._result_xdata_key
+                        : typeof params._xdata_destination === "string"
+                            ? params._xdata_destination
+                            : undefined,
+            });
+            _xlog.log("[entity-manager] aggregate value resolved", {
+                _field:
+                    field,
+                _value:
+                    value,
+                _xdata_key:
+                    typeof params._result_xdata_key === "string"
+                        ? params._result_xdata_key
+                        : typeof params._xdata_destination === "string"
+                            ? params._xdata_destination
+                            : undefined,
+            });
+
+            if (typeof params._xdata_destination === "string") {
+                _xlog.warn("[entity-manager] aggregate _xdata_destination is deprecated for XVibe summaries; use the generated xd.set value extraction", {
+                    _field:
+                        field,
+                    _xdata_destination:
+                        params._xdata_destination,
+                });
+            }
+
+            const response =
+                new XResponseOK({
+                    _aggregation: {
+                        _op:
+                            op,
+                        _field:
+                            field,
+                        _value:
+                            value,
+                    },
+                    _value:
+                        value,
+                }).toXData();
+
+            _xlog.log("[xentity] aggregate response", {
+                _entity:
+                    params._entity ??
+                    params._entity_id,
+                _field:
+                    field,
+                _response_keys:
+                    Object.keys(response),
+                _result_type:
+                    Array.isArray(response._result) ? "array" : typeof response._result,
+                _result_keys:
+                    response._result &&
+                    typeof response._result === "object" &&
+                    !Array.isArray(response._result)
+                        ? Object.keys(response._result)
+                        : undefined,
+                _value_type:
+                    typeof response._result?._value,
+                _value:
+                    response._result?._value,
+            });
+
+            return response;
 
         } catch (err) {
 

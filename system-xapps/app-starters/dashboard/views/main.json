@@ -1,11 +1,617 @@
 {
   "_id": "main",
   "_type": "view",
+  "_theme": "terminal",
+  "_requires": ["system.ready.wormhole"],
   "_children": [
     {
-      "_id": "dashboard-title",
-      "_type": "label",
-      "_text": "Dashboard"
+      "_id": "dashboard-style-sheet",
+      "_type": "style-sheet",
+      "_href": "style/custom.css",
+      "_classes": {}
+    },
+    {
+      "_id": "dashboard-shell",
+      "_type": "view",
+      "class": "dashboard-shell",
+      "_children": [
+        {
+          "_id": "dashboard-sidebar",
+          "_type": "sidebar",
+          "class": "dashboard-sidebar",
+          "_title": "Xpell Dashboard Starter",
+          "_subtitle": "Canonical XUI shell",
+          "_logo": "assets/logo.svg",
+          "_scroll": true,
+          "_dividers": true,
+          "_nav": {
+            "_id": "dashboard-primary-nav",
+            "_type": "navlist",
+            "_active": "overview",
+            "_dense": true,
+            "_items": [
+              {
+                "_id": "dashboard-nav-overview",
+                "_label": "Overview",
+                "_value": "overview"
+              },
+              {
+                "_id": "dashboard-nav-records",
+                "_label": "Records",
+                "_value": "records"
+              },
+              {
+                "_id": "dashboard-nav-activity",
+                "_label": "Activity",
+                "_value": "activity"
+              },
+              {
+                "_id": "dashboard-nav-settings",
+                "_label": "Settings",
+                "_value": "settings"
+              }
+            ]
+          },
+          "_footer": [
+            {
+              "_id": "dashboard-sidebar-status",
+              "_type": "badge",
+              "_text": "Starter",
+              "_variant": "info",
+              "_pill": true
+            }
+          ]
+        },
+        {
+          "_id": "dashboard-main-scroll",
+          "_type": "scroll",
+          "class": "dashboard-main-scroll",
+          "_direction": "vertical",
+          "_grow": true,
+          "_children": [
+            {
+              "_id": "dashboard-toolbar",
+              "_type": "toolbar",
+              "class": "dashboard-toolbar",
+              "_sticky": true,
+              "_top": 0,
+              "_elevated": true,
+              "_justify": "space-between",
+              "_align": "center",
+              "_wrap": true,
+              "_gap": 16,
+              "_children": [
+                {
+                  "_id": "dashboard-toolbar-title-group",
+                  "_type": "stack",
+                  "class": "dashboard-toolbar-title-group",
+                  "_direction": "vertical",
+                  "_gap": 4,
+                  "_children": [
+                    {
+                      "_id": "dashboard-page-title",
+                      "_type": "label",
+                      "_text": "Dashboard",
+                      "class": "dashboard-page-title"
+                    },
+                    {
+                      "_id": "dashboard-page-subtitle",
+                      "_type": "label",
+                      "_text": "Business-neutral starter for previewing and persisting XUI changes.",
+                      "class": "dashboard-page-subtitle"
+                    }
+                  ]
+                },
+                {
+                  "_id": "dashboard-toolbar-actions",
+                  "_type": "igroup",
+                  "class": "dashboard-toolbar-actions",
+                  "_gap": 10,
+                  "_align": "center",
+                  "_wrap": true,
+                  "_children": [
+                    {
+                      "_id": "dashboard-record-search",
+                      "_type": "search",
+                      "class": "dashboard-search",
+                      "_placeholder": "Search records...",
+                      "_clearable": true,
+                      "_icon": true
+                    },
+                    {
+                      "_id": "dashboard-theme-select",
+                      "_type": "select",
+                      "class": "toolbar-theme-select",
+                      "_data_source": "settings.theme",
+                      "_data_output": "settings.theme",
+                      "_update_data_source_event": "change",
+                      "_persist": {
+                        "_store": "xdb-client",
+                        "_key": "settings.theme",
+                        "_default": "terminal"
+                      },
+                      "_options": [
+                        {
+                          "value": "terminal",
+                          "label": "Terminal"
+                        },
+                        {
+                          "value": "dark",
+                          "label": "Dark"
+                        },
+                        {
+                          "value": "light",
+                          "label": "Light"
+                        }
+                      ],
+                      "_on_data": [
+                        {
+                          "_op": "select-value",
+                          "_params": {
+                            "value": "$data"
+                          }
+                        },
+                        {
+                          "_module": "xui",
+                          "_op": "set-theme",
+                          "_params": {
+                            "_theme": "$data"
+                          }
+                        }
+                      ],
+                      "_on": {
+                        "change": {
+                          "_module": "xui",
+                          "_op": "set-theme",
+                          "_params": {
+                            "_theme": "$event.target.value"
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "_id": "dashboard-refresh-button",
+                      "_type": "button",
+                      "_text": "Refresh"
+                    },
+                    {
+                      "_id": "dashboard-create-record-button",
+                      "_type": "button",
+                      "_text": "New Record",
+                      "_variant": "primary",
+                      "_on": {
+                        "click": {
+                          "_op": "toggle",
+                          "_params": {
+                            "target": "dashboard-create-record-modal"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "_id": "dashboard-overview-section",
+              "_type": "xsection",
+              "class": "dashboard-section",
+              "_title": "Overview",
+              "_subtitle": "Starter metrics use generic dashboard records and remain safe to adapt.",
+              "_actions": [
+                {
+                  "_id": "dashboard-overview-badge",
+                  "_type": "badge",
+                  "_text": "Live preview ready",
+                  "_variant": "success",
+                  "_pill": true
+                }
+              ],
+              "_children": [
+                {
+                  "_id": "dashboard-kpi-grid",
+                  "_type": "grid",
+                  "_min_col_width": 220,
+                  "_gap": 16,
+                  "_children": [
+                    {
+                      "_id": "dashboard-records-kpi",
+                      "_type": "kpi-card",
+                      "_label": "Dashboard records",
+                      "_value": "128",
+                      "_delta": "+12 this week",
+                      "_delta_state": "up",
+                      "_icon": "records"
+                    },
+                    {
+                      "_id": "dashboard-completion-kpi",
+                      "_type": "kpi-card",
+                      "_label": "Completion rate",
+                      "_value": "82%",
+                      "_delta": "+4%",
+                      "_delta_state": "up",
+                      "_icon": "rate"
+                    },
+                    {
+                      "_id": "dashboard-open-items-kpi",
+                      "_type": "kpi-card",
+                      "_label": "Open items",
+                      "_value": "34",
+                      "_delta": "-3",
+                      "_delta_state": "down",
+                      "_icon": "items"
+                    },
+                    {
+                      "_id": "dashboard-health-kpi",
+                      "_type": "kpi-card",
+                      "_label": "Runtime health",
+                      "_value": "Ready",
+                      "_delta": "Stable",
+                      "_delta_state": "flat",
+                      "_icon": "status"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "_id": "dashboard-records-section",
+              "_type": "xsection",
+              "class": "dashboard-section",
+              "_title": "Records",
+              "_subtitle": "A neutral table bound to generic dashboard-record rows.",
+              "_actions": [
+                {
+                  "_id": "dashboard-records-count-badge",
+                  "_type": "badge",
+                  "_text": "4 records",
+                  "_variant": "info",
+                  "_pill": true
+                }
+              ],
+              "_children": [
+                {
+                  "_id": "dashboard-records-table",
+                  "_type": "table",
+                  "_row_key": "_id",
+                  "_columns": [
+                    {
+                      "_key": "record_name",
+                      "_title": "Record"
+                    },
+                    {
+                      "_key": "category",
+                      "_title": "Category"
+                    },
+                    {
+                      "_key": "owner",
+                      "_title": "Owner"
+                    },
+                    {
+                      "_key": "state",
+                      "_title": "State"
+                    },
+                    {
+                      "_key": "updated_at",
+                      "_title": "Updated"
+                    }
+                  ],
+                  "_rows": [
+                    {
+                      "_id": "dashboard-record-001",
+                      "_entity": "dashboard-record",
+                      "record_name": "Record intake",
+                      "category": "Workflow",
+                      "owner": "Team",
+                      "state": "Active",
+                      "updated_at": "Today"
+                    },
+                    {
+                      "_id": "dashboard-record-002",
+                      "_entity": "dashboard-record",
+                      "record_name": "Review queue",
+                      "category": "Operations",
+                      "owner": "Editor",
+                      "state": "Review",
+                      "updated_at": "Yesterday"
+                    },
+                    {
+                      "_id": "dashboard-record-003",
+                      "_entity": "dashboard-record",
+                      "record_name": "Quality check",
+                      "category": "Control",
+                      "owner": "Analyst",
+                      "state": "Pending",
+                      "updated_at": "Jul 15"
+                    },
+                    {
+                      "_id": "dashboard-record-004",
+                      "_entity": "dashboard-record",
+                      "record_name": "Publish batch",
+                      "category": "Delivery",
+                      "owner": "Operator",
+                      "state": "Ready",
+                      "updated_at": "Jul 14"
+                    }
+                  ],
+                  "_empty_text": "No dashboard records yet",
+                  "_dense": false,
+                  "_striped": true,
+                  "_hover": true,
+                  "_bordered": true
+                }
+              ]
+            },
+            {
+              "_id": "dashboard-secondary-grid",
+              "_type": "grid",
+              "class": "dashboard-secondary-grid",
+              "_min_col_width": 340,
+              "_gap": 16,
+              "_children": [
+                {
+                  "_id": "dashboard-activity-section",
+                  "_type": "xsection",
+                  "_title": "Recent activity",
+                  "_subtitle": "Generic dashboard-activity rows for timeline-style updates.",
+                  "_children": [
+                    {
+                      "_id": "dashboard-activity-table",
+                      "_type": "table",
+                      "_row_key": "_id",
+                      "_columns": [
+                        {
+                          "_key": "activity",
+                          "_title": "Activity"
+                        },
+                        {
+                          "_key": "actor",
+                          "_title": "Actor"
+                        },
+                        {
+                          "_key": "status",
+                          "_title": "Status"
+                        }
+                      ],
+                      "_rows": [
+                        {
+                          "_id": "dashboard-activity-001",
+                          "_entity": "dashboard-activity",
+                          "activity": "Record created",
+                          "actor": "System",
+                          "status": "Done"
+                        },
+                        {
+                          "_id": "dashboard-activity-002",
+                          "_entity": "dashboard-activity",
+                          "activity": "Preview generated",
+                          "actor": "Vibe",
+                          "status": "Ready"
+                        },
+                        {
+                          "_id": "dashboard-activity-003",
+                          "_entity": "dashboard-activity",
+                          "activity": "View synchronized",
+                          "actor": "XVM",
+                          "status": "Synced"
+                        }
+                      ],
+                      "_empty_text": "No recent activity",
+                      "_dense": true,
+                      "_hover": true,
+                      "_bordered": true
+                    }
+                  ]
+                },
+                {
+                  "_id": "dashboard-settings-section",
+                  "_type": "xsection",
+                  "_title": "Settings",
+                  "_subtitle": "Starter-local controls that demonstrate form architecture.",
+                  "_children": [
+                    {
+                      "_id": "dashboard-settings-card",
+                      "_type": "card",
+                      "class": "dashboard-settings-card",
+                      "_hide_image": false,
+                      "_image": "assets/placeholder-record.svg",
+                      "_image_alt": "Dashboard placeholder",
+                      "_title": "Workspace preferences",
+                      "_text": "Use field wrappers and dashboard selects for mutable view settings.",
+                      "_actions": [
+                        {
+                          "_id": "dashboard-settings-save-button",
+                          "_type": "button",
+                          "_text": "Save settings"
+                        }
+                      ]
+                    },
+                    {
+                      "_id": "dashboard-settings-form",
+                      "_type": "stack",
+                      "class": "dashboard-settings-form",
+                      "_direction": "vertical",
+                      "_gap": 12,
+                      "_children": [
+                        {
+                          "_id": "dashboard-density-field",
+                          "_type": "field",
+                          "_label": "Density",
+                          "_hint": "Choose how compact record tables should appear.",
+                          "_control": {
+                            "_id": "dashboard-density-select",
+                            "_type": "xselect",
+                            "_value": "comfortable",
+                            "_options": [
+                              {
+                                "value": "compact",
+                                "label": "Compact"
+                              },
+                              {
+                                "value": "comfortable",
+                                "label": "Comfortable"
+                              },
+                              {
+                                "value": "spacious",
+                                "label": "Spacious"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "_id": "dashboard-status-field",
+                          "_type": "field",
+                          "_label": "Default status",
+                          "_control": {
+                            "_id": "dashboard-status-select",
+                            "_type": "xselect",
+                            "_value": "active",
+                            "_options": [
+                              {
+                                "value": "active",
+                                "label": "Active"
+                              },
+                              {
+                                "value": "review",
+                                "label": "Review"
+                              },
+                              {
+                                "value": "pending",
+                                "label": "Pending"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "_id": "dashboard-create-record-modal",
+      "_type": "modal",
+      "_open": false,
+      "_title": "Create record",
+      "_subtitle": "Create a generic dashboard-record entry.",
+      "_size": "md",
+      "_closable": true,
+      "_close_on_backdrop": true,
+      "_children": [
+        {
+          "_id": "dashboard-create-record-form",
+          "_type": "stack",
+          "class": "dashboard-create-record-form",
+          "_direction": "vertical",
+          "_gap": 14,
+          "_children": [
+            {
+              "_id": "dashboard-create-record-name-field",
+              "_type": "field",
+              "_label": "Record name",
+              "_required": true,
+              "_data_output": "dashboard_record_form.record_name",
+              "_update_data_source_event": "input",
+              "_control": {
+                "_id": "dashboard-create-record-name-input",
+                "_type": "text",
+                "placeholder": "Record name"
+              }
+            },
+            {
+              "_id": "dashboard-create-record-category-field",
+              "_type": "field",
+              "_label": "Category",
+              "_data_output": "dashboard_record_form.category",
+              "_update_data_source_event": "change",
+              "_control": {
+                "_id": "dashboard-create-record-category-select",
+                "_type": "xselect",
+                "_value": "workflow",
+                "_options": [
+                  {
+                    "value": "workflow",
+                    "label": "Workflow"
+                  },
+                  {
+                    "value": "operations",
+                    "label": "Operations"
+                  },
+                  {
+                    "value": "control",
+                    "label": "Control"
+                  }
+                ]
+              }
+            },
+            {
+              "_id": "dashboard-create-record-owner-field",
+              "_type": "field",
+              "_label": "Owner",
+              "_data_output": "dashboard_record_form.owner",
+              "_update_data_source_event": "input",
+              "_control": {
+                "_id": "dashboard-create-record-owner-input",
+                "_type": "text",
+                "placeholder": "Owner"
+              }
+            }
+          ]
+        }
+      ],
+      "_actions": [
+        {
+          "_id": "dashboard-create-record-cancel-button",
+          "_type": "button",
+          "_text": "Cancel",
+          "_on": {
+            "click": {
+              "_op": "toggle",
+              "_params": {
+                "target": "dashboard-create-record-modal"
+              }
+            }
+          }
+        },
+        {
+          "_id": "dashboard-create-record-submit-button",
+          "_type": "button",
+          "_text": "Create record",
+          "_variant": "primary",
+          "_on": {
+            "click": [
+              {
+                "_module": "xd",
+                "_op": "set",
+                "_params": {
+                  "key": "dashboard:last_action",
+                  "value": "create-record",
+                  "source": "dashboard-create-record-submit-button"
+                }
+              },
+              {
+                "_op": "toggle",
+                "_params": {
+                  "target": "dashboard-create-record-modal"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "_id": "dashboard-feedback-toast",
+      "_type": "toast",
+      "_open": false,
+      "_text": "Dashboard settings saved",
+      "_variant": "success",
+      "_position": "bottom-right",
+      "_closable": true
     }
   ]
 }

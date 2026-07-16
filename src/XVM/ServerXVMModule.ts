@@ -4,7 +4,20 @@ import { fileURLToPath } from "node:url";
 import { XModule, type XCommand, _xlog, _x, XError, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
 import { _xem } from "../XEM/XEventManager.js";
 import { _xu } from "../XNUtils/XUtils.js";
+import { _xs } from "../XSettings/XSettings.js";
 import { wsBroadcastScoped, wsSetScope } from "../Wormholes/wh.index.js";
+import {
+  append_project_memory_achievement,
+  log_project_memory_achievement_result,
+} from "./ProjectMemoryAchievements.js";
+import {
+  apply_project_memory_milestones,
+  normalize_project_memory_milestones,
+} from "./ProjectMemoryMilestones.js";
+import {
+  resolveProjectStage,
+  type XVMProjectMemoryStage,
+} from "./ProjectMemoryStage.js";
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -43,12 +56,35 @@ export type XVMAppBundle = {
   _entities: Record<string, any>;
 };
 
+export type XVMProjectMemory = {
+  _version: number;
+  _stage: XVMProjectMemoryStage;
+  _vision: string;
+  _goal: string;
+  _summary?: string;
+  _proposed?: {
+    _entities?: unknown[];
+    _views?: unknown[];
+    _flows?: unknown[];
+    _server_modules?: unknown[];
+  };
+  _current_focus: string;
+  _completed: unknown[];
+  _achievements: unknown[];
+  _milestones: unknown[];
+  _parking_lot: unknown[];
+  _decisions: unknown[];
+  _notes: unknown[];
+  _updated_at: string;
+};
+
 /* -------------------------------------------------------------------------- */
 
 const DEFAULT_ENV = "default";
 const DEFAULT_WORK_FOLDER = "./work";
 const XVM_FOLDER = "xvm/apps";
 const GENERATED_MODULE_REGISTRY_FILE = "generated/xmodules/registry.json";
+const ACTIVE_APPS_SETTINGS_KEY = "_active_apps";
 const XNODE_PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const ALLOWED_VIEW_STARTER_TEMPLATES = new Set(["blank", "page", "component"]);
 
@@ -102,6 +138,24 @@ export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
     _name: "get_view",
     _scope: "module",
     _description: "Load view artifact."
+  },
+
+  get_project_memory: {
+    _name: "get_project_memory",
+    _scope: "module",
+    _description: "Load or initialize application project memory."
+  },
+
+  save_project_memory: {
+    _name: "save_project_memory",
+    _scope: "module",
+    _description: "Persist application project memory."
+  },
+
+  patch_project_memory: {
+    _name: "patch_project_memory",
+    _scope: "module",
+    _description: "Patch and persist application project memory."
   },
 
   create_view: {
@@ -227,6 +281,7 @@ export const SERVER_XVM_SKILL: XpellSkill = {
     "Views are persisted through push_update.",
     "Flows are persisted through set_flow.",
     "Entities are persisted through set_entity.",
+    "Project memory is persisted as project-memory.json next to app.json.",
     "Version changes broadcast runtime updates.",
     "server-xvm is the source of truth for runtime artifacts."
   ]
@@ -313,18 +368,21 @@ export class ServerXVMModule extends XModule {
 
     this.get_bundle(app_id, env);
 
+    this.persist_active_app(env, app_id);
     this._active_app_by_env.set(env, app_id);
 
     _xlog.log("[server-xvm] active app set", {
       _app_id: app_id,
-      _env: env
+      _env: env,
+      _persisted: true
     });
 
     return {
       _ok: true,
       _result: {
         _app_id: app_id,
-        _env: env
+        _env: env,
+        _persisted: true
       }
     };
   }
@@ -333,9 +391,7 @@ export class ServerXVMModule extends XModule {
     const params = _xu.ensure_params(xcmd?._params);
     const env = this.resolve_env(params);
 
-    const app_id =
-      this._active_app_by_env.get(env) ??
-      "vibe-system";
+    const app_id = this.resolve_default_app_id(env);
 
     return {
       _ok: true,
@@ -355,10 +411,7 @@ export class ServerXVMModule extends XModule {
 
     const env = this.resolve_env(params);
 
-    const app_id =
-      typeof params._app_id === "string" && params._app_id.trim()
-        ? params._app_id.trim()
-        : this._active_app_by_env.get(env) ?? "vibe-system";
+    const app_id = this.resolve_app_id(params, env);
     const include_views = params._include_views === true;
     const include_flows = params._include_flows === true;
 
@@ -464,6 +517,98 @@ export class ServerXVMModule extends XModule {
         _version: bundle._app._meta._version,
         _view: view,
       },
+    };
+  }
+
+  async _get_project_memory(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const context = this.resolve_project_memory_context(params);
+    const memory = this.load_or_create_project_memory(
+      context._app_id,
+      context._env,
+      context._memory_path
+    );
+
+    return {
+      _ok: true,
+      _result: {
+        _memory: this.normalize_project_memory(memory, {
+          _touch_updated_at: false
+        })
+      }
+    };
+  }
+
+  async _save_project_memory(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const context = this.resolve_project_memory_context(params);
+
+    if (!_xu.is_plain_object(params._memory)) {
+      throw new XError("E_XVM_INVALID_PAYLOAD", "Missing _memory");
+    }
+
+    const memory = apply_project_memory_milestones(
+      this.normalize_project_memory(params._memory)
+    ) as XVMProjectMemory;
+    this.save_project_memory_file(context._app_id, context._env, context._memory_path, memory);
+
+    return {
+      _ok: true,
+      _result: {
+        _memory: memory
+      }
+    };
+  }
+
+  async _patch_project_memory(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const context = this.resolve_project_memory_context(params);
+
+    if (!_xu.is_plain_object(params._patch)) {
+      throw new XError("E_XVM_INVALID_PAYLOAD", "Missing _patch");
+    }
+
+    const current = this.normalize_project_memory(
+      this.load_or_create_project_memory(
+        context._app_id,
+        context._env,
+        context._memory_path
+      ),
+      {
+        _touch_updated_at: false
+      }
+    );
+    let memory = apply_project_memory_milestones(
+      this.normalize_project_memory({
+        ...current,
+        ...params._patch
+      })
+    ) as XVMProjectMemory;
+
+    if (
+      typeof params._patch._current_focus === "string" &&
+      params._patch._current_focus.trim().length > 0
+    ) {
+      const achievement_result = append_project_memory_achievement({
+        _memory: memory,
+        _achievement_id: "first-project-memory-focus",
+      });
+      memory = achievement_result._memory as XVMProjectMemory;
+      log_project_memory_achievement_result({
+        _app_id: context._app_id,
+        _env: context._env,
+        _achievement_id: "first-project-memory-focus",
+        _result: achievement_result,
+      });
+    }
+
+    this.save_project_memory_file(context._app_id, context._env, context._memory_path, memory);
+
+    return {
+      _ok: true,
+      _result: {
+        _memory: memory
+      }
     };
   }
 
@@ -1013,8 +1158,11 @@ export class ServerXVMModule extends XModule {
     });
 
     this._apps.clear();
+    this._active_app_by_env.clear();
+    this.prepare_server_settings();
     const system_stats = await this.loadSystemApps();
     const user_stats = await this.loadUserApps();
+    const active_apps_restored = this.restore_active_apps_from_settings();
 
     _xlog.log(
       "[server-xvm] loaded",
@@ -1022,7 +1170,8 @@ export class ServerXVMModule extends XModule {
         _apps: this._apps.size,
         _views: system_stats._views + user_stats._views,
         _flows: system_stats._flows + user_stats._flows,
-        _entities: system_stats._entities + user_stats._entities
+        _entities: system_stats._entities + user_stats._entities,
+        _active_apps: active_apps_restored
       }
     );
 
@@ -1030,7 +1179,8 @@ export class ServerXVMModule extends XModule {
       _apps_loaded: this._apps.size,
       _views_loaded: system_stats._views + user_stats._views,
       _flows_loaded: system_stats._flows + user_stats._flows,
-      _entities_loaded: system_stats._entities + user_stats._entities
+      _entities_loaded: system_stats._entities + user_stats._entities,
+      _active_apps_restored: active_apps_restored
     };
   }
 
@@ -1178,6 +1328,127 @@ export class ServerXVMModule extends XModule {
     return bundle;
   }
 
+  private resolve_default_app_id(env: string): string {
+    return this._active_app_by_env.get(env) ?? "vibe-system";
+  }
+
+  private resolve_app_id(params: Record<string, any>, env: string): string {
+    return typeof params._app_id === "string" && params._app_id.trim()
+      ? params._app_id.trim()
+      : this.resolve_default_app_id(env);
+  }
+
+  private resolve_server_settings_file(): string {
+    return path.resolve(
+      path.join(this._work_folder, "settings", "server-settings.json")
+    );
+  }
+
+  private prepare_server_settings(): boolean {
+    const settings_file = this.resolve_server_settings_file();
+    const settings_folder = path.dirname(settings_file);
+
+    fs.mkdirSync(settings_folder, { recursive: true });
+
+    if (!fs.existsSync(settings_file)) {
+      fs.writeFileSync(settings_file, "{}", "utf-8");
+    }
+
+    const loaded = _xs.load(settings_file);
+    if (!loaded) {
+      _xlog.warn("[server-xvm] active app settings load failed", {
+        _path: settings_file
+      });
+    }
+
+    return loaded;
+  }
+
+  private read_active_apps_setting(): Record<string, string> {
+    if (!this.prepare_server_settings()) {
+      return {};
+    }
+
+    const raw = _xs.get(ACTIVE_APPS_SETTINGS_KEY);
+    if (!_xu.is_plain_object(raw)) {
+      return {};
+    }
+
+    const active_apps: Record<string, string> = {};
+    for (const [env, app_id] of Object.entries(raw)) {
+      if (
+        typeof env === "string" &&
+        env.trim().length > 0 &&
+        typeof app_id === "string" &&
+        app_id.trim().length > 0
+      ) {
+        active_apps[env.trim()] = app_id.trim();
+      }
+    }
+
+    return active_apps;
+  }
+
+  private persist_active_app(env: string, app_id: string) {
+    if (!this.prepare_server_settings()) {
+      throw new XError("E_XVM_SETTINGS_LOAD_FAILED", "Failed to load server settings");
+    }
+
+    _xs.set(ACTIVE_APPS_SETTINGS_KEY, {
+      ...this.read_active_apps_setting(),
+      [env]: app_id,
+    });
+
+    let persisted = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.resolve_server_settings_file(), "utf-8"));
+      persisted =
+        _xu.is_plain_object(saved?._active_apps) &&
+        saved._active_apps[env] === app_id;
+    } catch {
+      persisted = false;
+    }
+
+    if (!persisted) {
+      throw new XError("E_XVM_SETTINGS_SAVE_FAILED", "Failed to persist active app setting");
+    }
+  }
+
+  private restore_active_apps_from_settings(): number {
+    const active_apps = this.read_active_apps_setting();
+    let restored = 0;
+
+    for (const [raw_env, raw_app_id] of Object.entries(active_apps)) {
+      let env: string;
+      let app_id: string;
+
+      try {
+        env = this.resolve_safe_segment(raw_env, "_active_apps env", "E_XVM_INVALID_ENV");
+        app_id = this.resolve_safe_segment(raw_app_id, "_active_apps app_id", "E_XVM_INVALID_APP_ID");
+      } catch (err) {
+        _xlog.warn("[server-xvm] skipped invalid persisted active app", {
+          _env: raw_env,
+          _app_id: raw_app_id,
+          _error: err instanceof Error ? err.message : String(err)
+        });
+        continue;
+      }
+
+      if (!this._apps.has(app_scope_key(app_id, env))) {
+        _xlog.warn("[server-xvm] skipped missing persisted active app", {
+          _env: env,
+          _app_id: app_id
+        });
+        continue;
+      }
+
+      this._active_app_by_env.set(env, app_id);
+      restored++;
+    }
+
+    return restored;
+  }
+
   private normalize_app_file(raw_input: any, app_dir: string, env: string, system: boolean): XVMAppFile {
     const raw = _xu.is_plain_object(raw_input) ? raw_input : {};
     const meta = _xu.is_plain_object(raw._meta) ? raw._meta : {};
@@ -1264,6 +1535,186 @@ export class ServerXVMModule extends XModule {
       });
       throw new XError("E_XVM_READONLY", "System apps are readonly");
     }
+  }
+
+  private resolve_project_memory_context(params: Record<string, any>): {
+    _app_id: string;
+    _env: string;
+    _memory_path: string;
+  } {
+    const app_id = this.resolve_safe_segment(
+      params._app_id,
+      "_app_id",
+      "E_XVM_INVALID_APP_ID"
+    );
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const bundle = this.get_bundle(app_id, env);
+    this.assert_mutable_bundle(bundle);
+
+    const memory_path = this.get_project_memory_path(app_id, env);
+    const app_json_path = path.join(path.dirname(memory_path), "app.json");
+    if (!fs.existsSync(app_json_path)) {
+      throw new XError("E_XVM_APP_NOT_FOUND", `App not found on disk: ${app_id}`);
+    }
+
+    return {
+      _app_id: app_id,
+      _env: env,
+      _memory_path: memory_path
+    };
+  }
+
+  private get_project_memory_path(app_id: string, env: string): string {
+    const safe_app_id = this.resolve_safe_segment(
+      app_id,
+      "_app_id",
+      "E_XVM_INVALID_APP_ID"
+    );
+    const safe_env = this.resolve_safe_segment(
+      env,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const app_dir = this.resolve_user_app_dir(safe_env, safe_app_id);
+    const memory_path = path.resolve(app_dir, "project-memory.json");
+    const relative = path.relative(app_dir, memory_path);
+
+    if (
+      relative.startsWith("..") ||
+      path.isAbsolute(relative)
+    ) {
+      throw new XError("E_XVM_INVALID_APP_PATH", "Invalid project memory path");
+    }
+
+    return memory_path;
+  }
+
+  private default_project_memory(): XVMProjectMemory {
+    return {
+      _version: 1,
+      _stage: "planning",
+      _vision: "",
+      _goal: "",
+      _current_focus: "",
+      _completed: [],
+      _achievements: [],
+      _milestones: [],
+      _parking_lot: [],
+      _decisions: [],
+      _notes: [],
+      _updated_at: ""
+    };
+  }
+
+  private normalize_project_memory(
+    raw_input: unknown,
+    opts: {
+      _touch_updated_at?: boolean;
+    } = {}
+  ): XVMProjectMemory {
+    const raw = _xu.is_plain_object(raw_input) ? raw_input : {};
+    const current = this.default_project_memory();
+
+    return {
+      _version: typeof raw._version === "number" && Number.isFinite(raw._version)
+        ? raw._version
+        : current._version,
+      _stage: resolveProjectStage(raw),
+      _vision: typeof raw._vision === "string" ? raw._vision : current._vision,
+      _goal: typeof raw._goal === "string" ? raw._goal : current._goal,
+      ...(typeof raw._summary === "string" ? { _summary: raw._summary } : {}),
+      ...(_xu.is_plain_object(raw._proposed)
+        ? {
+          _proposed: {
+            ...(Array.isArray(raw._proposed._entities)
+              ? { _entities: raw._proposed._entities }
+              : {}),
+            ...(Array.isArray(raw._proposed._views)
+              ? { _views: raw._proposed._views }
+              : {}),
+            ...(Array.isArray(raw._proposed._flows)
+              ? { _flows: raw._proposed._flows }
+              : {}),
+            ...(Array.isArray(raw._proposed._server_modules)
+              ? { _server_modules: raw._proposed._server_modules }
+              : {}),
+          },
+        }
+        : {}),
+      _current_focus: typeof raw._current_focus === "string"
+        ? raw._current_focus
+        : current._current_focus,
+      _completed: Array.isArray(raw._completed) ? raw._completed : current._completed,
+      _achievements: Array.isArray(raw._achievements) ? raw._achievements : current._achievements,
+      _milestones: normalize_project_memory_milestones(raw._milestones),
+      _parking_lot: Array.isArray(raw._parking_lot) ? raw._parking_lot : current._parking_lot,
+      _decisions: Array.isArray(raw._decisions) ? raw._decisions : current._decisions,
+      _notes: Array.isArray(raw._notes) ? raw._notes : current._notes,
+      _updated_at: opts._touch_updated_at === false
+        ? typeof raw._updated_at === "string"
+          ? raw._updated_at
+          : current._updated_at
+        : _xu.to_iso_now()
+    };
+  }
+
+  private load_or_create_project_memory(
+    app_id: string,
+    env: string,
+    memory_path: string
+  ): XVMProjectMemory {
+    if (fs.existsSync(memory_path)) {
+      _xlog.log("[server-xvm] project memory loaded", {
+        _app_id: app_id,
+        _env: env
+      });
+      return this.read_project_memory_file(app_id, env, memory_path);
+    }
+
+    const memory = this.default_project_memory();
+    this.write_json_file_atomic(memory_path, memory);
+
+    _xlog.log("[server-xvm] project memory created", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return memory;
+  }
+
+  private read_project_memory_file(
+    app_id: string,
+    env: string,
+    memory_path: string
+  ): XVMProjectMemory {
+    try {
+      return JSON.parse(fs.readFileSync(memory_path, "utf-8")) as XVMProjectMemory;
+    } catch (err) {
+      _xlog.warn("[server-xvm] invalid project memory", {
+        _app_id: app_id,
+        _env: env,
+        _error: err instanceof Error ? err.message : String(err)
+      });
+      throw new XError("E_XVM_INVALID_PROJECT_MEMORY", "Invalid project memory JSON");
+    }
+  }
+
+  private save_project_memory_file(
+    app_id: string,
+    env: string,
+    memory_path: string,
+    memory: XVMProjectMemory
+  ) {
+    this.write_json_file_atomic(memory_path, memory);
+
+    _xlog.log("[server-xvm] project memory saved", {
+      _app_id: app_id,
+      _env: env
+    });
   }
 
 

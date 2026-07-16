@@ -11,12 +11,23 @@ import { EntityProcessor } from "./Processors/EntityProcessor.js";
 import { FlowProcessor } from "./Processors/FlowProcessor.js";
 import { FormProcessor } from "./Processors/FormProcessor.js";
 import { TableProcessor } from "./Processors/TableProcessor.js";
+import { AddFieldProcessor } from "./Processors/AddFieldProcessor.js";
+import { RenameFieldProcessor } from "./Processors/RenameFieldProcessor.js";
+import { DeprecateFieldProcessor } from "./Processors/DeprecateFieldProcessor.js";
+import { DeleteFieldProcessor } from "./Processors/DeleteFieldProcessor.js";
+import { RestoreDeprecatedFieldProcessor } from "./Processors/RestoreDeprecatedFieldProcessor.js";
 import { LearnedIntentProcessor } from "./Processors/LearnedIntentProcessor.js";
 import {
   SemanticIntentProcessor,
   type XVibeSemanticIntentGenerateJson,
 } from "./Processors/SemanticIntentProcessor.js";
 import type { XVibeIntentProcessor } from "./Processors/XVibeIntentProcessor.js";
+import { RuntimeContextManager } from "./Runtime/RuntimeContextManager.js";
+import { ProjectMemoryFocusProcessor } from "./Processors/ProjectMemoryFocusProcessor.js";
+import { PlanningSessionProcessor } from "./Processors/PlanningSessionProcessor.js";
+import { PlanningProcessor } from "./Processors/PlanningProcessor.js";
+import { CapabilityGuidanceProcessor } from "./Processors/CapabilityGuidanceProcessor.js";
+import { MutationPlanningProcessor } from "./Processors/MutationPlanningProcessor.js";
 
 export type XVibeIntentEngineOptions = {
   _intent_memory_store?: IntentMemoryStore;
@@ -28,7 +39,12 @@ export class XVibeIntentEngine {
 
   constructor(options: XVibeIntentEngineOptions = {}) {
     this.processors = [
+      new CapabilityGuidanceProcessor(),
+      new MutationPlanningProcessor(),
       new DeterministicIntentProcessor(),
+      new ProjectMemoryFocusProcessor(),
+      new PlanningSessionProcessor(),
+      new PlanningProcessor(),
       new LearnedIntentProcessor({
         _store: options._intent_memory_store,
       }),
@@ -37,6 +53,11 @@ export class XVibeIntentEngine {
       new FormProcessor(),
       new TableProcessor(),
       new CrudProcessor(),
+      new AddFieldProcessor(),
+      new RenameFieldProcessor(),
+      new DeprecateFieldProcessor(),
+      new DeleteFieldProcessor(),
+      new RestoreDeprecatedFieldProcessor(),
       new SemanticIntentProcessor({
         _generate_json: options._semantic_generate_json,
       }),
@@ -59,10 +80,18 @@ export class XVibeIntentEngine {
       };
     }
 
+    const enriched_request: XVibeIntentEngineRequest = {
+      ...request,
+      _runtime_context:
+        await RuntimeContextManager.attachProjectMemoryToRuntimeContext(
+          request._runtime_context,
+        ),
+    };
+
     for (const processor of this.processors) {
       const processor_started_at = Date.now();
       const processor_name = this.processor_name(processor);
-      const intent = await processor.analyze(request);
+      const intent = await processor.analyze(enriched_request);
       const processor_duration_ms =
         Date.now() - processor_started_at;
       if (intent) {

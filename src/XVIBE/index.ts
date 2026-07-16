@@ -11,6 +11,16 @@ export { VibeKnowledgeSelector } from "./VibeKnowledgeSelector.js";
 export { VibeIntentPlanner, normalize_string_array } from "./VibeIntentPlanner.js";
 export type { VibeIntentPlan, VibeRuntimeCapabilityRegistry } from "./VibeIntentPlanner.js";
 export { VibeBehaviorPlanner } from "./VibeBehaviorPlanner.js";
+export { XVibeCapabilityRegistry } from "./Capability/index.js";
+export type {
+  XVibeCapabilityCategory,
+  XVibeCapabilityDefinition,
+  XVibeCapabilityGuidanceArtifact,
+  XVibeCapabilityGuidanceItem,
+  XVibeCapabilityGuidanceSection,
+  XVibeCapabilityMode,
+  XVibeCapabilityStatus,
+} from "./Capability/index.js";
 export type {
   RuntimeAssets,
   RuntimeAssetRef,

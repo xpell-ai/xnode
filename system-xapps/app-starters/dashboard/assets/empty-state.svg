@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 480 300" role="img" aria-labelledby="title desc">
+  <title id="title">Empty dashboard placeholder</title>
+  <desc id="desc">A neutral empty-state asset for starter dashboards.</desc>
+  <rect width="480" height="300" rx="24" fill="#f8fafc"/>
+  <rect x="76" y="64" width="328" height="172" rx="18" fill="#e2e8f0"/>
+  <rect x="112" y="96" width="168" height="18" rx="9" fill="#94a3b8"/>
+  <rect x="112" y="134" width="256" height="14" rx="7" fill="#cbd5e1"/>
+  <rect x="112" y="166" width="214" height="14" rx="7" fill="#cbd5e1"/>
+  <circle cx="360" cy="102" r="26" fill="#67e8f9"/>
+</svg>

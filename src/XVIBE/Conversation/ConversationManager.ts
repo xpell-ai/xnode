@@ -76,6 +76,7 @@ export type XVibeConversationDocument = XVibeJsonObject & {
   _message_count: number;
   _title?: string;
   _metadata?: unknown;
+  _planning_draft?: unknown;
 };
 
 type XVibeConversationIndexEntry = XVibeJsonObject & {
@@ -410,6 +411,79 @@ function read_conversation_artifact_status(value: unknown): XVibeConversationArt
   return value as XVibeConversationArtifactStatus;
 }
 
+function json_compatible_deep_equal(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (left === null || right === null) return left === right;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    if (left.length !== right.length) return false;
+    return left.every((item, index) =>
+      json_compatible_deep_equal(item, right[index]));
+  }
+  if (_xu.is_plain_object(left) || _xu.is_plain_object(right)) {
+    if (!_xu.is_plain_object(left) || !_xu.is_plain_object(right)) return false;
+    const left_keys = Object.keys(left).sort();
+    const right_keys = Object.keys(right).sort();
+    if (!json_compatible_deep_equal(left_keys, right_keys)) return false;
+    return left_keys.every((key) =>
+      json_compatible_deep_equal(left[key], right[key]));
+  }
+
+  return false;
+}
+
+function mutation_plan_step_ids_for_identity(value: unknown): string[] | undefined {
+  if (!_xu.is_plain_object(value) || value._type !== "mutation-plan" || !Array.isArray(value._steps)) {
+    return undefined;
+  }
+
+  const ids: string[] = [];
+  for (const step of value._steps) {
+    if (!_xu.is_plain_object(step) || typeof step._id !== "string" || !step._id.trim()) {
+      return undefined;
+    }
+    ids.push(step._id.trim());
+  }
+
+  return ids;
+}
+
+function mutation_plan_request_identity_matches(
+  expected: XVibeJsonObject,
+  actual: unknown,
+): boolean {
+  if (!_xu.is_plain_object(actual)) return false;
+  if (actual._type !== "mutation-plan") return false;
+  const expected_ids = mutation_plan_step_ids_for_identity(expected);
+  const actual_ids = mutation_plan_step_ids_for_identity(actual);
+  if (!expected_ids || !actual_ids) return false;
+  if (!json_compatible_deep_equal(expected_ids, actual_ids)) return false;
+
+  for (const key of ["_title", "_goal"]) {
+    if (
+      typeof expected[key] === "string" &&
+      typeof actual[key] === "string" &&
+      expected[key] !== actual[key]
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function conversation_artifact_request_matches(input: {
+  _artifact_type?: string;
+  _expected: XVibeJsonObject;
+  _actual: unknown;
+}): boolean {
+  if (input._artifact_type === "mutation-plan" || input._expected._type === "mutation-plan") {
+    return mutation_plan_request_identity_matches(input._expected, input._actual);
+  }
+
+  return json_compatible_deep_equal(input._expected, input._actual);
+}
+
 function read_optional_conversation_artifact_error(value: unknown): unknown {
   if (value === undefined) return undefined;
   if (typeof value === "string") return value;
@@ -553,15 +627,21 @@ function sanitize_verified_learned_intent(
   const title = derive_verified_learned_action_title(action);
   const description = read_trimmed_string(action._description);
   const action_reason = read_trimmed_string(action._reason);
+  const action_params =
+    _xu.is_plain_object(action._params)
+      ? clone_json(action._params)
+      : undefined;
+  if (_xu.is_plain_object(action_params)) {
+    delete action_params._app_id;
+    delete action_params._env;
+  }
   const sanitized_action: XVibeJsonObject = {
     ...(action_id ? { _id: action_id } : {}),
     _title: title,
     ...(description ? { _description: description } : {}),
     _action_type: "apply-view-edit",
     _status: "suggested",
-    ...(_xu.is_plain_object(action._params)
-      ? { _params: clone_json(action._params) }
-      : {}),
+    ...(action_params ? { _params: action_params } : {}),
     _requires_approval: true,
     ...(action_reason ? { _reason: action_reason } : {}),
   };
@@ -890,6 +970,28 @@ function read_conversation_document(
   return conversation as XVibeConversationDocument;
 }
 
+function write_conversation_document_with_index(input: {
+  _conversations_dir: string;
+  _conversation_dir: string;
+  _conversation: XVibeConversationDocument;
+}): void {
+  write_json_object_file(
+    path.join(input._conversation_dir, "conversation.json"),
+    input._conversation,
+  );
+  write_conversation_index(
+    input._conversations_dir,
+    upsert_conversation_index_entry(
+      read_conversation_index(
+        input._conversations_dir,
+        input._conversation._app_id,
+        input._conversation._env,
+      ),
+      input._conversation,
+    ),
+  );
+}
+
 function read_conversation_messages(
   conversation_dir: string,
 ): XVibeConversationMessage[] {
@@ -1061,6 +1163,25 @@ function normalize_analyze_message_runtime_context(input: {
     context._active_view_id = active_view_id;
   }
 
+  const stage =
+    read_optional_intent_context_string(
+      input._runtime_context._stage,
+      "_runtime_context._stage",
+    );
+  if (
+    stage === "planning" ||
+    stage === "building" ||
+    stage === "review" ||
+    stage === "completed"
+  ) {
+    context._stage = stage;
+  } else if (stage) {
+    throw_explicit_error(
+      XVIBE_INVALID_INTENT_REQUEST,
+      "Invalid '_runtime_context._stage': expected planning, building, review, or completed",
+    );
+  }
+
   if (input._runtime_context._selected_object !== undefined) {
     if (!_xu.is_plain_object(input._runtime_context._selected_object)) {
       throw_explicit_error(
@@ -1074,6 +1195,57 @@ function normalize_analyze_message_runtime_context(input: {
       "_runtime_context._selected_object",
       XVIBE_INVALID_INTENT_REQUEST,
     ) as Record<string, any>;
+  }
+
+  if (input._runtime_context._current_artifact !== undefined) {
+    if (!_xu.is_plain_object(input._runtime_context._current_artifact)) {
+      throw_explicit_error(
+        XVIBE_INVALID_INTENT_REQUEST,
+        "Invalid '_runtime_context._current_artifact': expected object",
+      );
+    }
+
+    context._current_artifact =
+      read_optional_json_value(
+        input._runtime_context._current_artifact,
+        "_runtime_context._current_artifact",
+        XVIBE_INVALID_INTENT_REQUEST,
+      ) as Record<string, any>;
+  }
+
+  if (input._runtime_context._current_project_plan !== undefined) {
+    if (!_xu.is_plain_object(input._runtime_context._current_project_plan)) {
+      throw_explicit_error(
+        XVIBE_INVALID_INTENT_REQUEST,
+        "Invalid '_runtime_context._current_project_plan': expected object",
+      );
+    }
+
+    context._current_project_plan =
+      read_optional_json_value(
+        input._runtime_context._current_project_plan,
+        "_runtime_context._current_project_plan",
+        XVIBE_INVALID_INTENT_REQUEST,
+      ) as Record<string, any>;
+  }
+
+  if (input._runtime_context._planning_answer !== undefined) {
+    if (Array.isArray(input._runtime_context._planning_answer)) {
+      context._planning_answer =
+        read_optional_intent_context_string_array(
+          input._runtime_context._planning_answer,
+          "_runtime_context._planning_answer",
+        );
+    } else {
+      const planning_answer =
+        read_optional_intent_context_string(
+          input._runtime_context._planning_answer,
+          "_runtime_context._planning_answer",
+        );
+      if (planning_answer) {
+        context._planning_answer = planning_answer;
+      }
+    }
   }
 
   if (input._runtime_context._available_artifacts !== undefined) {
@@ -1151,6 +1323,157 @@ export class ConversationManager {
     return structured_error_payload(error);
   }
 
+  static readPlanningDraft(input: {
+    _app_id: string;
+    _env: string;
+    _conversation_id?: string;
+  }): XVibeJsonObject | undefined {
+    if (
+      typeof input._conversation_id !== "string" ||
+      input._conversation_id.trim().length === 0
+    ) {
+      return undefined;
+    }
+
+    try {
+      const app_id = normalize_safe_app_id(input._app_id);
+      const env = read_safe_path_segment(input._env, "_env", XVIBE_INVALID_ENV);
+      const conversation_id =
+        read_safe_path_segment(
+          input._conversation_id,
+          "_conversation_id",
+          XVIBE_INVALID_CONVERSATION_ID,
+        );
+      const { _conversation_dir: conversation_dir } =
+        resolve_existing_conversation({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+        });
+      const conversation = read_conversation_document(conversation_dir);
+      return _xu.is_plain_object(conversation._planning_draft)
+        ? clone_json(conversation._planning_draft as XVibeJsonObject)
+        : undefined;
+    } catch (error) {
+      _xlog.warn("[xvibe] planning draft read failed", {
+        _app_id: input._app_id,
+        _env: input._env,
+        _conversation_id: input._conversation_id,
+        _error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
+    }
+  }
+
+  static writePlanningDraft(input: {
+    _app_id: string;
+    _env: string;
+    _conversation_id?: string;
+    _draft: Record<string, any>;
+  }): void {
+    if (
+      typeof input._conversation_id !== "string" ||
+      input._conversation_id.trim().length === 0
+    ) {
+      return;
+    }
+
+    if (
+      !_xu.is_plain_object(input._draft) ||
+      !is_json_compatible_value(input._draft)
+    ) {
+      throw_explicit_error(
+        XVIBE_CONVERSATION_STORAGE_FAILED,
+        "Invalid planning draft: expected JSON-compatible object",
+      );
+    }
+
+    const app_id = normalize_safe_app_id(input._app_id);
+    const env = read_safe_path_segment(input._env, "_env", XVIBE_INVALID_ENV);
+    const conversation_id =
+      read_safe_path_segment(
+        input._conversation_id,
+        "_conversation_id",
+        XVIBE_INVALID_CONVERSATION_ID,
+      );
+    const {
+      _conversations_dir: conversations_dir,
+      _conversation_dir: conversation_dir,
+    } =
+      resolve_existing_conversation({
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+      });
+    const conversation = read_conversation_document(conversation_dir);
+    const updated_conversation: XVibeConversationDocument = {
+      ...conversation,
+      _updated_at: new Date().toISOString(),
+      _planning_draft: clone_json(input._draft),
+    };
+
+    write_conversation_document_with_index({
+      _conversations_dir: conversations_dir,
+      _conversation_dir: conversation_dir,
+      _conversation: updated_conversation,
+    });
+
+    _xlog.log("[xvibe] planning draft stored", {
+      _app_id: app_id,
+      _env: env,
+      _conversation_id: conversation_id,
+    });
+  }
+
+  static clearPlanningDraft(input: {
+    _app_id: string;
+    _env: string;
+    _conversation_id?: string;
+  }): void {
+    if (
+      typeof input._conversation_id !== "string" ||
+      input._conversation_id.trim().length === 0
+    ) {
+      return;
+    }
+
+    const app_id = normalize_safe_app_id(input._app_id);
+    const env = read_safe_path_segment(input._env, "_env", XVIBE_INVALID_ENV);
+    const conversation_id =
+      read_safe_path_segment(
+        input._conversation_id,
+        "_conversation_id",
+        XVIBE_INVALID_CONVERSATION_ID,
+      );
+    const {
+      _conversations_dir: conversations_dir,
+      _conversation_dir: conversation_dir,
+    } =
+      resolve_existing_conversation({
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+      });
+    const conversation = read_conversation_document(conversation_dir);
+    const updated_conversation: XVibeConversationDocument = {
+      ...conversation,
+      _updated_at: new Date().toISOString(),
+    };
+    delete updated_conversation._planning_draft;
+
+    write_conversation_document_with_index({
+      _conversations_dir: conversations_dir,
+      _conversation_dir: conversation_dir,
+      _conversation: updated_conversation,
+    });
+
+    _xlog.log("[xvibe] planning draft cleared", {
+      _app_id: app_id,
+      _env: env,
+      _conversation_id: conversation_id,
+    });
+  }
+
   static readAnalyzeMessageRequest(xcmd: XCommand): XVibeAnalyzeMessageRequest {
     const params = _xu.is_plain_object(xcmd?._params) ? xcmd._params : {};
     const app_id = normalize_safe_app_id(params._app_id);
@@ -1171,19 +1494,33 @@ export class ConversationManager {
       _conversation_id: conversation_id,
     });
 
+    const runtime_context =
+      normalize_analyze_message_runtime_context({
+        _app_id: app_id,
+        _env: env,
+        _conversation_id: conversation_id,
+        _runtime_context: params._runtime_context,
+      });
+    if (!_xu.is_plain_object(runtime_context._current_project_plan)) {
+      const planning_draft =
+        ConversationManager.readPlanningDraft({
+          _app_id: app_id,
+          _env: env,
+          _conversation_id: conversation_id,
+        });
+      if (planning_draft) {
+        runtime_context._current_project_plan =
+          planning_draft as Record<string, any>;
+      }
+    }
+
     return {
       _app_id: app_id,
       _env: env,
       _conversation_id: conversation_id,
       _message: params._message,
       ...(message_id ? { _message_id: message_id } : {}),
-      _runtime_context:
-        normalize_analyze_message_runtime_context({
-          _app_id: app_id,
-          _env: env,
-          _conversation_id: conversation_id,
-          _runtime_context: params._runtime_context,
-        }),
+      _runtime_context: runtime_context,
     };
   }
 
@@ -1623,6 +1960,14 @@ export class ConversationManager {
         );
       const artifact_status =
         read_conversation_artifact_status(params._artifact_status);
+      const artifact_type =
+        read_optional_string(params._artifact_type, "_artifact_type");
+      const artifact_request =
+        read_optional_json_object(
+          params._artifact_request,
+          "_artifact_request",
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+        );
       const artifact_result =
         read_optional_json_object(
           params._artifact_result,
@@ -1665,6 +2010,44 @@ export class ConversationManager {
       }
 
       const intent = message._intent as XVibeJsonObject;
+      if (artifact_type && intent._artifact_type !== artifact_type) {
+        throw_explicit_error(
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+          `Conversation artifact type mismatch: ${message_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+            _expected_artifact_type: artifact_type,
+            _actual_artifact_type:
+              typeof intent._artifact_type === "string"
+                ? intent._artifact_type
+                : undefined,
+          },
+        );
+      }
+      if (
+        artifact_request !== undefined &&
+        !conversation_artifact_request_matches({
+          _artifact_type:
+            artifact_type ??
+            (typeof intent._artifact_type === "string" ? intent._artifact_type : undefined),
+          _expected: artifact_request,
+          _actual: intent._artifact_request,
+        })
+      ) {
+        throw_explicit_error(
+          XVIBE_INVALID_CONVERSATION_MESSAGE,
+          `Conversation artifact request mismatch: ${message_id}`,
+          {
+            _conversation_id: conversation_id,
+            _message_id: message_id,
+            _artifact_type:
+              artifact_type ??
+              (typeof intent._artifact_type === "string" ? intent._artifact_type : undefined),
+          },
+        );
+      }
+
       intent._artifact_status = artifact_status;
       if (artifact_result !== undefined) {
         intent._artifact_result = artifact_result;

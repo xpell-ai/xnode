@@ -2,11 +2,13 @@ import assert from "assert";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { _x, _xlog } from "@xpell/core";
+import { _x, _xd, _xlog, XDataModule, XModule, XObject, XpellEngine } from "@xpell/core";
 import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
 import { XAuthModule } from "./XAuth/index.js";
 import { XDB, XDBStorageFS } from "./XDB/index.js";
 import { XEntityManager } from "./XEntityManager/XEntityManager.js";
+import FlowManagerModule from "./XFM/FlowManagerModule.js";
+import { _xem } from "./XEM/XEventManager.js";
 import { XStudioModule } from "./XStudio/XStudioModule.js";
 import { ServerXVMModule } from "./XVM/ServerXVMModule.js";
 import {
@@ -39,6 +41,13 @@ import {
   XVibeIntentEngine,
   type XVibeIntentEngineOptions,
 } from "./XVIBE/XVibeIntentEngine.js";
+import { RuntimeContextManager } from "./XVIBE/Runtime/RuntimeContextManager.js";
+import {
+  canonicalizeSemanticViewEditParams,
+  isStructuredViewEditAction,
+} from "./XVIBE/StructuredEditing/StructuredViewEdit.js";
+import { resolveViewTarget } from "./XVIBE/StructuredEditing/ViewTargetResolution.js";
+import { ArtifactRelationshipRegistry } from "./XVIBE/Artifact/ArtifactRelationshipRegistry.js";
 import { ArtifactResolver } from "./XVIBE/Artifact/ArtifactResolver.js";
 import { CapabilityRegistry } from "./XVIBE/ExecutionGraph/CapabilityRegistry.js";
 import { ExecutionGraphExecutor } from "./XVIBE/ExecutionGraph/ExecutionGraphExecutor.js";
@@ -55,9 +64,12 @@ import {
   SemanticIntentProcessor,
   type XVibeSemanticIntentGenerateJsonInput,
 } from "./XVIBE/Processors/SemanticIntentProcessor.js";
+import { DeterministicIntentProcessor } from "./XVIBE/Processors/DeterministicIntentProcessor.js";
+import { PlanningSessionProcessor } from "./XVIBE/Processors/PlanningSessionProcessor.js";
 import { VibeBehaviorPlanner } from "./XVIBE/VibeBehaviorPlanner.js";
 import { XMutator } from "./XMutator/XMutator.js";
 import { _XSettings } from "./XSettings/XSettings.js";
+import { makeRes } from "./Wormholes/wh.codec.js";
 
 type ValidateGeneratedArtifact = (input: {
   _artifact_type: "view" | "command";
@@ -68,6 +80,153 @@ type ValidateGeneratedArtifact = (input: {
   _generated_artifacts?: unknown;
   _planned_flow_ids?: string[];
 }) => { _ok: true; _errors: [] } | { _ok: false; _errors: string[] };
+
+function test_entity_manager_call_server(
+  op: "find" | "aggregate",
+  params: Record<string, unknown>,
+  output?: {
+    key: string;
+    path: string;
+  },
+): Record<string, unknown> {
+  return {
+    _module: "xvm",
+    _op: "call-server",
+    _fail_on_error: true,
+    _params: {
+      _cmd: {
+        _module: "entity-manager",
+        _op: op,
+        _params: params,
+      },
+    },
+    ...(output
+      ? {
+        _output: {
+          _target: "xdata",
+          _key: output.key,
+          _path: output.path,
+        },
+      }
+      : {}),
+  };
+}
+
+function test_entity_manager_server_command(command: any): any {
+  if (command?._module === "entity-manager") return command;
+  if (command?._module !== "xvm" || command?._op !== "call-server") return undefined;
+  const server_command = command?._params?._cmd;
+  return server_command?._module === "entity-manager" ? server_command : undefined;
+}
+
+class TestClientXVMModule extends XModule {
+  readonly _server_calls: any[] = [];
+  _fail_server_call?: (command: any) => boolean;
+
+  constructor(opts?: {
+    _fail_server_call?: (command: any) => boolean;
+  }) {
+    super({ _name: "xvm" });
+    this._fail_server_call = opts?._fail_server_call;
+  }
+
+  async _call_server(xcmd: any) {
+    const server_command = JSON.parse(JSON.stringify(xcmd?._params?._cmd ?? null));
+    if (
+      typeof server_command?._params?._records === "string" &&
+      server_command._params._records.startsWith("$xdata:")
+    ) {
+      server_command._params._records =
+        _xd.get(server_command._params._records.slice("$xdata:".length));
+    }
+    this._server_calls.push(server_command);
+    if (this._fail_server_call?.(server_command)) {
+      throw new Error(`test server failure: ${server_command?._module}.${server_command?._op}`);
+    }
+    const response = await _x.execute(server_command);
+    if (response?._ok === false) {
+      throw new Error(`test server rejected: ${server_command?._module}.${server_command?._op}`);
+    }
+    const result = response?._result ?? response;
+    const raw_output = xcmd?._output;
+    const fallback_output =
+        server_command?._op === "aggregate" &&
+        typeof server_command?._params?._result_xdata_key === "string"
+          ? {
+            _target: "xdata",
+            _key: server_command._params._result_xdata_key,
+            _path: "_value",
+          }
+          : undefined;
+    const output =
+      raw_output?._target === "xdata" &&
+      typeof raw_output?._key === "string" &&
+      typeof raw_output?._path === "string"
+        ? raw_output
+        : fallback_output;
+    if (
+      output?._target === "xdata" &&
+      typeof output?._key === "string" &&
+      typeof output?._path === "string"
+    ) {
+      const value = output._path === "_value"
+        ? response?._result?._value ?? result?._value
+        : output._path
+        .split(".")
+        .filter(Boolean)
+        .reduce((current: any, key: string) => current?.[key], result);
+      _xd.set(output._key, value, {
+        source: "test-client-xvm:output",
+      });
+    }
+    if (
+      server_command?._op === "aggregate" &&
+      typeof server_command?._params?._result_xdata_key === "string"
+    ) {
+      server_command._test_written_value =
+        response?._result?._value ?? result?._value ?? 0;
+      _xd.set(
+        server_command._params._result_xdata_key,
+        server_command._test_written_value,
+        { source: "test-client-xvm:aggregate-output" },
+      );
+    }
+    return result;
+  }
+}
+
+function restore_server_runtime_for_xobject(): void {
+  const server_runtime_proxy = new XpellEngine() as any;
+  server_runtime_proxy.execute = (command: any) =>
+    (_x as any).execute(command);
+}
+
+async function run_on_mount_in_client_runtime(
+  on_mount: unknown,
+  opts?: {
+    _id?: string;
+    _requires?: string[];
+    _fail_server_call?: (command: any) => boolean;
+  },
+): Promise<any[]> {
+  const client_runtime = new XpellEngine();
+  const xvm = new TestClientXVMModule({
+    _fail_server_call: opts?._fail_server_call,
+  });
+  await client_runtime.loadModuleAsync(new XDataModule());
+  await client_runtime.loadModuleAsync(xvm);
+  try {
+    const object = new XObject({
+      _id: opts?._id ?? "test-client-on-mount",
+      _requires: opts?._requires,
+      _on_mount: on_mount as any,
+    });
+    await object.onMount();
+  } finally {
+    restore_server_runtime_for_xobject();
+  }
+  return xvm._server_calls;
+}
 
 function strip_when_prompt_disallows_flow(prompt: string, view: XVibeViewArtifact): number {
   if (prompt_allows_view_flow_triggers(prompt)) {
@@ -115,6 +274,93 @@ function find_xui_node_for_test(value: unknown, id: string): Record<string, unkn
   }
 
   return undefined;
+}
+
+function test_runtime_type(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value !== "object") return typeof value;
+  return value.constructor?.name ?? "object";
+}
+
+function test_is_plain_object(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const prototype =
+    Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function find_non_json_compatible_for_test(
+  value: unknown,
+  path_name = "$",
+): { _path: string; _runtime_type: string } | null {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean"
+  ) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value)
+      ? null
+      : { _path: path_name, _runtime_type: test_runtime_type(value) };
+  }
+
+  if (typeof value !== "object") {
+    return { _path: path_name, _runtime_type: test_runtime_type(value) };
+  }
+
+  if (Array.isArray(value)) {
+    for (let index = 0; index < value.length; index += 1) {
+      const issue =
+        find_non_json_compatible_for_test(value[index], `${path_name}[${index}]`);
+      if (issue) return issue;
+    }
+    return null;
+  }
+
+  if (!test_is_plain_object(value)) {
+    return { _path: path_name, _runtime_type: test_runtime_type(value) };
+  }
+
+  for (const [key, child_value] of Object.entries(value)) {
+    const issue =
+      find_non_json_compatible_for_test(child_value, `${path_name}.${key}`);
+    if (issue) return issue;
+  }
+
+  return null;
+}
+
+function assert_json_compatible_for_test(value: unknown, label: string) {
+  const issue =
+    find_non_json_compatible_for_test(value);
+  assert.equal(
+    issue,
+    null,
+    issue
+      ? `${label} is not JSON-compatible at ${issue._path} (${issue._runtime_type})`
+      : `${label} is JSON-compatible`,
+  );
+}
+
+async function run_flow_success_commands_for_test(
+  flow: Record<string, any>,
+  result: Record<string, any>,
+) {
+  if (result?._ok !== true || flow?._on_success === undefined) return;
+
+  const commands =
+    Array.isArray(flow._on_success)
+      ? flow._on_success
+      : [flow._on_success];
+  for (const command of commands) {
+    await (_x as any).execute(command);
+  }
 }
 
 async function list_relative_files_for_test(dir: string): Promise<string[]> {
@@ -201,13 +447,23 @@ const XVIBE_INTENT_STUB_CONVERSATION_RESULT = {
 };
 
 const XVIBE_INTENT_PROCESSOR_CHAIN = [
+  "CapabilityGuidanceProcessor",
+  "MutationPlanningProcessor",
   "DeterministicIntentProcessor",
+  "ProjectMemoryFocusProcessor",
+  "PlanningSessionProcessor",
+  "PlanningProcessor",
   "LearnedIntentProcessor",
   "EntityProcessor",
   "FlowProcessor",
   "FormProcessor",
   "TableProcessor",
   "CrudProcessor",
+  "AddFieldProcessor",
+  "RenameFieldProcessor",
+  "DeprecateFieldProcessor",
+  "DeleteFieldProcessor",
+  "RestoreDeprecatedFieldProcessor",
   "SemanticIntentProcessor",
 ];
 
@@ -324,6 +580,547 @@ function assert_xvibe_selected_object_action(
   });
 }
 
+function assert_xvibe_text_replacement_action(
+  response: any,
+  expected: {
+    _app_id?: string;
+    _env?: string;
+    _view_id: string;
+    _target_id: string;
+    _property_value: string;
+    _target_type?: string;
+  },
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "DeterministicIntentProcessor");
+  assert.equal(response._intent?._message_type, "edit");
+  assert.equal(response._intent?._execution_level, "deterministic");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._reason, "deterministic_text_replacement");
+  assert.equal(response._intent?._actions.length, 1);
+
+  const action = response._intent._actions[0];
+  assert.equal(action._action_type, "apply-view-edit");
+  assert.equal(action._status, "suggested");
+  assert.equal(action._requires_approval, true);
+  assert.equal(action._executable, true);
+  const expected_params = {
+    _app_id: expected._app_id ?? "intent-test-app",
+    _env: expected._env ?? "test",
+    _view_id: expected._view_id,
+    _target_id: expected._target_id,
+    ...(expected._target_type ? { _target_type: expected._target_type } : {}),
+    _edit_action: "update-property",
+    _property_name: "_text",
+    _property_value: expected._property_value,
+  };
+  assert.deepEqual(action._params, expected_params);
+  assert.deepEqual(action._execution_payload, {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: expected_params,
+  });
+}
+
+function assert_xvibe_button_creation_action(
+  response: any,
+  expected: {
+    _app_id?: string;
+    _env?: string;
+    _view_id: string;
+    _button_id: string;
+    _button_text: string;
+  },
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "DeterministicIntentProcessor");
+  assert.equal(response._intent?._message_type, "edit");
+  assert.equal(response._intent?._execution_level, "deterministic");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._reason, "deterministic_button_creation");
+  assert.equal(response._intent?._actions.length, 1);
+
+  const expected_params = {
+    _app_id: expected._app_id ?? "intent-test-app",
+    _env: expected._env ?? "test",
+    _view_id: expected._view_id,
+    _target_id: expected._view_id,
+    _target_type: "view",
+    _edit_action: "add-child",
+    _location: "bottom",
+    _child: {
+      _type: "button",
+      _id: expected._button_id,
+      _text: expected._button_text,
+    },
+  };
+  const action = response._intent._actions[0];
+  assert.equal(action._id, "deterministic-button-creation");
+  assert.equal(action._action_type, "apply-view-edit");
+  assert.equal(action._status, "suggested");
+  assert.equal(action._requires_approval, true);
+  assert.equal(action._executable, true);
+  assert.deepEqual(action._params, expected_params);
+  assert.deepEqual(action._execution_payload, {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: expected_params,
+  });
+}
+
+function assert_xvibe_project_memory_focus_action(
+  response: any,
+  focus: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "ProjectMemoryFocusProcessor");
+  assert.equal(response._intent?._message_type, "planning");
+  assert.equal(response._intent?._execution_level, "deterministic");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.ok(response._intent?._confidence >= 0.9);
+  assert.equal(response._intent?._artifact_type, undefined);
+  assert.equal(response._intent?._artifact_request, undefined);
+  assert.equal(response._intent?._actions.length, 1);
+
+  const action = response._intent._actions[0];
+  assert.equal(action._title, `Set current focus to ${focus}`);
+  assert.equal(action._action_type, "module-op");
+  assert.equal(action._status, "suggested");
+  assert.equal(action._requires_approval, true);
+  assert.equal(action._executable, true);
+  assert.deepEqual(action._params, {
+    _app_id: "intent-test-app",
+    _env: "test",
+    _memory_patch: {
+      _current_focus: focus,
+    },
+  });
+  assert.deepEqual(action._execution_payload, {
+    _module: "server-xvm",
+    _op: "patch-project-memory",
+    _params: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _patch: {
+        _current_focus: focus,
+      },
+    },
+  });
+}
+
+function assert_xvibe_project_plan_artifact(
+  response: any,
+  expected_goal: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "PlanningProcessor");
+  assert.equal(response._intent?._message_type, "planning");
+  assert.equal(response._intent?._execution_level, "planning");
+  assert.equal(response._intent?._should_mutate, false);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._artifact_type, "project-plan");
+  assert.deepEqual(response._intent?._actions, []);
+
+  const plan = response._intent?._artifact_request;
+  assert.equal(plan?._type, "project-plan");
+  assert.equal(plan?._stage, "planning");
+  assert.equal(plan?._goal, expected_goal);
+  assert.ok(Array.isArray(plan?._questions));
+  assert.ok(plan._questions.length >= 8);
+  assert.deepEqual(
+    plan._questions.slice(0, 8).map((question: any) => ({
+      _id: question._id,
+      _type: question._type,
+      _required: question._required,
+      _answer: question._answer,
+      _has_options: Array.isArray(question._options) && question._options.length > 0,
+    })),
+    [
+      {
+        _id: "primary_user",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "core_entities",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "ai_capabilities",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "notification_capabilities",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "reporting_capabilities",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "integration_capabilities",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "first_workflow",
+        _type: "single",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+      {
+        _id: "authentication",
+        _type: "multi",
+        _required: true,
+        _answer: null,
+        _has_options: true,
+      },
+    ],
+  );
+  assert.deepEqual(
+    plan?._unanswered,
+    plan._questions.map((question: any) => question._id),
+  );
+  assert.equal(
+    plan._questions.some((question: any) => question._id === "runtime"),
+    false,
+  );
+  assert.deepEqual(plan?._answers, {});
+  assert.equal(plan?._current_question?._id, "primary_user");
+  assert.equal(plan?._status, "collecting-information");
+  assert.ok(Array.isArray(plan?._proposed?._entities));
+  assert.ok(plan._proposed._entities.length > 0);
+  assert.ok(Array.isArray(plan?._proposed?._views));
+  assert.ok(plan._proposed._views.length > 0);
+  assert.ok(Array.isArray(plan?._proposed?._flows));
+  assert.ok(plan._proposed._flows.length > 0);
+  assert.ok(Array.isArray(plan?._milestones));
+  assert.ok(plan._milestones.length > 0);
+  assert.equal(plan?._next_step?._title, "Answer planning question");
+  assert.equal(plan?._next_step?._question_id, "primary_user");
+}
+
+function assert_xvibe_capability_guidance(
+  response: any,
+  expected: {
+    _query_type: string;
+    _capability_ids?: string[];
+    _category?: string;
+    _current_view_id?: string;
+  },
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "CapabilityGuidanceProcessor");
+  assert.equal(response._intent?._message_type, "question");
+  assert.equal(response._intent?._execution_level, "deterministic");
+  assert.equal(response._intent?._should_mutate, false);
+  assert.equal(response._intent?._artifact_type, "capability-guidance");
+  assert.deepEqual(response._intent?._actions, []);
+
+  const guidance = response._intent?._artifact_request;
+  assert.equal(guidance?._type, "capability-guidance");
+  assert.equal(guidance?._query_type, expected._query_type);
+  if (expected._category) {
+    assert.equal(guidance?._category, expected._category);
+  }
+  if (expected._current_view_id) {
+    assert.equal(guidance?._current_view_id, expected._current_view_id);
+  }
+
+  const capabilities = guidance?._capabilities;
+  assert.equal(Array.isArray(capabilities), true);
+  assert.ok(capabilities.length > 0);
+  assert.equal(guidance?._capability_count, capabilities.length);
+  assert.equal(Array.isArray(guidance?._sections), true);
+  assert.ok(guidance._sections.length > 0);
+  assert.equal(
+    capabilities.every((capability: any) =>
+      capability._tested === true &&
+      capability._user_visible === true &&
+      typeof capability.title === "string" &&
+      typeof capability.description === "string" &&
+      Array.isArray(capability.prompt_examples) &&
+      Array.isArray(capability.manual_steps) &&
+      typeof capability.mode === "string" &&
+      typeof capability.status === "string",
+    ),
+    true,
+  );
+  assert.equal(
+    capabilities.some((capability: any) =>
+      capability._id === "fix-project-views" ||
+      capability._id === "integrity-repair-operations",
+    ),
+    false,
+  );
+  assert.equal(
+    guidance?._matched_capability_ids.includes("fix-project-views"),
+    false,
+  );
+  if (expected._capability_ids) {
+    assert.deepEqual(
+      guidance?._matched_capability_ids,
+      expected._capability_ids,
+    );
+  }
+}
+
+function assert_xvibe_mutation_plan(
+  response: any,
+  expected: {
+    _title: string;
+    _min_steps: number;
+    _step_ids?: string[];
+    _executable_steps?: number;
+    _unsupported_steps?: number;
+    _can_apply?: boolean;
+  },
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "MutationPlanningProcessor");
+  assert.equal(response._intent?._message_type, "planning");
+  assert.equal(response._intent?._execution_level, "planning");
+  assert.equal(response._intent?._should_mutate, false);
+  assert.equal(response._intent?._artifact_type, "mutation-plan");
+  assert.deepEqual(response._intent?._actions, []);
+  assert_json_compatible_for_test(
+    response._intent,
+    "MutationPlanningProcessor intent",
+  );
+
+  const plan = response._intent?._artifact_request;
+  assert.equal(plan?._type, "mutation-plan");
+  assert.equal(plan?._title, expected._title);
+  assert.equal(typeof plan?._goal, "string");
+  assert.equal(
+    plan?._summary,
+    "This change requires several deterministic mutations.",
+  );
+  assert.equal(Array.isArray(plan?._steps), true);
+  assert.ok(plan._steps.length >= expected._min_steps);
+  assert.equal(plan?._estimated_mutations, plan._steps.length);
+  assert.equal(typeof plan?._executable_steps, "number");
+  assert.equal(typeof plan?._unsupported_steps, "number");
+  assert.equal(typeof plan?._can_apply, "boolean");
+  assert.equal(
+    plan._steps.filter((step: any) => step._primitive).length,
+    plan._executable_steps,
+  );
+  assert.equal(
+    plan._steps.filter((step: any) => step._status === "unsupported").length,
+    plan._unsupported_steps,
+  );
+  if (expected._executable_steps !== undefined) {
+    assert.equal(plan?._executable_steps, expected._executable_steps);
+  }
+  if (expected._unsupported_steps !== undefined) {
+    assert.equal(plan?._unsupported_steps, expected._unsupported_steps);
+  }
+  if (expected._can_apply !== undefined) {
+    assert.equal(plan?._can_apply, expected._can_apply);
+  }
+  assert.equal(plan?._status, "planned");
+  assert.equal(
+    plan._steps.every((step: any) =>
+      typeof step._id === "string" &&
+      typeof step._title === "string" &&
+      (step._status === "planned" || step._status === "unsupported") &&
+      (
+        step._status === "planned"
+          ? step._primitive?._module === "xvibe" &&
+            step._primitive?._op === "apply-view-edit" &&
+            typeof step._primitive?._params === "object"
+          : typeof step._reason === "string" &&
+            step._primitive === undefined
+      ),
+    ),
+    true,
+  );
+  for (const step of plan._steps) {
+    if (!step._primitive) continue;
+    const primitive_params =
+      step._primitive._params;
+    const canonical =
+      canonicalizeSemanticViewEditParams(primitive_params);
+    assert.equal(canonical._ok, true);
+    assert.equal(
+      isStructuredViewEditAction(canonical._ok ? canonical._params._edit_action : undefined),
+      true,
+    );
+  }
+  assert.deepEqual(
+    plan?._buttons,
+    [
+      {
+        _id: "apply-plan",
+        _title: "Apply Plan",
+        _status: "placeholder",
+      },
+      {
+        _id: "edit-plan",
+        _title: "Edit Plan",
+        _status: "placeholder",
+      },
+      {
+        _id: "cancel-plan",
+        _title: "Cancel",
+        _status: "placeholder",
+      },
+    ],
+  );
+  if (expected._step_ids) {
+    assert.deepEqual(
+      plan._steps.map((step: any) => step._id),
+      expected._step_ids,
+    );
+  }
+}
+
+function planning_session_project_memory(stage: string) {
+  return {
+    _version: 1,
+    _stage: stage,
+    _vision: "Build a CRM",
+    _goal: "Build a CRM app",
+    _current_focus: "",
+    _completed: [],
+    _parking_lot: [],
+    _decisions: [],
+    _notes: [],
+    _updated_at: "2026-07-09T00:00:00.000Z",
+  };
+}
+
+function planning_session_project_plan(overrides: Record<string, any> = {}) {
+  const questions = [
+    {
+      _id: "primary_user",
+      _type: "multi",
+      _question: "Who will primarily use this CRM?",
+      _options: ["Sales", "Managers", "Support", "Customers", "Other"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "core_entities",
+      _type: "multi",
+      _question: "Which core records should the first version manage?",
+      _options: ["Customers", "Products", "Orders", "Tasks", "Other"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "ai_capabilities",
+      _type: "multi",
+      _question: "Which AI capabilities should the app include?",
+      _options: [
+        "None",
+        "Chat assistant",
+        "Smart suggestions",
+        "Image understanding",
+        "Document/PDF understanding",
+        "Text generation",
+        "Automation agent",
+      ],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "notification_capabilities",
+      _type: "multi",
+      _question: "Which notification capabilities should the app include?",
+      _options: ["None", "Email", "Push", "SMS"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "reporting_capabilities",
+      _type: "multi",
+      _question: "Which reporting capabilities should the app include?",
+      _options: ["None", "Dashboard", "Charts", "Export PDF", "Export Excel"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "integration_capabilities",
+      _type: "multi",
+      _question: "Which integration capabilities should the app include?",
+      _options: ["None", "REST API", "Webhooks", "OAuth", "Third-party APIs"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "first_workflow",
+      _type: "single",
+      _question: "What is the first workflow to build?",
+      _options: ["Create record", "Review dashboard", "Approve request", "Assign owner", "Other"],
+      _required: true,
+      _answer: null,
+    },
+    {
+      _id: "authentication",
+      _type: "multi",
+      _question: "Is authentication required for the first version?",
+      _options: ["No", "Staff login", "Role-based access", "Customer login", "Other"],
+      _required: true,
+      _answer: null,
+    },
+  ];
+
+  return {
+    _type: "project-plan",
+    _stage: "planning",
+    _domain: "crm",
+    _goal: "Build a CRM app",
+    _summary: "Plan a CRM app.",
+    _questions: questions,
+    _answers: {},
+    _unanswered: questions.map((question) => question._id),
+    _proposed: {
+      _entities: [],
+      _views: [],
+      _flows: [],
+      _server_modules: [],
+    },
+    _milestones: [],
+    ...overrides,
+  };
+}
+
+async function analyze_planning_session_for_test(input: {
+  _message: string;
+  _plan: Record<string, any>;
+  _stage?: string;
+}) {
+  const processor = new PlanningSessionProcessor();
+  return processor.analyze({
+    _message: input._message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _project_memory: planning_session_project_memory(input._stage ?? "planning") as any,
+      _current_project_plan: input._plan,
+    },
+  });
+}
+
 function assert_xvibe_entity_artifact_request(
   response: any,
   entity_name: string,
@@ -365,6 +1162,57 @@ function assert_xvibe_flow_artifact_request(
     _action: "entity-add",
   });
   assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_xdata_set_flow_artifact_request(
+  response: any,
+  expected: {
+    _app_id?: string;
+    _env?: string;
+    _flow_id: string;
+    _xdata_key: string;
+    _xdata_value: string;
+  },
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "FlowProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(response._intent?._reason, "Create flow artifact request.");
+  assert.equal(response._intent?._artifact_type, "flow");
+  const artifact_request = {
+    _operation: "create",
+    _flow_id: expected._flow_id,
+    _action: "xdata-set",
+    _xdata_key: expected._xdata_key,
+    _xdata_value: expected._xdata_value,
+  };
+  assert.deepEqual(response._intent?._artifact_request, artifact_request);
+  assert.equal(response._intent?._actions.length, 1);
+  const action = response._intent?._actions[0];
+  const action_params = {
+    _app_id: expected._app_id ?? "intent-test-app",
+    _env: expected._env ?? "test",
+    _artifact_type: "flow",
+    _artifact_request: artifact_request,
+  };
+  assert.deepEqual(action, {
+    _id: `create-flow-${expected._flow_id}`,
+    _title: `Create flow ${expected._flow_id}`,
+    _description: `Persist flow ${expected._flow_id}.`,
+    _action_type: "module-op",
+    _status: "suggested",
+    _requires_approval: true,
+    _executable: true,
+    _params: action_params,
+    _execution_payload: {
+      _module: "xvibe",
+      _op: "apply-artifact-request",
+      _params: action_params,
+    },
+  });
 }
 
 function assert_xvibe_form_artifact_request(
@@ -436,7 +1284,176 @@ function assert_xvibe_crud_execution_plan_request(
   assert.deepEqual(response._intent?._actions, []);
 }
 
+function assert_xvibe_crud_field_suggestion_request(
+  response: any,
+  entity_name: string,
+  fields: { _name: string }[],
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "CrudProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(
+    response._intent?._reason,
+    "Suggest CRUD fields before generating artifacts.",
+  );
+  assert.equal(response._intent?._artifact_type, "crud-field-suggestion");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "suggest-fields",
+    _entity_name: entity_name,
+    _fields: fields,
+  });
+  assert.equal(
+    response._intent?._artifact_request?._execution_graph,
+    undefined,
+  );
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_add_field_artifact_request(
+  response: any,
+  entity_name: string,
+  field_name: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "AddFieldProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(
+    response._intent?._reason,
+    "Add field to existing CRUD artifacts.",
+  );
+  assert.equal(response._intent?._artifact_type, "crud-evolution");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "add-field",
+    _entity_name: entity_name,
+    _field_name: field_name,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_rename_field_artifact_request(
+  response: any,
+  entity_name: string,
+  old_field: string,
+  new_field: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "RenameFieldProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(
+    response._intent?._reason,
+    "Rename field in existing CRUD artifacts.",
+  );
+  assert.equal(response._intent?._artifact_type, "crud-evolution");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "rename-field",
+    _entity_name: entity_name,
+    _old_field: old_field,
+    _new_field: new_field,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_deprecate_field_artifact_request(
+  response: any,
+  processor_name: "DeprecateFieldProcessor" | "DeleteFieldProcessor",
+  entity_name: string,
+  field_name: string,
+  expected_request_extra: Record<string, unknown> = {},
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, processor_name);
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(
+    response._intent?._reason,
+    processor_name === "DeleteFieldProcessor"
+      ? "Field deletion is not yet supported. This operation will safely deprecate the field."
+      : "Deprecate field in existing CRUD artifacts.",
+  );
+  assert.equal(response._intent?._artifact_type, "crud-evolution");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "deprecate-field",
+    _entity_name: entity_name,
+    _field_name: field_name,
+    ...expected_request_extra,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
+function assert_xvibe_restore_field_artifact_request(
+  response: any,
+  entity_name: string,
+  field_name: string,
+) {
+  assert.equal(response._ok, true);
+  assert.equal(response._processor, "RestoreDeprecatedFieldProcessor");
+  assert.equal(response._intent?._message_type, "generate");
+  assert.equal(response._intent?._execution_level, "artifact");
+  assert.equal(response._intent?._should_mutate, true);
+  assert.equal(response._intent?._confidence, 1);
+  assert.equal(
+    response._intent?._reason,
+    "Restore deprecated field in existing CRUD artifacts.",
+  );
+  assert.equal(response._intent?._artifact_type, "crud-evolution");
+  assert.deepEqual(response._intent?._artifact_request, {
+    _operation: "restore-field",
+    _entity_name: entity_name,
+    _field_name: field_name,
+  });
+  assert.deepEqual(response._intent?._actions, []);
+}
+
 set_xvibe_semantic_intent_env(undefined);
+
+const artifact_relationship_registry = new ArtifactRelationshipRegistry();
+assert.deepEqual(
+  artifact_relationship_registry
+    .lookup({
+      _source: "entity-field",
+      _operation: "add-field",
+    })
+    .map((relationship) => relationship._target),
+  ["entity", "flow", "form", "table"],
+);
+assert.deepEqual(
+  artifact_relationship_registry
+    .lookup({
+      _source: "entity-field",
+      _operation: "rename-field",
+    })
+    .map((relationship) => relationship._target),
+  ["entity", "records", "flow", "form", "table"],
+);
+assert.deepEqual(
+  artifact_relationship_registry
+    .lookup({
+      _source: "entity-field",
+      _operation: "deprecate-field",
+    })
+    .map((relationship) => relationship._target),
+  ["entity", "flow", "form", "table"],
+);
+assert.deepEqual(
+  artifact_relationship_registry
+    .lookup({
+      _source: "entity-field",
+      _operation: "restore-field",
+    })
+    .map((relationship) => relationship._target),
+  ["entity", "flow", "form", "table"],
+);
 
 const xvibe_intent_engine = xvibe_test_intent_engine();
 const xvibe_intent_valid_res = await xvibe_intent_engine.analyze({
@@ -455,6 +1472,1463 @@ assert.deepEqual(
   XVIBE_INTENT_PROCESSOR_CHAIN,
 );
 assert.equal(typeof xvibe_intent_valid_res._duration_ms, "number");
+
+set_xvibe_semantic_intent_env("true", "capability-guidance-semantic-provider");
+let xvibe_capability_guidance_semantic_generate_count = 0;
+const xvibe_capability_guidance_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_capability_guidance_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_capability_overview_res =
+  await xvibe_capability_guidance_engine.analyze({
+    _message: "What can I do with Visual Xpell?",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_capability_guidance(
+  xvibe_capability_overview_res,
+  {
+    _query_type: "overview",
+    _category: "mixed",
+  },
+);
+assert.deepEqual(
+  xvibe_capability_overview_res._intent?._artifact_request?._matched_capability_ids,
+  [
+    "update-text",
+    "set-styles",
+    "add-remove-class",
+    "add-header-footer-label",
+    "hide-object",
+    "remove-object",
+    "create-toolbar",
+    "create-button",
+    "open-existing-view-modal",
+    "close-modal-on-form-success",
+    "entity-list",
+    "entity-aggregation",
+    "start-project-planning",
+    "confirm-plan",
+  ],
+);
+assert.equal(xvibe_capability_guidance_semantic_generate_count, 0);
+
+const xvibe_capability_text_res =
+  await xvibe_capability_guidance_engine.analyze({
+    _message: "How do I change object text?",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "dashboard",
+    },
+  });
+assert_xvibe_capability_guidance(
+  xvibe_capability_text_res,
+  {
+    _query_type: "capability",
+    _capability_ids: ["update-text"],
+    _category: "view-editing",
+    _current_view_id: "dashboard",
+  },
+);
+assert.deepEqual(
+  xvibe_capability_text_res._intent?._artifact_request?._capabilities[0].manual_steps,
+  [
+    "Select the object",
+    "Open Inspector",
+    "Edit _text",
+    "Save",
+  ],
+);
+
+const xvibe_capability_style_res =
+  await xvibe_capability_guidance_engine.analyze({
+    _message: "How can I style a button?",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_capability_guidance(
+  xvibe_capability_style_res,
+  {
+    _query_type: "capability",
+    _capability_ids: ["set-styles", "add-remove-class"],
+    _category: "view-editing",
+  },
+);
+assert.equal(
+  xvibe_capability_style_res._intent?._artifact_request?._capabilities
+    .some((capability: any) =>
+      capability.prompt_examples.includes("Set the Play button background to green"),
+    ),
+  true,
+);
+
+const xvibe_capability_manual_res =
+  await xvibe_capability_guidance_engine.analyze({
+    _message: "How do I do this manually?",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_capability_guidance(
+  xvibe_capability_manual_res,
+  {
+    _query_type: "manual",
+    _category: "mixed",
+  },
+);
+assert.equal(
+  xvibe_capability_manual_res._intent?._artifact_request?._capabilities
+    .every((capability: any) =>
+      Array.isArray(capability.manual_steps) &&
+      capability.manual_steps.length > 0,
+    ),
+  true,
+);
+
+const xvibe_capability_current_view_prompts_res =
+  await xvibe_capability_guidance_engine.analyze({
+    _message: "What prompts work for the current view, including fix project views?",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert_xvibe_capability_guidance(
+  xvibe_capability_current_view_prompts_res,
+  {
+    _query_type: "prompt-examples",
+    _category: "view-editing",
+    _current_view_id: "main",
+  },
+);
+assert.equal(
+  xvibe_capability_current_view_prompts_res._intent?._artifact_request?._capabilities
+    .every((capability: any) =>
+      Array.isArray(capability.prompt_examples) &&
+      capability.prompt_examples.length > 0,
+    ),
+  true,
+);
+assert.equal(xvibe_capability_guidance_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+set_xvibe_semantic_intent_env("true", "mutation-plan-semantic-provider");
+let xvibe_mutation_plan_semantic_generate_count = 0;
+let xvibe_mutation_plan_apply_view_edit_execute_count = 0;
+const original_execute_for_mutation_plan = (_x as any).execute;
+const xvibe_mutation_plan_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_mutation_plan_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+
+try {
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "xvibe" && command?._op === "apply-view-edit") {
+      xvibe_mutation_plan_apply_view_edit_execute_count += 1;
+    }
+    if (command?._module === "server-xvm" && command?._op === "get_flow") {
+      if (command?._params?._flow_id === "save-project") {
+        return {
+          _ok: true,
+          _result: {
+            _flow: {
+              _id: "save-project",
+              _steps: [],
+            },
+          },
+        };
+      }
+      throw new Error(`Flow not found: ${command?._params?._flow_id}`);
+    }
+    if (command?._module === "server-xvm" && command?._op === "list_views") {
+      return {
+        _ok: true,
+        _result: {
+          _views: [
+            { _id: "homepage" },
+            { _id: "main" },
+            { _id: "dashboard" },
+          ],
+        },
+      };
+    }
+    return original_execute_for_mutation_plan.call(_x, command);
+  };
+
+  const xvibe_mutation_plan_current_view = {
+    _id: "main",
+    _type: "view",
+    _children: [],
+  };
+  const xvibe_mutation_plan_current_view_before =
+    JSON.stringify(xvibe_mutation_plan_current_view);
+  const xvibe_toolbar_mutation_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Add a toolbar with Save and Cancel",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+        _current_view: xvibe_mutation_plan_current_view,
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_toolbar_mutation_plan_res,
+    {
+      _title: "Toolbar",
+      _min_steps: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-toolbar",
+        "create-save-button",
+        "create-cancel-button",
+      ],
+    },
+  );
+  assert.equal(
+    JSON.stringify(xvibe_mutation_plan_current_view),
+    xvibe_mutation_plan_current_view_before,
+  );
+  const xvibe_toolbar_mutation_plan: any =
+    xvibe_toolbar_mutation_plan_res._intent?._artifact_request;
+  assert.ok(xvibe_toolbar_mutation_plan);
+  assert.deepEqual(
+    xvibe_toolbar_mutation_plan._steps.map((step: any) => ({
+      _id: step._id,
+      _title: step._title,
+      _module: step._primitive?._module,
+      _op: step._primitive?._op,
+      _edit_action: step._primitive?._params?._edit_action,
+    })),
+    [
+      {
+        _id: "create-toolbar",
+        _title: "Create toolbar",
+        _module: "xvibe",
+        _op: "apply-view-edit",
+        _edit_action: "create-toolbar",
+      },
+      {
+        _id: "create-save-button",
+        _title: "Add Save button to toolbar",
+        _module: "xvibe",
+        _op: "apply-view-edit",
+        _edit_action: "add-child",
+      },
+      {
+        _id: "create-cancel-button",
+        _title: "Add Cancel button to toolbar",
+        _module: "xvibe",
+        _op: "apply-view-edit",
+        _edit_action: "add-child",
+      },
+    ],
+  );
+  assert.deepEqual(
+    xvibe_toolbar_mutation_plan._steps[0]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _edit_action: "create-toolbar",
+      _location: "top",
+      _toolbar_props: {
+        _id: "main-toolbar",
+        _children: [],
+      },
+    },
+  );
+  assert.deepEqual(
+    xvibe_toolbar_mutation_plan._steps[1]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _target_id: "main-toolbar",
+      _target_type: "toolbar",
+      _edit_action: "add-child",
+      _location: "bottom",
+      _child: {
+        _type: "button",
+        _id: "save-button",
+        _text: "Save",
+      },
+    },
+  );
+  assert.deepEqual(
+    xvibe_toolbar_mutation_plan._steps[2]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _target_id: "main-toolbar",
+      _target_type: "toolbar",
+      _edit_action: "add-child",
+      _location: "bottom",
+      _child: {
+        _type: "button",
+        _id: "cancel-button",
+        _text: "Cancel",
+      },
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_toolbar_move_refresh_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create a top toolbar and move Refresh into it",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_toolbar_move_refresh_plan_res,
+    {
+      _title: "Toolbar",
+      _min_steps: 2,
+      _executable_steps: 2,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-toolbar",
+        "move-refresh-button",
+      ],
+    },
+  );
+  const xvibe_toolbar_move_refresh_plan: any =
+    xvibe_toolbar_move_refresh_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    xvibe_toolbar_move_refresh_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["create-toolbar", "move-object"],
+  );
+  assert.deepEqual(
+    xvibe_toolbar_move_refresh_plan._steps[1]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _target_id: "Refresh",
+      _target_text: "Refresh",
+      _target_type: "button",
+      _edit_action: "move-object",
+      _position: "append",
+      _destination_id: "main-toolbar",
+      _destination_type: "toolbar",
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_toolbar_move_refresh_new_record_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create a toolbar and move Refresh and New Record into it",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_toolbar_move_refresh_new_record_plan_res,
+    {
+      _title: "Toolbar",
+      _min_steps: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-toolbar",
+        "move-refresh-button",
+        "move-new-record-button",
+      ],
+    },
+  );
+  const xvibe_toolbar_move_refresh_new_record_plan: any =
+    xvibe_toolbar_move_refresh_new_record_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    xvibe_toolbar_move_refresh_new_record_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["create-toolbar", "move-object", "move-object"],
+  );
+  assert.equal(
+    xvibe_toolbar_move_refresh_new_record_plan._steps[1]._primitive._params._target_text,
+    "Refresh",
+  );
+  assert.equal(
+    xvibe_toolbar_move_refresh_new_record_plan._steps[2]._primitive._params._target_text,
+    "New Record",
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_toolbar_with_existing_objects_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Add a toolbar with Refresh and New Record",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_toolbar_with_existing_objects_plan_res,
+    {
+      _title: "Toolbar",
+      _min_steps: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-toolbar",
+        "move-refresh-button",
+        "move-new-record-button",
+      ],
+    },
+  );
+
+  const xvibe_button_flow_binding_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create a Save button in the main toolbar and bind it to save-project.",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+        _current_view: {
+          _id: "main",
+          _type: "view",
+          _children: [
+            {
+              _id: "main-toolbar",
+              _type: "toolbar",
+              _children: [],
+            },
+          ],
+        },
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_button_flow_binding_plan_res,
+    {
+      _title: "Save Button Flow Binding",
+      _min_steps: 2,
+      _executable_steps: 2,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "add-save-button-to-toolbar",
+        "bind-save-button-to-save-project",
+      ],
+    },
+  );
+  const xvibe_button_flow_binding_plan: any =
+    xvibe_button_flow_binding_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    xvibe_button_flow_binding_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["add-child", "bind-flow"],
+  );
+  assert.deepEqual(
+    xvibe_button_flow_binding_plan._steps[0]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _target_id: "main-toolbar",
+      _target_type: "toolbar",
+      _edit_action: "add-child",
+      _location: "bottom",
+      _child: {
+        _type: "button",
+        _id: "save-button",
+        _text: "Save",
+      },
+    },
+  );
+  assert.deepEqual(
+    xvibe_button_flow_binding_plan._steps[1]._primitive._params,
+    {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _view_id: "main",
+      _target_id: "save-button",
+      _target_type: "button",
+      _edit_action: "bind-flow",
+      _flow: {
+        _id: "save-project",
+        _payload: {},
+      },
+      _flow_event: "click",
+      _flow_auto: true,
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_add_meal_button_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: 'Add an "Add Meal" button to the homepage.',
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_button_creation_action(
+    xvibe_add_meal_button_res,
+    {
+      _view_id: "homepage",
+      _button_id: "add-meal-button",
+      _button_text: "Add Meal",
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_add_save_button_main_view_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Add a Save button to the main view.",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "homepage",
+      },
+    });
+  assert_xvibe_button_creation_action(
+    xvibe_add_save_button_main_view_res,
+    {
+      _view_id: "main",
+      _button_id: "save-button",
+      _button_text: "Save",
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_create_refresh_button_current_view_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create a Refresh button in the current view.",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "dashboard",
+      },
+    });
+  assert_xvibe_button_creation_action(
+    xvibe_create_refresh_button_current_view_res,
+    {
+      _view_id: "dashboard",
+      _button_id: "refresh-button",
+      _button_text: "Refresh",
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_dashboard_redesign_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Redesign the dashboard",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "dashboard",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_dashboard_redesign_plan_res,
+    {
+      _title: "Redesign",
+      _min_steps: 3,
+      _executable_steps: 0,
+      _unsupported_steps: 3,
+      _can_apply: false,
+    },
+  );
+  assert.equal(
+    xvibe_dashboard_redesign_plan_res._intent?._artifact_request?._steps.every(
+      (step: any) =>
+        step._status === "unsupported" &&
+        step._primitive === undefined &&
+        step._reason === "no_supported_primitive_mapping",
+    ),
+    true,
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_crm_page_mutation_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create CRM screen",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    xvibe_crm_page_mutation_plan_res,
+    {
+      _title: "CRM Screen",
+      _min_steps: 3,
+      _executable_steps: 0,
+      _unsupported_steps: 3,
+      _can_apply: false,
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_simple_text_bypass_mutation_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: 'Change "My App" to "Dashboard"',
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_text_replacement_action(
+    xvibe_simple_text_bypass_mutation_plan_res,
+    {
+      _view_id: "main",
+      _target_id: "My App",
+      _target_type: "label",
+      _property_value: "Dashboard",
+    },
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_hide_button_bypass_mutation_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "hide selected",
+      _runtime_context: xvibe_intent_selected_object_context(),
+    });
+  assert_xvibe_selected_object_action(
+    xvibe_hide_button_bypass_mutation_plan_res,
+    "hide-object",
+  );
+  assert.equal(
+    xvibe_hide_button_bypass_mutation_plan_res._processor,
+    "DeterministicIntentProcessor",
+  );
+  assert.equal(xvibe_mutation_plan_semantic_generate_count, 0);
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+
+  const xvibe_create_toolbar_bypass_plan_res =
+    await xvibe_mutation_plan_engine.analyze({
+      _message: "Create toolbar",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "main",
+      },
+    });
+  assert.equal(xvibe_create_toolbar_bypass_plan_res._ok, true);
+  assert.notEqual(
+    xvibe_create_toolbar_bypass_plan_res._processor,
+    "MutationPlanningProcessor",
+  );
+  assert.notEqual(
+    xvibe_create_toolbar_bypass_plan_res._intent?._artifact_type,
+    "mutation-plan",
+  );
+  assert.equal(xvibe_mutation_plan_apply_view_edit_execute_count, 0);
+} finally {
+  (_x as any).execute = original_execute_for_mutation_plan;
+  set_xvibe_semantic_intent_env(undefined);
+}
+
+for (const [message, focus] of [
+  ["let's work on authentication now", "Authentication"],
+  ["lets work on authentication", "Authentication"],
+  ["Let’s work on authentication now.", "Authentication"],
+  ["let's focus on authentication", "Authentication"],
+  ["set current focus to authentication", "Authentication"],
+  ["change focus to authentication", "Authentication"],
+  ["switch focus to authentication", "Authentication"],
+  ["work on authentication", "Authentication"],
+  ["Set current focus to customer CRUD", "Customer CRUD"],
+] as const) {
+  const xvibe_focus_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _available_artifacts: {
+        _views: ["view-main"],
+      },
+    },
+  });
+  assert_xvibe_project_memory_focus_action(
+    xvibe_focus_res,
+    focus,
+  );
+}
+
+const xvibe_planning_stage_crm_res = await xvibe_intent_engine.analyze({
+  _message: "I want to build a CRM",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+    _stage: "planning",
+  },
+});
+assert_xvibe_project_plan_artifact(
+  xvibe_planning_stage_crm_res,
+  "Build a CRM app",
+);
+assert.equal(
+  xvibe_planning_stage_crm_res._intent?._artifact_request?._proposed?._entities?.[0]?._id,
+  "customer",
+);
+assert.deepEqual(
+  xvibe_planning_stage_crm_res._intent?._artifact_request?._questions
+    ?.find((question: any) => question?._id === "primary_user")
+    ?._options,
+  ["Sales", "Managers", "Support", "Customers", "Other"],
+);
+
+const xvibe_planning_stage_nutrition_res = await xvibe_intent_engine.analyze({
+  _message: "I want to build a nutrition app",
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+    _stage: "planning",
+  },
+});
+assert_xvibe_project_plan_artifact(
+  xvibe_planning_stage_nutrition_res,
+  "Build a nutrition app",
+);
+assert.equal(
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request?._domain,
+  "nutrition",
+);
+assert.equal(
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request?._proposed?._entities?.[0]?._id,
+  "meal",
+);
+assert.deepEqual(
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request?._questions
+    ?.find((question: any) => question?._id === "primary_user")
+    ?._options,
+  ["Personal user", "Friend/Family", "Coach", "Nutritionist", "Other"],
+);
+assert.deepEqual(
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request?._questions
+    ?.find((question: any) => question?._id === "core_entities")
+    ?._options,
+  ["Foods", "Meals", "Daily logs", "Nutrition goals", "Recipes", "Weight entries"],
+);
+assert.deepEqual(
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request?._questions
+    ?.find((question: any) => question?._id === "first_workflow")
+    ?._options,
+  ["Log meal", "Search foods", "Set daily goals", "View daily dashboard"],
+);
+
+for (const message of [
+  "I want to build protein/calories counter for myself and my friend",
+  "I want to build a calorie tracker",
+  "I want to build a meal and macros app",
+] as const) {
+  const nutrition_keyword_plan_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _stage: "planning",
+    },
+  });
+  assert_xvibe_project_plan_artifact(
+    nutrition_keyword_plan_res,
+    "Build a nutrition app",
+  );
+  assert.equal(
+    nutrition_keyword_plan_res._intent?._artifact_request?._domain,
+    "nutrition",
+  );
+  assert.equal(
+    nutrition_keyword_plan_res._intent?._artifact_request?._summary,
+    "Plan a nutrition app for meals, food photos, and nutrition tracking.",
+  );
+  assert.deepEqual(
+    nutrition_keyword_plan_res._intent?._artifact_request?._questions
+      ?.find((question: any) => question?._id === "primary_user")
+      ?._options,
+    ["Personal user", "Friend/Family", "Coach", "Nutritionist", "Other"],
+  );
+  assert.deepEqual(
+    nutrition_keyword_plan_res._intent?._artifact_request?._questions
+      ?.find((question: any) => question?._id === "core_entities")
+      ?._options,
+    ["Foods", "Meals", "Daily logs", "Nutrition goals", "Recipes", "Weight entries"],
+  );
+  assert.deepEqual(
+    nutrition_keyword_plan_res._intent?._artifact_request?._questions
+      ?.find((question: any) => question?._id === "first_workflow")
+      ?._options,
+    ["Log meal", "Search foods", "Set daily goals", "View daily dashboard"],
+  );
+}
+const nutrition_plan =
+  xvibe_planning_stage_nutrition_res._intent?._artifact_request as Record<string, any>;
+assert.ok(nutrition_plan);
+
+const nutrition_primary_user_res =
+  await analyze_planning_session_for_test({
+    _message: "Personal user",
+    _plan: nutrition_plan,
+  });
+const nutrition_core_entities_res =
+  await analyze_planning_session_for_test({
+    _message: "Foods, Meals",
+    _plan: nutrition_primary_user_res?._artifact_request as Record<string, any>,
+  });
+assert.equal(
+  nutrition_core_entities_res?._artifact_request?._current_question?._id,
+  "ai_capabilities",
+);
+const nutrition_ai_capability_res =
+  await analyze_planning_session_for_test({
+    _message: "AI Image Understanding",
+    _plan: nutrition_core_entities_res?._artifact_request as Record<string, any>,
+  });
+assert.deepEqual(
+  nutrition_ai_capability_res?._artifact_request?._answers?.ai_capabilities,
+  ["Image understanding"],
+);
+assert.deepEqual(
+  nutrition_ai_capability_res?._artifact_request?._capabilities?._ai,
+  ["Image understanding"],
+);
+assert.equal(
+  nutrition_ai_capability_res?._artifact_request?._proposed?._server_modules
+    ?.some((module: any) => module?._id === "vision"),
+  true,
+);
+assert.equal(
+  nutrition_ai_capability_res?._artifact_request?._milestones
+    ?.some((milestone: any) => milestone?._title === "AI Food Recognition"),
+  true,
+);
+assert.deepEqual(nutrition_ai_capability_res?._actions, []);
+
+const planning_session_first_question_res =
+  await analyze_planning_session_for_test({
+    _message: "continue planning",
+    _plan: planning_session_project_plan(),
+  });
+assert.equal(planning_session_first_question_res?._message_type, "planning");
+assert.equal(planning_session_first_question_res?._execution_level, "planning");
+assert.equal(planning_session_first_question_res?._should_mutate, false);
+assert.equal(planning_session_first_question_res?._artifact_type, "project-plan");
+assert.equal(
+  planning_session_first_question_res?._artifact_request?._current_question?._id,
+  "primary_user",
+);
+assert.equal(
+  planning_session_first_question_res?._artifact_request?._current_question?._question,
+  "Who will primarily use this CRM?",
+);
+assert.equal(
+  planning_session_first_question_res?._artifact_request?._current_question?._type,
+  "multi",
+);
+assert.deepEqual(
+  planning_session_first_question_res?._artifact_request?._answers,
+  {},
+);
+assert.deepEqual(planning_session_first_question_res?._actions, []);
+
+const planning_session_advance_res =
+  await analyze_planning_session_for_test({
+    _message: "Sales",
+    _plan: planning_session_project_plan({
+      _current_question: {
+        _id: "primary_user",
+        _type: "multi",
+        _question: "Who will primarily use this CRM?",
+        _options: ["Sales", "Managers", "Support", "Customers", "Other"],
+        _required: true,
+        _answer: null,
+      },
+    }),
+  });
+assert.deepEqual(
+  planning_session_advance_res?._artifact_request?._answers?.primary_user,
+  ["Sales"],
+);
+assert.deepEqual(
+  planning_session_advance_res?._artifact_request?._questions?.[0]?._answer,
+  ["Sales"],
+);
+assert.equal(
+  planning_session_advance_res?._artifact_request?._unanswered.includes("primary_user"),
+  false,
+);
+assert.equal(
+  planning_session_advance_res?._artifact_request?._current_question?._id,
+  "core_entities",
+);
+assert.equal(planning_session_advance_res?._execution_level, "planning");
+assert.deepEqual(planning_session_advance_res?._actions, []);
+
+const planning_session_single_answer_res =
+  await analyze_planning_session_for_test({
+    _message: "Create record",
+    _plan: planning_session_project_plan({
+      _answers: {
+        primary_user: ["Sales"],
+        core_entities: ["Customers"],
+        ai_capabilities: ["None"],
+        notification_capabilities: ["None"],
+        reporting_capabilities: ["None"],
+        integration_capabilities: ["None"],
+      },
+      _unanswered: ["first_workflow", "authentication"],
+      _current_question: {
+        _id: "first_workflow",
+        _type: "single",
+        _question: "What is the first workflow to build?",
+        _options: ["Create record", "Review dashboard", "Approve request", "Assign owner", "Other"],
+        _required: true,
+        _answer: null,
+      },
+    }),
+  });
+assert.equal(
+  planning_session_single_answer_res?._artifact_request?._answers?.first_workflow,
+  "Create record",
+);
+assert.equal(
+  planning_session_single_answer_res?._artifact_request?._current_question?._id,
+  "authentication",
+);
+
+const planning_session_comma_multi_answer_res =
+  await analyze_planning_session_for_test({
+    _message: "Customers, Contacts",
+    _plan: planning_session_project_plan({
+      _answers: {
+        primary_user: ["Sales"],
+      },
+      _unanswered: [
+        "core_entities",
+        "ai_capabilities",
+        "notification_capabilities",
+        "reporting_capabilities",
+        "integration_capabilities",
+        "first_workflow",
+        "authentication",
+      ],
+      _current_question: {
+        _id: "core_entities",
+        _type: "multi",
+        _question: "Which core records should the first version manage?",
+        _options: ["Customers", "Products", "Orders", "Tasks", "Other"],
+        _required: true,
+        _answer: null,
+      },
+    }),
+  });
+assert.deepEqual(
+  planning_session_comma_multi_answer_res?._artifact_request?._answers?.core_entities,
+  ["Customers", "Contacts"],
+);
+assert.equal(
+  planning_session_comma_multi_answer_res?._artifact_request?._current_question?._id,
+  "ai_capabilities",
+);
+
+const planning_session_skip_answered_res =
+  await analyze_planning_session_for_test({
+    _message: "continue planning",
+    _plan: planning_session_project_plan({
+      _answers: {
+        primary_user: ["Sales"],
+      },
+      _unanswered: ["primary_user", "core_entities"],
+    }),
+  });
+assert.equal(
+  planning_session_skip_answered_res?._artifact_request?._current_question?._id,
+  "core_entities",
+);
+assert.deepEqual(
+  planning_session_skip_answered_res?._artifact_request?._unanswered,
+  [
+    "core_entities",
+    "ai_capabilities",
+    "notification_capabilities",
+    "reporting_capabilities",
+    "integration_capabilities",
+    "first_workflow",
+    "authentication",
+  ],
+);
+
+const planning_session_crm_adaptive_res =
+  await analyze_planning_session_for_test({
+    _message: "Staff login",
+    _plan: planning_session_project_plan({
+      _answers: {
+        primary_user: ["Sales"],
+        core_entities: ["Customers", "Contacts"],
+        ai_capabilities: ["None"],
+        notification_capabilities: ["None"],
+        reporting_capabilities: ["None"],
+        integration_capabilities: ["None"],
+        first_workflow: "Create record",
+      },
+      _unanswered: ["authentication"],
+      _current_question: {
+        _id: "authentication",
+        _type: "multi",
+        _question: "Is authentication required for the first version?",
+        _options: ["No", "Staff login", "Role-based access", "Customer login", "Other"],
+        _required: true,
+        _answer: null,
+      },
+    }),
+  });
+assert.deepEqual(
+  planning_session_crm_adaptive_res?._artifact_request?._questions
+    ?.map((question: any) => question._id)
+    .slice(0, 11),
+  [
+    "primary_user",
+    "core_entities",
+    "ai_capabilities",
+    "notification_capabilities",
+    "reporting_capabilities",
+    "integration_capabilities",
+    "first_workflow",
+    "authentication",
+    "customer_ownership",
+    "company_contact_relationship",
+    "follow_up_tasks",
+  ],
+);
+assert.equal(
+  planning_session_crm_adaptive_res?._artifact_request?._current_question?._id,
+  "customer_ownership",
+);
+
+const planning_session_complete_res =
+  await analyze_planning_session_for_test({
+    _message: "Tasks",
+    _plan: planning_session_project_plan({
+      _questions: [
+        ...planning_session_project_plan()._questions,
+        {
+          _id: "customer_ownership",
+          _type: "single",
+          _question: "Who owns customer records?",
+          _options: ["Sales", "Account managers", "Support", "Shared team", "Other"],
+          _required: true,
+          _answer: null,
+        },
+        {
+          _id: "company_contact_relationship",
+          _type: "single",
+          _question: "How should companies and contacts relate?",
+          _options: [
+            "Company has many contacts",
+            "Contacts are standalone",
+            "Both company and individual customers",
+            "Other",
+          ],
+          _required: true,
+          _answer: null,
+        },
+        {
+          _id: "follow_up_tasks",
+          _type: "multi",
+          _question: "Which follow-up/task capabilities are required?",
+          _options: ["Tasks", "Reminders", "Notes", "Email follow-up", "Other"],
+          _required: true,
+          _answer: null,
+        },
+      ],
+      _answers: {
+        primary_user: ["Sales"],
+        core_entities: ["Customers", "Contacts"],
+        ai_capabilities: ["None"],
+        notification_capabilities: ["None"],
+        reporting_capabilities: ["None"],
+        integration_capabilities: ["None"],
+        first_workflow: "Create record",
+        authentication: ["Staff login"],
+        customer_ownership: "Sales",
+        company_contact_relationship: "Company has many contacts",
+      },
+      _unanswered: ["follow_up_tasks"],
+      _current_question: {
+        _id: "follow_up_tasks",
+        _type: "multi",
+        _question: "Which follow-up/task capabilities are required?",
+        _options: ["Tasks", "Reminders", "Notes", "Email follow-up", "Other"],
+        _required: true,
+        _answer: null,
+      },
+    }),
+  });
+assert.equal(
+  planning_session_complete_res?._artifact_request?._status,
+  "ready-for-confirmation",
+);
+assert.deepEqual(
+  planning_session_complete_res?._artifact_request?._unanswered,
+  [],
+);
+assert.equal(planning_session_complete_res?._execution_level, "planning");
+assert.deepEqual(planning_session_complete_res?._actions, []);
+assert.equal(
+  planning_session_complete_res?._artifact_request?._next_step?._prompt,
+  "Planning complete.",
+);
+
+const planning_session_building_stage_res =
+  await analyze_planning_session_for_test({
+    _message: "Sales",
+    _stage: "building",
+    _plan: planning_session_project_plan({
+      _current_question: {
+        _id: "primary_user",
+        _question: "Who will primarily use this CRM?",
+      },
+    }),
+  });
+assert.equal(planning_session_building_stage_res, null);
+
+const xvibe_planning_stage_build_command_res =
+  await xvibe_intent_engine.analyze({
+    _message: "Create Product CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _stage: "planning",
+    },
+  });
+assert_xvibe_crud_field_suggestion_request(
+  xvibe_planning_stage_build_command_res,
+  "product",
+  [
+    { _name: "name" },
+    { _name: "description" },
+    { _name: "price" },
+    { _name: "category" },
+    { _name: "stock" },
+    { _name: "status" },
+  ],
+);
+
+const xvibe_building_stage_explicit_plan_res =
+  await xvibe_intent_engine.analyze({
+    _message: "Plan an inventory app",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _stage: "building",
+    },
+  });
+assert_xvibe_project_plan_artifact(
+  xvibe_building_stage_explicit_plan_res,
+  "Build an inventory app",
+);
+assert.equal(
+  xvibe_building_stage_explicit_plan_res._intent?._artifact_request?._proposed?._entities?.[0]?._id,
+  "product",
+);
+
+const guide_recommendation_xvibe = new XVibeModule();
+assert.ok(XVibeModule._ops["get-guide-recommendation"]);
+const guide_auth_missing_user =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Authentication",
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [],
+      _modules: [],
+    },
+  });
+const guide_auth_user_crud_recommendation = {
+  _title: "User CRUD",
+  _reason: "Current focus is Authentication.",
+  _type: "crud",
+  _priority: 100,
+  _action: {
+    _prompt: "Create User CRUD.",
+  },
+};
+assert.deepEqual(guide_auth_missing_user, guide_auth_user_crud_recommendation);
+const guide_auth_alias =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Auth",
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [],
+      _modules: [],
+    },
+  });
+assert.deepEqual(guide_auth_alias, guide_auth_user_crud_recommendation);
+const guide_auth_prompt_crud_res =
+  await xvibe_intent_engine.analyze({
+    _message: guide_auth_missing_user?._action._prompt ?? "",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _available_artifacts: {
+        _views: ["view-main"],
+      },
+    },
+  });
+assert.equal(guide_auth_prompt_crud_res._ok, true);
+assert.equal(guide_auth_prompt_crud_res._processor, "CrudProcessor");
+
+const guide_auth_after_user_crud_completed =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Authentication",
+      _completed: [
+        {
+          _id: "user-crud",
+          _title: "User CRUD",
+          _type: "crud",
+        },
+      ],
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [],
+      _modules: [],
+    },
+});
+assert.deepEqual(guide_auth_after_user_crud_completed, {
+  _title: "Login",
+  _reason: "Current focus is Authentication.",
+  _type: "flow",
+  _priority: 100,
+  _action: {
+    _prompt: "Create flow login.",
+  },
+});
+
+const guide_product_management_recommendation = {
+  _title: "Product CRUD",
+  _reason: "Current focus is Product Management.",
+  _type: "crud",
+  _priority: 100,
+  _action: {
+    _prompt: "Create Product CRUD.",
+  },
+};
+for (const focus of ["Product Management", "Products", "Product CRUD"] as const) {
+  const guide_product_management =
+    await guide_recommendation_xvibe.getGuideRecommendation({
+      _app_id: "intent-test-app",
+      _env: "test",
+      _project_memory: {
+        _current_focus: focus,
+      },
+      _runtime_assets: {
+        _views: [],
+        _flows: [],
+        _entities: [{ _id: "product" }],
+        _modules: [],
+      },
+    });
+  assert.deepEqual(
+    guide_product_management,
+    guide_product_management_recommendation,
+  );
+}
+
+const guide_product_crud_completed =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Product CRUD",
+      _completed: [
+        {
+          _id: "product-crud",
+          _title: "Product CRUD",
+          _type: "crud",
+        },
+      ],
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [{ _id: "product" }],
+      _modules: [],
+    },
+  });
+assert.deepEqual(guide_product_crud_completed, {
+  _title: "Product Search",
+  _reason: "Current focus is Product Management.",
+  _type: "flow",
+  _priority: 100,
+  _action: {
+    _prompt: "Create flow product-search.",
+  },
+});
+
+const guide_product_parking_lot_suppressed =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Product Management",
+      _parking_lot: ["Product CRUD"],
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [{ _id: "product" }],
+      _modules: [],
+    },
+  });
+assert.equal(guide_product_parking_lot_suppressed, null);
+
+const guide_customer_crud_missing =
+  await (guide_recommendation_xvibe as any)._get_guide_recommendation({
+    _params: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _project_memory: {
+        _current_focus: "Customer CRUD",
+      },
+      _runtime_assets: {
+        _views: [],
+        _flows: [],
+        _entities: [{ _id: "customer" }],
+        _modules: [],
+      },
+    },
+  });
+assert.equal(guide_customer_crud_missing._ok, true);
+const guide_customer_crud_recommendation = {
+  _title: "Customer CRUD",
+  _reason: "Current focus is Customer Management.",
+  _type: "crud",
+  _priority: 100,
+  _action: {
+    _prompt: "Create Customer CRUD.",
+  },
+};
+assert.deepEqual(
+  guide_customer_crud_missing._result._recommendation,
+  guide_customer_crud_recommendation,
+);
+for (const focus of ["Customer Management", "Customers"] as const) {
+  const guide_customer_alias =
+    await guide_recommendation_xvibe.getGuideRecommendation({
+      _app_id: "intent-test-app",
+      _env: "test",
+      _project_memory: {
+        _current_focus: focus,
+      },
+      _runtime_assets: {
+        _views: [],
+        _flows: [],
+        _entities: [{ _id: "customer" }],
+        _modules: [],
+      },
+    });
+  assert.deepEqual(guide_customer_alias, guide_customer_crud_recommendation);
+}
+
+const guide_parking_lot_suppressed =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Customer CRUD",
+      _parking_lot: ["Customer CRUD"],
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [{ _id: "customer" }],
+      _modules: [],
+    },
+  });
+assert.equal(guide_parking_lot_suppressed, null);
+
+const guide_completed_suppressed =
+  await guide_recommendation_xvibe.getGuideRecommendation({
+    _app_id: "intent-test-app",
+    _env: "test",
+    _project_memory: {
+      _current_focus: "Authentication",
+      _completed: [
+        {
+          _id: "user-crud",
+          _title: "User CRUD",
+          _type: "crud",
+        },
+        {
+          _id: "login",
+          _title: "Login",
+          _type: "flow",
+        },
+        {
+          _id: "roles",
+          _title: "Roles",
+          _type: "flow",
+        },
+        {
+          _id: "permissions",
+          _title: "Permissions",
+          _type: "flow",
+        },
+      ],
+    },
+    _runtime_assets: {
+      _views: [],
+      _flows: [],
+      _entities: [],
+      _modules: [],
+    },
+  });
+assert.equal(guide_completed_suppressed, null);
 
 const xvibe_entity_create_user_res = await xvibe_intent_engine.analyze({
   _message: "Create entity User",
@@ -600,7 +3074,7 @@ assert_xvibe_entity_artifact_request(
 );
 
 const xvibe_entity_non_entity_res = await xvibe_intent_engine.analyze({
-  _message: "Create a dashboard",
+  _message: "Show dashboard ideas",
   _runtime_context: {
     _app_id: "intent-test-app",
     _env: "test",
@@ -698,8 +3172,42 @@ assert_xvibe_flow_artifact_request(
   "product-type",
 );
 
+const xvibe_flow_xdata_set_res = await xvibe_intent_engine.analyze({
+  _message:
+    'Create a flow named save-project with one step that sets XData key save-status to "Project saved".',
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_xdata_set_flow_artifact_request(
+  xvibe_flow_xdata_set_res,
+  {
+    _flow_id: "save-project",
+    _xdata_key: "save-status",
+    _xdata_value: "Project saved",
+  },
+);
+
+const xvibe_flow_xdata_set_short_res = await xvibe_intent_engine.analyze({
+  _message:
+    'Create flow Save Project with one step that sets XData key save-status to "Project saved".',
+  _runtime_context: {
+    _app_id: "intent-test-app",
+    _env: "test",
+  },
+});
+assert_xvibe_xdata_set_flow_artifact_request(
+  xvibe_flow_xdata_set_short_res,
+  {
+    _flow_id: "save-project",
+    _xdata_key: "save-status",
+    _xdata_value: "Project saved",
+  },
+);
+
 const xvibe_flow_non_flow_res = await xvibe_intent_engine.analyze({
-  _message: "Create a dashboard that lists users",
+  _message: "Show dashboard ideas for users",
   _runtime_context: {
     _app_id: "intent-test-app",
     _env: "test",
@@ -760,6 +3268,34 @@ assert.deepEqual(
 assert.equal(xvibe_flow_semantic_generate_count, 0);
 set_xvibe_semantic_intent_env(undefined);
 
+set_xvibe_semantic_intent_env("true", "xdata-flow-before-semantic-provider");
+let xvibe_xdata_flow_semantic_generate_count = 0;
+const xvibe_xdata_flow_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_xdata_flow_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_xdata_flow_before_semantic_res =
+  await xvibe_xdata_flow_before_semantic_engine.analyze({
+    _message:
+      'Create a flow named save-project with one step that sets XData key save-status to "Project saved".',
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_xdata_set_flow_artifact_request(
+  xvibe_xdata_flow_before_semantic_res,
+  {
+    _flow_id: "save-project",
+    _xdata_key: "save-status",
+    _xdata_value: "Project saved",
+  },
+);
+assert.equal(xvibe_xdata_flow_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
 for (const [message, entity_name, view_id] of [
   ["Create form for product", "product", "create-product"],
   ["Create product form", "product", "create-product"],
@@ -787,7 +3323,7 @@ for (const [message, entity_name, view_id] of [
 }
 
 const xvibe_form_non_form_res = await xvibe_intent_engine.analyze({
-  _message: "Create a dashboard that lists products",
+  _message: "Show dashboard ideas for products",
   _runtime_context: {
     _app_id: "intent-test-app",
     _env: "test",
@@ -871,7 +3407,7 @@ for (const [message, entity_name, view_id] of [
 }
 
 const xvibe_table_non_table_res = await xvibe_intent_engine.analyze({
-  _message: "Create dashboard with users table",
+  _message: "Show dashboard ideas with users table",
   _runtime_context: {
     _app_id: "intent-test-app",
     _env: "test",
@@ -944,9 +3480,17 @@ for (const message of [
       _env: "test",
     },
   });
-  assert_xvibe_crud_execution_plan_request(
+  assert_xvibe_crud_field_suggestion_request(
     xvibe_crud_res,
     "product",
+    [
+      { _name: "name" },
+      { _name: "description" },
+      { _name: "price" },
+      { _name: "category" },
+      { _name: "stock" },
+      { _name: "status" },
+    ],
   );
 }
 
@@ -957,10 +3501,143 @@ const xvibe_crud_normalized_res = await xvibe_intent_engine.analyze({
     _env: "test",
   },
 });
-assert_xvibe_crud_execution_plan_request(
+assert_xvibe_crud_field_suggestion_request(
   xvibe_crud_normalized_res,
   "product-type",
+  [
+    { _name: "name" },
+    { _name: "description" },
+    { _name: "price" },
+    { _name: "category" },
+    { _name: "stock" },
+    { _name: "status" },
+  ],
 );
+
+const original_crud_suggestion_execute = (_x as any).execute;
+let crud_suggestion_xai_generate_count = 0;
+try {
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "xai" && command?._op === "generate") {
+      crud_suggestion_xai_generate_count += 1;
+      assert.match(
+        command._params?._prompt ?? "",
+        /Do not include entity-prefixed fields/u,
+      );
+      assert.match(
+        command._params?._prompt ?? "",
+        /Do not include id fields, \*_id fields, created_at, or updated_at/u,
+      );
+      return {
+        _ok: true,
+        _text: JSON.stringify({
+          _fields: [
+            "product_id",
+            "product_name",
+            "product_description",
+            "created_at",
+            "updated_at",
+            "_id",
+            "id",
+            "_created_at",
+            "_updated_at",
+            "product2_id",
+            "product2_name",
+            "price",
+            "category",
+            "Status",
+          ],
+        }),
+      };
+    }
+
+    return original_crud_suggestion_execute.call(_x, command);
+  };
+
+  const xvibe_crud_xai_suggestion_res = await xvibe_intent_engine.analyze({
+    _message: "Create Product2 CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_crud_field_suggestion_request(
+    xvibe_crud_xai_suggestion_res,
+    "product2",
+    [
+      { _name: "name" },
+      { _name: "description" },
+      { _name: "price" },
+      { _name: "category" },
+      { _name: "status" },
+    ],
+  );
+  assert.equal(crud_suggestion_xai_generate_count, 1);
+
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "xai" && command?._op === "generate") {
+      crud_suggestion_xai_generate_count += 1;
+      throw new Error("crud field suggestion cache should avoid xai.generate");
+    }
+
+    return original_crud_suggestion_execute.call(_x, command);
+  };
+
+  const xvibe_crud_cache_suggestion_res = await xvibe_intent_engine.analyze({
+    _message: "Create Product2 CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_crud_field_suggestion_request(
+    xvibe_crud_cache_suggestion_res,
+    "product2",
+    [
+      { _name: "name" },
+      { _name: "description" },
+      { _name: "price" },
+      { _name: "category" },
+      { _name: "status" },
+    ],
+  );
+  assert.equal(crud_suggestion_xai_generate_count, 1);
+} finally {
+  (_x as any).execute = original_crud_suggestion_execute;
+}
+
+const original_crud_fallback_execute = (_x as any).execute;
+let crud_fallback_xai_generate_count = 0;
+try {
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "xai" && command?._op === "generate") {
+      crud_fallback_xai_generate_count += 1;
+      throw new Error("forced crud suggestion fallback");
+    }
+
+    return original_crud_fallback_execute.call(_x, command);
+  };
+
+  const xvibe_crud_fallback_suggestion_res = await xvibe_intent_engine.analyze({
+    _message: "Create Fallback Thing CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_crud_field_suggestion_request(
+    xvibe_crud_fallback_suggestion_res,
+    "fallback-thing",
+    [
+      { _name: "name" },
+      { _name: "description" },
+      { _name: "status" },
+    ],
+  );
+  assert.equal(crud_fallback_xai_generate_count, 1);
+} finally {
+  (_x as any).execute = original_crud_fallback_execute;
+}
 
 const xvibe_crud_comma_fields_res = await xvibe_intent_engine.analyze({
   _message: "Create Partner CRUD with name,email,phone",
@@ -1046,15 +3723,383 @@ const xvibe_crud_before_semantic_res =
       _env: "test",
     },
   });
-assert_xvibe_crud_execution_plan_request(
+assert_xvibe_crud_field_suggestion_request(
   xvibe_crud_before_semantic_res,
   "product",
+  [
+    { _name: "name" },
+    { _name: "description" },
+    { _name: "price" },
+    { _name: "category" },
+    { _name: "stock" },
+    { _name: "status" },
+  ],
 );
 assert.deepEqual(
   xvibe_crud_before_semantic_res._processor_chain,
   XVIBE_INTENT_PROCESSOR_CHAIN,
 );
 assert.equal(xvibe_crud_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+for (const [message, entity_name, field_name] of [
+  ["Add priority field to Project CRUD", "project", "priority"],
+  ["Add priority to Project", "project", "priority"],
+  ["Add field priority to project", "project", "priority"],
+  ["Add due_date field to Project CRUD", "project", "due-date"],
+] as const) {
+  const xvibe_add_field_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert_xvibe_add_field_artifact_request(
+    xvibe_add_field_res,
+    entity_name,
+    field_name,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "add-field-before-semantic-provider");
+let xvibe_add_field_semantic_generate_count = 0;
+const xvibe_add_field_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_add_field_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_add_field_before_semantic_res =
+  await xvibe_add_field_before_semantic_engine.analyze({
+    _message: "Add priority field to Project CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_add_field_artifact_request(
+  xvibe_add_field_before_semantic_res,
+  "project",
+  "priority",
+);
+assert.deepEqual(
+  xvibe_add_field_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_add_field_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+const xvibe_rename_field_prompt_cases: Array<
+  [
+    string,
+    Record<string, unknown>,
+    string,
+    string,
+    string,
+  ]
+> = [
+  [
+    "Rename priority to severity",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+    "severity",
+  ],
+  [
+    "Rename priority field to severity",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+    "severity",
+  ],
+  [
+    "Rename priority to severity in Project",
+    {},
+    "project",
+    "priority",
+    "severity",
+  ],
+  [
+    "Rename priority to severity in Project CRUD",
+    {},
+    "project",
+    "priority",
+    "severity",
+  ],
+];
+for (const [message, context, entity_name, old_field, new_field] of xvibe_rename_field_prompt_cases) {
+  const xvibe_rename_field_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      ...context,
+    },
+  });
+  assert_xvibe_rename_field_artifact_request(
+    xvibe_rename_field_res,
+    entity_name,
+    old_field,
+    new_field,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "rename-field-before-semantic-provider");
+let xvibe_rename_field_semantic_generate_count = 0;
+const xvibe_rename_field_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_rename_field_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_rename_field_before_semantic_res =
+  await xvibe_rename_field_before_semantic_engine.analyze({
+    _message: "Rename priority to severity in Project CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_rename_field_artifact_request(
+  xvibe_rename_field_before_semantic_res,
+  "project",
+  "priority",
+  "severity",
+);
+assert.deepEqual(
+  xvibe_rename_field_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_rename_field_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+const xvibe_deprecate_field_prompt_cases: Array<
+  [string, Record<string, unknown>, string, string]
+> = [
+  [
+    "Deprecate priority field",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+  ],
+  [
+    "Deprecate priority field in Project",
+    {},
+    "project",
+    "priority",
+  ],
+  [
+    "Deprecate priority from Project CRUD",
+    {},
+    "project",
+    "priority",
+  ],
+  [
+    "Mark priority as deprecated",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+  ],
+];
+for (const [message, context, entity_name, field_name] of xvibe_deprecate_field_prompt_cases) {
+  const xvibe_deprecate_field_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      ...context,
+    },
+  });
+  assert_xvibe_deprecate_field_artifact_request(
+    xvibe_deprecate_field_res,
+    "DeprecateFieldProcessor",
+    entity_name,
+    field_name,
+  );
+}
+
+const xvibe_delete_field_prompt_cases: Array<
+  [string, Record<string, unknown>, string, string]
+> = [
+  [
+    "Delete priority field",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+  ],
+  ["Delete priority from Project CRUD", {}, "project", "priority"],
+  [
+    "Remove priority field",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+  ],
+];
+for (const [message, context, entity_name, field_name] of xvibe_delete_field_prompt_cases) {
+  const xvibe_delete_field_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      ...context,
+    },
+  });
+  assert_xvibe_deprecate_field_artifact_request(
+    xvibe_delete_field_res,
+    "DeleteFieldProcessor",
+    entity_name,
+    field_name,
+    {
+      _requested_operation: "delete",
+    },
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "deprecate-field-before-semantic-provider");
+let xvibe_deprecate_field_semantic_generate_count = 0;
+const xvibe_deprecate_field_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_deprecate_field_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_deprecate_field_before_semantic_res =
+  await xvibe_deprecate_field_before_semantic_engine.analyze({
+    _message: "Deprecate priority field in Project",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_deprecate_field_artifact_request(
+  xvibe_deprecate_field_before_semantic_res,
+  "DeprecateFieldProcessor",
+  "project",
+  "priority",
+);
+assert.deepEqual(
+  xvibe_deprecate_field_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_deprecate_field_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+set_xvibe_semantic_intent_env("true", "delete-field-before-semantic-provider");
+let xvibe_delete_field_semantic_generate_count = 0;
+const xvibe_delete_field_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_delete_field_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_delete_field_before_semantic_res =
+  await xvibe_delete_field_before_semantic_engine.analyze({
+    _message: "Delete priority from Project CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_deprecate_field_artifact_request(
+  xvibe_delete_field_before_semantic_res,
+  "DeleteFieldProcessor",
+  "project",
+  "priority",
+  {
+    _requested_operation: "delete",
+  },
+);
+assert.deepEqual(
+  xvibe_delete_field_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_delete_field_semantic_generate_count, 0);
+set_xvibe_semantic_intent_env(undefined);
+
+const xvibe_restore_field_prompt_cases: Array<
+  [string, Record<string, unknown>, string, string]
+> = [
+  ["Restore priority field in Project CRUD", {}, "project", "priority"],
+  ["Undeprecate priority in Project", {}, "project", "priority"],
+  [
+    "Bring back priority field",
+    {
+      _available_artifacts: {
+        _entities: ["project"],
+      },
+    },
+    "project",
+    "priority",
+  ],
+  ["Restore priority to Project", {}, "project", "priority"],
+];
+for (const [message, context, entity_name, field_name] of xvibe_restore_field_prompt_cases) {
+  const xvibe_restore_field_res = await xvibe_intent_engine.analyze({
+    _message: message,
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      ...context,
+    },
+  });
+  assert_xvibe_restore_field_artifact_request(
+    xvibe_restore_field_res,
+    entity_name,
+    field_name,
+  );
+}
+
+set_xvibe_semantic_intent_env("true", "restore-field-before-semantic-provider");
+let xvibe_restore_field_semantic_generate_count = 0;
+const xvibe_restore_field_before_semantic_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => {
+    xvibe_restore_field_semantic_generate_count += 1;
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const xvibe_restore_field_before_semantic_res =
+  await xvibe_restore_field_before_semantic_engine.analyze({
+    _message: "Restore priority field in Project CRUD",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+assert_xvibe_restore_field_artifact_request(
+  xvibe_restore_field_before_semantic_res,
+  "project",
+  "priority",
+);
+assert.deepEqual(
+  xvibe_restore_field_before_semantic_res._processor_chain,
+  XVIBE_INTENT_PROCESSOR_CHAIN,
+);
+assert.equal(xvibe_restore_field_semantic_generate_count, 0);
 set_xvibe_semantic_intent_env(undefined);
 
 const xvibe_learn_file_create_work_dir =
@@ -1568,6 +4613,162 @@ try {
     "DeterministicIntentProcessor",
   );
 
+  const xvibe_intent_fix_project_views_res = await xvibe_intent_engine.analyze({
+    _message: "fix project views",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+    },
+  });
+  assert.equal(xvibe_intent_fix_project_views_res._ok, true);
+  assert.equal(
+    xvibe_intent_fix_project_views_res._processor,
+    "DeterministicIntentProcessor",
+  );
+  assert.equal(
+    xvibe_intent_fix_project_views_res._intent?._message_type,
+    "edit",
+  );
+  assert.equal(
+    xvibe_intent_fix_project_views_res._intent?._execution_level,
+    "deterministic",
+  );
+  const xvibe_intent_fix_project_views_action =
+    xvibe_intent_fix_project_views_res._intent?._actions[0];
+  assert.equal(
+    xvibe_intent_fix_project_views_action?._action_type,
+    "module-op",
+  );
+  assert.equal(xvibe_intent_fix_project_views_action?._executable, true);
+  assert.deepEqual(
+    xvibe_intent_fix_project_views_action?._execution_payload,
+    {
+      _module: "xvibe",
+      _op: "fix-project-views",
+      _params: {
+        _app_id: "intent-test-app",
+        _env: "test",
+      },
+    },
+  );
+
+  const xvibe_known_text_replacement_prompts: Array<{
+    _message: string;
+    _runtime_context_extra?: Record<string, unknown>;
+    _expected: {
+      _view_id: string;
+      _target_id: string;
+      _target_type?: string;
+      _property_value: string;
+    };
+  }> = [
+    {
+      _message: 'change title "Dashboard" to "My App"',
+      _runtime_context_extra: { _active_view_id: "dashboard" },
+      _expected: {
+        _view_id: "dashboard",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _property_value: "My App",
+      },
+    },
+    {
+      _message: 'change title "My App" to "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'change label "My App" to "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'update label "My App" text to "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'update main view change "My App" label text to "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'replace "My App" with "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'rename title "My App" to "Dashboard"',
+      _expected: {
+        _view_id: "main",
+        _target_id: "My App",
+        _target_type: "label",
+        _property_value: "Dashboard",
+      },
+    },
+    {
+      _message: 'change text "Dashboard" to "My App"',
+      _runtime_context_extra: { _active_view_id: "home" },
+      _expected: {
+        _view_id: "home",
+        _target_id: "Dashboard",
+        _target_type: "text",
+        _property_value: "My App",
+      },
+    },
+  ];
+  for (const prompt_case of xvibe_known_text_replacement_prompts) {
+    const result = await xvibe_intent_engine.analyze({
+      _message: prompt_case._message,
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        ...(prompt_case._runtime_context_extra ?? {}),
+      },
+    });
+    assert_xvibe_text_replacement_action(result, prompt_case._expected);
+  }
+
+  const xvibe_intent_rename_title_res = await xvibe_intent_engine.analyze({
+    _message: 'rename title "Dashboard" to "My App"',
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _current_artifact: {
+        _id: "main",
+      },
+    },
+  });
+  assert_xvibe_text_replacement_action(
+    xvibe_intent_rename_title_res,
+    {
+      _view_id: "main",
+      _target_id: "Dashboard",
+      _target_type: "label",
+      _property_value: "My App",
+    },
+  );
+
   const xvibe_intent_delete_selected_res = await xvibe_intent_engine.analyze({
     _message: "delete selected",
     _runtime_context: xvibe_intent_selected_object_context(),
@@ -1676,7 +4877,7 @@ const xvibe_semantic_disabled_engine = xvibe_test_intent_engine({
 });
 const xvibe_semantic_disabled_engine_res =
   await xvibe_semantic_disabled_engine.analyze({
-    _message: "what can you do?",
+    _message: "semantic disabled fallback fixture",
     _conversation_id: "conversation-semantic-disabled",
     _runtime_context: {
       _app_id: "intent-test-app",
@@ -1718,6 +4919,46 @@ assert.deepEqual(
 assert.equal(typeof xvibe_semantic_deterministic_res._duration_ms, "number");
 assert.equal(xvibe_semantic_deterministic_generate_count, 0);
 
+const xvibe_semantic_text_replacement_res =
+  await xvibe_semantic_deterministic_engine.analyze({
+    _message: 'change title "Dashboard" to "My App"',
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert_xvibe_text_replacement_action(
+  xvibe_semantic_text_replacement_res,
+  {
+    _view_id: "main",
+    _target_id: "Dashboard",
+    _target_type: "label",
+    _property_value: "My App",
+  },
+);
+assert.equal(xvibe_semantic_deterministic_generate_count, 0);
+
+const xvibe_semantic_verbose_text_replacement_res =
+  await xvibe_semantic_deterministic_engine.analyze({
+    _message: 'update main view change "My App" label text to "Dashboard"',
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert_xvibe_text_replacement_action(
+  xvibe_semantic_verbose_text_replacement_res,
+  {
+    _view_id: "main",
+    _target_id: "My App",
+    _target_type: "label",
+    _property_value: "Dashboard",
+  },
+);
+assert.equal(xvibe_semantic_deterministic_generate_count, 0);
+
 let xvibe_semantic_entity_generate_count = 0;
 const xvibe_semantic_entity_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => {
@@ -1751,7 +4992,7 @@ const xvibe_semantic_enabled_engine = xvibe_test_intent_engine({
 });
 const xvibe_semantic_enabled_res =
   await xvibe_semantic_enabled_engine.analyze({
-    _message: "what can you do?",
+    _message: "answer a general runtime question with semantic intent",
     _conversation_id: "conversation-semantic-enabled",
     _runtime_context: {
       _app_id: "intent-test-app",
@@ -1848,6 +5089,77 @@ assert.deepEqual(
   "XVibeIntentResult",
 );
 
+const xvibe_semantic_project_memory = {
+  _version: 1,
+  _vision: "CRM",
+  _goal: "CRM",
+  _current_focus: "Customer CRUD",
+  _completed: [],
+  _parking_lot: ["Reports"],
+  _decisions: ["SQLite", "No authentication"],
+  _notes: [],
+  _updated_at: "2026-07-06T00:00:00.000Z",
+};
+const xvibe_semantic_project_memory_inputs:
+  XVibeSemanticIntentGenerateJsonInput[] = [];
+const xvibe_semantic_project_memory_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async (input) => {
+    xvibe_semantic_project_memory_inputs.push(input);
+    return XVIBE_SEMANTIC_VALID_INTENT;
+  },
+});
+const original_semantic_project_memory_execute = (_x as any).execute;
+const original_semantic_project_memory_get_module = (_x as any).getModule;
+try {
+  (_x as any).getModule = (name: string) => {
+    if (name === "server-xvm") return {};
+    return typeof original_semantic_project_memory_get_module === "function"
+      ? original_semantic_project_memory_get_module.call(_x, name)
+      : undefined;
+  };
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm" && command?._op === "get-project-memory") {
+      return {
+        _ok: true,
+        _result: {
+          _memory: xvibe_semantic_project_memory,
+        },
+      };
+    }
+
+    return original_semantic_project_memory_execute.call(_x, command);
+  };
+
+  const xvibe_semantic_project_memory_res =
+    await xvibe_semantic_project_memory_engine.analyze({
+      _message: "answer with semantic project memory context",
+      _conversation_id: "conversation-semantic-project-memory",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _conversation_id: "conversation-semantic-project-memory",
+      },
+    });
+  assert.equal(xvibe_semantic_project_memory_res._ok, true);
+  const xvibe_semantic_project_memory_input =
+    xvibe_semantic_project_memory_inputs[0];
+  if (!xvibe_semantic_project_memory_input) {
+    throw new Error("semantic project memory generate input was not captured");
+  }
+  assert.ok(xvibe_semantic_project_memory_input.prompt.includes("\"_project_memory\""));
+  assert.ok(xvibe_semantic_project_memory_input.prompt.includes("\"_goal\":\"CRM\""));
+  assert.ok(xvibe_semantic_project_memory_input.prompt.includes("\"_current_focus\":\"Customer CRUD\""));
+  const xvibe_semantic_project_memory_request =
+    (xvibe_semantic_project_memory_input.context as any)._request;
+  assert.deepEqual(
+    xvibe_semantic_project_memory_request._runtime_context._project_memory,
+    xvibe_semantic_project_memory,
+  );
+} finally {
+  (_x as any).execute = original_semantic_project_memory_execute;
+  (_x as any).getModule = original_semantic_project_memory_get_module;
+}
+
 const xvibe_semantic_normalized_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "IntentResult",
@@ -1873,12 +5185,112 @@ const xvibe_semantic_normalized_engine = xvibe_test_intent_engine({
     _warnings: [],
   }),
 });
+const xvibe_semantic_preflight_view_main = {
+  _id: "view-main",
+  _type: "view",
+  _children: [
+    {
+      _id: "button-json-1",
+      _type: "button",
+      _text: "Selected Button",
+    },
+    {
+      _id: "dashboard-title-real",
+      _type: "label",
+      _text: "Dashboard",
+    },
+    {
+      _id: "my-app-label-real",
+      _type: "label",
+      _text: "My App",
+    },
+    {
+      _id: "new-record-button-real",
+      _type: "button",
+      _text: "New Record",
+    },
+  ],
+};
+const xvibe_semantic_preflight_main_view = {
+  ...xvibe_semantic_preflight_view_main,
+  _id: "main",
+};
+const xvibe_semantic_preflight_dashboard_view = {
+  ...xvibe_semantic_preflight_view_main,
+  _id: "dashboard",
+};
+let xvibe_semantic_root_target_preflight_generate_count = 0;
+const xvibe_semantic_root_target_preflight_processor =
+  new SemanticIntentProcessor({
+    _generate_json: async () => {
+      xvibe_semantic_root_target_preflight_generate_count += 1;
+      return {
+        _message_type: "edit",
+        _execution_level: "artifact",
+        _should_mutate: true,
+        _confidence: 0.82,
+        _reason: "mock_semantic_root_target_text_edit",
+        _actions: [
+          {
+            _id: "semantic-root-target-text-edit",
+            _title: "Update title text",
+            _action_type: "apply-view-edit",
+            _status: "suggested",
+            _params: {
+              _view_id: "main",
+              _target_id: "main",
+              _target_type: "view",
+              _edit_action: "update-property",
+              _property_name: "_text",
+              _property_value: "Dashboard",
+            },
+          },
+        ],
+        _warnings: [],
+      };
+    },
+  });
+const xvibe_semantic_root_target_preflight_res =
+  await xvibe_semantic_root_target_preflight_processor.analyze({
+    _message: 'update main view change "My App" label text to "Dashboard"',
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+      _current_view: xvibe_semantic_preflight_main_view,
+      _available_artifacts: {
+        _views: ["main"],
+      },
+    },
+  });
+const xvibe_semantic_root_target_preflight_action =
+  xvibe_semantic_root_target_preflight_res?._actions[0];
+assert.equal(xvibe_semantic_root_target_preflight_generate_count, 1);
+assert.equal(xvibe_semantic_root_target_preflight_action?._executable, true);
+assert.equal(
+  xvibe_semantic_root_target_preflight_action?._params?._target_id,
+  "my-app-label-real",
+);
+assert.equal(
+  xvibe_semantic_root_target_preflight_action?._params?._target_type,
+  "label",
+);
+assert.equal(
+  xvibe_semantic_root_target_preflight_action?._params?._property_value,
+  "Dashboard",
+);
+
 const xvibe_semantic_normalized_res =
   await xvibe_semantic_normalized_engine.analyze({
     _message: "hide the selected button semantically",
     _runtime_context: {
       _app_id: "intent-test-app",
       _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+      _available_artifacts: {
+        _views: ["view-main"],
+      },
     },
   });
 assert.equal(xvibe_semantic_normalized_res._ok, true);
@@ -1911,6 +5323,2218 @@ assert.equal(
   true,
 );
 
+const xvibe_semantic_update_style_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.82,
+    _reason: "mock_semantic_update_style",
+    _actions: [
+      {
+        _id: "semantic-update-style",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "update-style",
+          _properties: {
+            fontSize: "32px",
+            fontWeight: "bold",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_update_style_res =
+  await xvibe_semantic_update_style_engine.analyze({
+    _message: "Make the Dashboard title 32px and bold",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+assert.equal(xvibe_semantic_update_style_res._ok, true);
+assert.equal(
+  xvibe_semantic_update_style_res._intent?._actions[0]._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_update_style_res._intent?._actions[0]._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "bold",
+  },
+);
+
+const xvibe_semantic_set_style_properties_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_set_style_properties",
+    _actions: [
+      {
+        _id: "semantic-set-style-properties",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-style",
+          _style_properties: {
+            "font-size": "32px",
+            "font-weight": "bold",
+            "margin-bottom": "16px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_set_style_properties_res =
+  await xvibe_semantic_set_style_properties_engine.analyze({
+    _message: "Make the Dashboard title 32px, bold, with 16px margin below.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_set_style_properties_action =
+  xvibe_semantic_set_style_properties_res._intent?._actions[0];
+assert.equal(xvibe_semantic_set_style_properties_res._ok, true);
+assert.equal(xvibe_semantic_set_style_properties_action?._executable, true);
+assert.equal(
+  xvibe_semantic_set_style_properties_action?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_set_style_properties_action?._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  },
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_set_style_properties_action?._params ?? {},
+    "_style_properties",
+  ),
+  false,
+);
+assert.deepEqual(
+  xvibe_semantic_set_style_properties_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_set_style_properties_action?._params,
+  },
+);
+assert.equal(
+  xvibe_semantic_set_style_properties_action?._execution_payload?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_set_style_properties_action?._execution_payload?._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  },
+);
+
+const xvibe_semantic_update_properties_styles_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_update_properties_styles",
+    _actions: [
+      {
+        _id: "semantic-update-properties-styles",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "update-properties",
+          _properties: {
+            styles: {
+              "font-size": "32px",
+              "font-weight": "bold",
+              "margin-bottom": "16px",
+            },
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_update_properties_styles_res =
+  await xvibe_semantic_update_properties_styles_engine.analyze({
+    _message: "Make the Dashboard title 32px, bold, with 16px margin below.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_update_properties_styles_action =
+  xvibe_semantic_update_properties_styles_res._intent?._actions[0];
+assert.equal(xvibe_semantic_update_properties_styles_res._ok, true);
+assert.equal(xvibe_semantic_update_properties_styles_action?._executable, true);
+assert.equal(
+  xvibe_semantic_update_properties_styles_action?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_update_properties_styles_action?._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  },
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_update_properties_styles_action?._params ?? {},
+    "_properties",
+  ),
+  false,
+);
+assert.deepEqual(
+  xvibe_semantic_update_properties_styles_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_update_properties_styles_action?._params,
+  },
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_update_properties_styles_action?._execution_payload?._params ?? {},
+    "_properties",
+  ),
+  false,
+);
+
+const xvibe_semantic_set_properties_single_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_set_properties_single",
+    _actions: [
+      {
+        _id: "semantic-set-properties-single",
+        _title: "Update title text",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-properties",
+          _properties: {
+            _text: "Overview",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_set_properties_single_res =
+  await xvibe_semantic_set_properties_single_engine.analyze({
+    _message: "Rename the Dashboard title to Overview",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_set_properties_single_action =
+  xvibe_semantic_set_properties_single_res._intent?._actions[0];
+assert.equal(xvibe_semantic_set_properties_single_res._ok, true);
+assert.equal(xvibe_semantic_set_properties_single_action?._executable, true);
+assert.equal(
+  xvibe_semantic_set_properties_single_action?._params?._edit_action,
+  "update-property",
+);
+assert.equal(
+  xvibe_semantic_set_properties_single_action?._params?._property_name,
+  "_text",
+);
+assert.equal(
+  xvibe_semantic_set_properties_single_action?._params?._property_value,
+  "Overview",
+);
+assert.equal(
+  xvibe_semantic_set_properties_single_action?._params?._properties,
+  undefined,
+);
+
+const xvibe_semantic_update_properties_batch_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_update_properties_batch",
+    _actions: [
+      {
+        _id: "semantic-update-properties-batch",
+        _title: "Update title properties",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "update-properties",
+          _properties: {
+            _text: "Overview",
+            class: "dashboard-title",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_update_properties_batch_res =
+  await xvibe_semantic_update_properties_batch_engine.analyze({
+    _message: "Update Dashboard title text and class",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+    },
+  });
+const xvibe_semantic_update_properties_batch_action =
+  xvibe_semantic_update_properties_batch_res._intent?._actions[0];
+assert.equal(xvibe_semantic_update_properties_batch_res._ok, true);
+assert.equal(xvibe_semantic_update_properties_batch_action?._executable, false);
+assert.equal(
+  xvibe_semantic_update_properties_batch_action?._non_executable_reason,
+  "unsupported_property_batch",
+);
+assert.equal(
+  xvibe_semantic_update_properties_batch_action?._execution_payload,
+  undefined,
+);
+
+const xvibe_semantic_dashboard_view_to_active_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_dashboard_view_to_active",
+    _actions: [
+      {
+        _id: "semantic-dashboard-view-to-active",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "dashboard",
+          _target_id: "dashboard-title",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+            "font-weight": "bold",
+            "margin-bottom": "16px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_dashboard_view_to_active_res =
+  await xvibe_semantic_dashboard_view_to_active_engine.analyze({
+    _message: "Make the Dashboard title 32px, bold, with 16px margin below.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+      _current_view: xvibe_semantic_preflight_main_view,
+      _available_artifacts: {
+        _views: ["main"],
+      },
+    },
+  });
+assert.equal(xvibe_semantic_dashboard_view_to_active_res._ok, true);
+assert.equal(
+  xvibe_semantic_dashboard_view_to_active_res._intent?._actions[0]._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_dashboard_view_to_active_res._intent?._actions[0]._params?._view_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_dashboard_view_to_active_res._intent?._actions[0]._params?._target_id,
+  "dashboard-title-real",
+);
+
+const xvibe_semantic_exact_id_preflight_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_exact_id_preflight",
+    _actions: [
+      {
+        _id: "semantic-exact-id-preflight",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "dashboard-title-real",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_exact_id_preflight_res =
+  await xvibe_semantic_exact_id_preflight_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+assert.equal(xvibe_semantic_exact_id_preflight_res._ok, true);
+assert.equal(
+  xvibe_semantic_exact_id_preflight_res._intent?._actions[0]._params?._target_id,
+  "dashboard-title-real",
+);
+
+const xvibe_semantic_new_record_button_preflight_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_new_record_button_preflight",
+    _actions: [
+      {
+        _id: "semantic-new-record-button-preflight",
+        _title: "Hide new record button",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "new-record-button",
+          _target_type: "button",
+          _edit_action: "hide-object",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_new_record_button_preflight_res =
+  await xvibe_semantic_new_record_button_preflight_engine.analyze({
+    _message: "Hide the New Record button.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+assert.equal(xvibe_semantic_new_record_button_preflight_res._ok, true);
+assert.equal(
+  xvibe_semantic_new_record_button_preflight_res._intent?._actions[0]._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_new_record_button_preflight_res._intent?._actions[0]._params?._target_id,
+  "new-record-button-real",
+);
+
+const xvibe_semantic_ambiguous_dashboard_view = {
+  _id: "view-main",
+  _type: "view",
+  _children: [
+    {
+      _id: "dashboard-title-a",
+      _type: "label",
+      _text: "Dashboard",
+    },
+    {
+      _id: "dashboard-title-b",
+      _type: "label",
+      _text: "Dashboard",
+    },
+  ],
+};
+const xvibe_semantic_ambiguous_visible_text_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_ambiguous_visible_text",
+    _actions: [
+      {
+        _id: "semantic-ambiguous-visible-text",
+        _title: "Update dashboard styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_ambiguous_visible_text_res =
+  await xvibe_semantic_ambiguous_visible_text_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_ambiguous_dashboard_view,
+    },
+  });
+assert.equal(xvibe_semantic_ambiguous_visible_text_res._ok, true);
+assert.equal(
+  xvibe_semantic_ambiguous_visible_text_res._intent?._actions[0]._executable,
+  false,
+);
+assert.equal(
+  xvibe_semantic_ambiguous_visible_text_res._intent?._actions[0]._non_executable_reason,
+  "target_ambiguous",
+);
+assert.equal(
+  xvibe_semantic_ambiguous_visible_text_res._intent?._actions[0]._execution_payload,
+  undefined,
+);
+
+const xvibe_semantic_unresolved_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_unresolved_target",
+    _actions: [
+      {
+        _id: "semantic-unresolved-target",
+        _title: "Update missing target styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "missing-widget",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_unresolved_target_res =
+  await xvibe_semantic_unresolved_target_engine.analyze({
+    _message: "Make the Missing Widget title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+assert.equal(xvibe_semantic_unresolved_target_res._ok, true);
+assert.equal(
+  xvibe_semantic_unresolved_target_res._intent?._actions[0]._executable,
+  false,
+);
+assert.equal(
+  xvibe_semantic_unresolved_target_res._intent?._actions[0]._non_executable_reason,
+  "target_not_found",
+);
+assert.equal(
+  xvibe_semantic_unresolved_target_res._intent?._actions[0]._execution_payload,
+  undefined,
+);
+
+const xvibe_semantic_exact_dashboard_view_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_exact_dashboard_view",
+    _actions: [
+      {
+        _id: "semantic-exact-dashboard-view",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "dashboard",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_exact_dashboard_view_res =
+  await xvibe_semantic_exact_dashboard_view_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "dashboard",
+      _current_view: xvibe_semantic_preflight_dashboard_view,
+      _available_artifacts: {
+        _views: ["main", "dashboard"],
+      },
+    },
+  });
+assert.equal(xvibe_semantic_exact_dashboard_view_res._ok, true);
+assert.equal(
+  xvibe_semantic_exact_dashboard_view_res._intent?._actions[0]._params?._view_id,
+  "dashboard",
+);
+
+const xvibe_semantic_main_view_alias_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_main_view_alias",
+    _actions: [
+      {
+        _id: "semantic-main-view-alias",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "main view",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_main_view_alias_res =
+  await xvibe_semantic_main_view_alias_engine.analyze({
+    _message: "Make the Dashboard title 32px in the main view",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _current_view: xvibe_semantic_preflight_main_view,
+      _available_artifacts: {
+        _views: ["main"],
+      },
+    },
+  });
+assert.equal(xvibe_semantic_main_view_alias_res._ok, true);
+assert.equal(
+  xvibe_semantic_main_view_alias_res._intent?._actions[0]._params?._view_id,
+  "main",
+);
+
+const xvibe_semantic_unknown_view_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_unknown_view",
+    _actions: [
+      {
+        _id: "semantic-unknown-view",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "unknown",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_unknown_view_res =
+  await xvibe_semantic_unknown_view_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _available_artifacts: {
+        _views: ["main"],
+      },
+    },
+  });
+assert.equal(xvibe_semantic_unknown_view_res._ok, true);
+assert.equal(
+  xvibe_semantic_unknown_view_res._intent?._actions[0]._executable,
+  false,
+);
+assert.equal(
+  xvibe_semantic_unknown_view_res._intent?._actions[0]._non_executable_reason,
+  "view_not_found",
+);
+assert.equal(
+  xvibe_semantic_unknown_view_res._intent?._actions[0]._execution_payload,
+  undefined,
+);
+
+const xvibe_semantic_single_set_style_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_single_set_style",
+    _actions: [
+      {
+        _id: "semantic-single-set-style",
+        _title: "Update title font size",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-style",
+          _style_property: "font-size",
+          _style_value: "32px",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_single_set_style_res =
+  await xvibe_semantic_single_set_style_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_single_set_style_action =
+  xvibe_semantic_single_set_style_res._intent?._actions[0];
+assert.equal(xvibe_semantic_single_set_style_res._ok, true);
+assert.equal(xvibe_semantic_single_set_style_action?._executable, true);
+assert.equal(
+  xvibe_semantic_single_set_style_action?._params?._edit_action,
+  "set-style",
+);
+assert.equal(
+  xvibe_semantic_single_set_style_action?._params?._style_property,
+  "font-size",
+);
+assert.equal(
+  xvibe_semantic_single_set_style_action?._params?._style_value,
+  "32px",
+);
+assert.equal(
+  xvibe_semantic_single_set_style_action?._params?._styles,
+  undefined,
+);
+
+const xvibe_semantic_create_toolbar_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.86,
+    _reason: "mock_semantic_create_toolbar",
+    _actions: [
+      {
+        _id: "semantic-create-toolbar",
+        _title: "Add toolbar",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _edit_action: "add-toolbar",
+          _location: "top",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_create_toolbar_res =
+  await xvibe_semantic_create_toolbar_engine.analyze({
+    _message: "Add a top toolbar to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_create_toolbar_action =
+  xvibe_semantic_create_toolbar_res._intent?._actions[0];
+assert.equal(xvibe_semantic_create_toolbar_res._ok, true);
+assert.equal(xvibe_semantic_create_toolbar_action?._executable, true);
+assert.equal(
+  xvibe_semantic_create_toolbar_action?._params?._edit_action,
+  "create-toolbar",
+);
+assert.equal(
+  xvibe_semantic_create_toolbar_action?._params?._target_id,
+  "view-main",
+);
+assert.equal(
+  xvibe_semantic_create_toolbar_action?._params?._target_type,
+  "view",
+);
+assert.deepEqual(
+  xvibe_semantic_create_toolbar_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_create_toolbar_action?._params,
+  },
+);
+
+const xvibe_semantic_canonical_styles = {
+  "font-size": "32px",
+  "font-weight": "bold",
+  "margin-bottom": "16px",
+};
+const xvibe_semantic_expected_canonical_style_params = {
+  _edit_action: "set-styles",
+  _styles: xvibe_semantic_canonical_styles,
+};
+const xvibe_semantic_view_edit_canonical_matrix: Array<{
+  _name: string;
+  _params: Record<string, unknown>;
+}> = [
+  {
+    _name: "nested set-properties properties.styles",
+    _params: {
+      _edit_action: {
+        type: "set-properties",
+        properties: {
+          styles: xvibe_semantic_canonical_styles,
+        },
+      },
+    },
+  },
+  {
+    _name: "nested update-properties _properties._styles",
+    _params: {
+      _edit_action: {
+        _type: "update-properties",
+        _properties: {
+          _styles: xvibe_semantic_canonical_styles,
+        },
+      },
+    },
+  },
+  {
+    _name: "nested action update-properties properties.styles",
+    _params: {
+      _edit_action: {
+        action: "update-properties",
+        properties: {
+          styles: xvibe_semantic_canonical_styles,
+        },
+      },
+    },
+  },
+  {
+    _name: "flat set-properties properties.styles",
+    _params: {
+      _edit_action: "set-properties",
+      properties: {
+        styles: xvibe_semantic_canonical_styles,
+      },
+    },
+  },
+  {
+    _name: "flat update-properties _properties._styles",
+    _params: {
+      _edit_action: "update-properties",
+      _properties: {
+        _styles: xvibe_semantic_canonical_styles,
+      },
+    },
+  },
+  {
+    _name: "nested set-style styles",
+    _params: {
+      _edit_action: {
+        _action: "set-style",
+        styles: xvibe_semantic_canonical_styles,
+      },
+    },
+  },
+  {
+    _name: "nested set-styles _styles",
+    _params: {
+      _edit_action: {
+        _action: "set-styles",
+        _styles: xvibe_semantic_canonical_styles,
+      },
+    },
+  },
+  {
+    _name: "flat set-style _style_properties",
+    _params: {
+      _edit_action: "set-style",
+      _style_properties: xvibe_semantic_canonical_styles,
+    },
+  },
+  {
+    _name: "flat set-styles _styles",
+    _params: {
+      _edit_action: "set-styles",
+      _styles: xvibe_semantic_canonical_styles,
+    },
+  },
+  {
+    _name: "invented style action styles object",
+    _params: {
+      _edit_action: "set-element-styles",
+      styles: {
+        fontSize: "32px",
+        fontWeight: "bold",
+        marginBottom: "16px",
+      },
+    },
+  },
+  {
+    _name: "invented style action array entries",
+    _params: {
+      _edit_action: "change-component-styles",
+      styleProperties: [
+        { property: "fontSize", value: "32px" },
+        { name: "fontWeight", value: "bold" },
+        { property: "marginBottom", value: "16px" },
+      ],
+    },
+  },
+  {
+    _name: "nested invented style wrapper",
+    _params: {
+      _edit_action: {
+        type: "apply-styles",
+        properties: {
+          styles: {
+            fontSize: "32px",
+            fontWeight: "bold",
+            marginBottom: "16px",
+          },
+        },
+      },
+    },
+  },
+];
+for (const test_case of xvibe_semantic_view_edit_canonical_matrix) {
+  const canonical =
+    canonicalizeSemanticViewEditParams(test_case._params);
+  assert.equal(canonical._ok, true, test_case._name);
+  assert.deepEqual(
+    canonical._params,
+    xvibe_semantic_expected_canonical_style_params,
+    test_case._name,
+  );
+}
+const xvibe_semantic_canonical_single_set_style =
+  canonicalizeSemanticViewEditParams({
+    _edit_action: "set-style",
+    _style_property: "font-size",
+    _style_value: "32px",
+  });
+assert.equal(xvibe_semantic_canonical_single_set_style._ok, true);
+assert.deepEqual(
+  xvibe_semantic_canonical_single_set_style._params,
+  {
+    _edit_action: "set-style",
+    _style_property: "font-size",
+    _style_value: "32px",
+  },
+);
+const xvibe_semantic_unknown_canonical =
+  canonicalizeSemanticViewEditParams({
+    _edit_action: "rotate-widget",
+    _target_id: "Dashboard",
+  });
+assert.equal(xvibe_semantic_unknown_canonical._ok, false);
+assert.equal(
+  xvibe_semantic_unknown_canonical._ok
+    ? undefined
+    : xvibe_semantic_unknown_canonical._reason,
+  "unsupported_edit_action",
+);
+const xvibe_semantic_ambiguous_style_canonical =
+  canonicalizeSemanticViewEditParams({
+    _edit_action: "style-object",
+    styles: [
+      { property: "fontSize" },
+    ],
+  });
+assert.equal(xvibe_semantic_ambiguous_style_canonical._ok, false);
+assert.equal(
+  xvibe_semantic_ambiguous_style_canonical._ok
+    ? undefined
+    : xvibe_semantic_ambiguous_style_canonical._reason,
+  "ambiguous_edit_action",
+);
+const xvibe_semantic_malformed_canonical =
+  canonicalizeSemanticViewEditParams({
+    _edit_action: {
+      properties: {
+        styles: xvibe_semantic_canonical_styles,
+      },
+    },
+  });
+assert.equal(xvibe_semantic_malformed_canonical._ok, false);
+assert.equal(
+  xvibe_semantic_malformed_canonical._ok
+    ? undefined
+    : xvibe_semantic_malformed_canonical._reason,
+  "invalid_edit_action",
+);
+
+const xvibe_semantic_nested_set_properties_styles_engine =
+  xvibe_test_intent_engine({
+    _semantic_generate_json: async () => ({
+      _message_type: "edit",
+      _execution_level: "artifact",
+      _should_mutate: true,
+      _confidence: 0.84,
+      _reason: "mock_semantic_nested_set_properties_styles",
+      _actions: [
+        {
+          _id: "semantic-nested-set-properties-styles",
+          _title: "Update title styles",
+          _action_type: "apply-view-edit",
+          _status: "suggested",
+          _params: {
+            _view_id: "view-main",
+            _target_id: "Dashboard",
+            _target_type: "label",
+            _edit_action: {
+              type: "set-properties",
+              properties: {
+                styles: {
+                  "font-size": "32px",
+                  "font-weight": "bold",
+                  "margin-bottom": "16px",
+                },
+              },
+            },
+          },
+        },
+      ],
+      _warnings: [],
+    }),
+  });
+const xvibe_semantic_nested_set_properties_styles_res =
+  await xvibe_semantic_nested_set_properties_styles_engine.analyze({
+    _message: "Make the Dashboard title 32px, bold, with 16px margin below.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_nested_set_properties_styles_action =
+  xvibe_semantic_nested_set_properties_styles_res._intent?._actions[0];
+assert.equal(xvibe_semantic_nested_set_properties_styles_res._ok, true);
+assert.equal(xvibe_semantic_nested_set_properties_styles_action?._executable, true);
+assert.equal(
+  xvibe_semantic_nested_set_properties_styles_action?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_nested_set_properties_styles_action?._params?._styles,
+  xvibe_semantic_canonical_styles,
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_nested_set_properties_styles_action?._params ?? {},
+    "_properties",
+  ),
+  false,
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_nested_set_properties_styles_action?._params ?? {},
+    "properties",
+  ),
+  false,
+);
+assert.equal(
+  Object.prototype.hasOwnProperty.call(
+    xvibe_semantic_nested_set_properties_styles_action?._params ?? {},
+    "styles",
+  ),
+  false,
+);
+assert.deepEqual(
+  xvibe_semantic_nested_set_properties_styles_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_nested_set_properties_styles_action?._params,
+  },
+);
+
+const xvibe_semantic_nested_update_style_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_nested_update_style",
+    _actions: [
+      {
+        _id: "semantic-nested-update-style",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: {
+            action: "update-style",
+            properties: {
+              fontSize: "32px",
+              fontWeight: "bold",
+              marginBottom: "16px",
+            },
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_nested_update_style_res =
+  await xvibe_semantic_nested_update_style_engine.analyze({
+    _message: "Make the Dashboard title 32px, bold, with 16px margin below.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_nested_update_style_action =
+  xvibe_semantic_nested_update_style_res._intent?._actions[0];
+assert.equal(xvibe_semantic_nested_update_style_res._ok, true);
+assert.equal(xvibe_semantic_nested_update_style_action?._executable, true);
+assert.equal(xvibe_semantic_nested_update_style_action?._requires_approval, true);
+assert.equal(
+  xvibe_semantic_nested_update_style_action?._params?._edit_action,
+  "set-styles",
+);
+assert.equal(
+  xvibe_semantic_nested_update_style_action?._params?._view_id,
+  "view-main",
+);
+assert.equal(
+  xvibe_semantic_nested_update_style_action?._params?._target_id,
+  "dashboard-title-real",
+);
+assert.deepEqual(
+  xvibe_semantic_nested_update_style_action?._params?._resolved_target_path,
+  ["view-main", "dashboard-title-real"],
+);
+assert.equal(
+  xvibe_semantic_nested_update_style_action?._params?._target_type,
+  "label",
+);
+assert.deepEqual(
+  xvibe_semantic_nested_update_style_action?._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_nested_update_style_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_nested_update_style_action?._params,
+  },
+);
+
+const xvibe_semantic_nested_set_styles_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_nested_set_styles",
+    _actions: [
+      {
+        _id: "semantic-nested-set-styles",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: {
+            _action: "set-styles",
+            _styles: {
+              backgroundColor: "blue",
+              "font-size": "32px",
+            },
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_nested_set_styles_res =
+  await xvibe_semantic_nested_set_styles_engine.analyze({
+    _message: "Make the Dashboard title blue and 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_nested_set_styles_action =
+  xvibe_semantic_nested_set_styles_res._intent?._actions[0];
+assert.equal(xvibe_semantic_nested_set_styles_res._ok, true);
+assert.equal(xvibe_semantic_nested_set_styles_action?._executable, true);
+assert.equal(
+  xvibe_semantic_nested_set_styles_action?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_nested_set_styles_action?._params?._styles,
+  {
+    "background-color": "blue",
+    "font-size": "32px",
+  },
+);
+
+const xvibe_semantic_flat_set_styles_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.84,
+    _reason: "mock_semantic_flat_set_styles",
+    _actions: [
+      {
+        _id: "semantic-flat-set-styles",
+        _title: "Update title styles",
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _params: {
+          _view_id: "view-main",
+          _target_id: "Dashboard",
+          _target_type: "label",
+          _edit_action: "set-styles",
+          _styles: {
+            "font-size": "32px",
+            "font-weight": "700",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_flat_set_styles_res =
+  await xvibe_semantic_flat_set_styles_engine.analyze({
+    _message: "Make the Dashboard title 32px and bold",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+    },
+  });
+const xvibe_semantic_flat_set_styles_action =
+  xvibe_semantic_flat_set_styles_res._intent?._actions[0];
+assert.equal(xvibe_semantic_flat_set_styles_res._ok, true);
+assert.equal(
+  xvibe_semantic_flat_set_styles_action?._params?._edit_action,
+  "set-styles",
+);
+assert.deepEqual(
+  xvibe_semantic_flat_set_styles_action?._params?._styles,
+  {
+    "font-size": "32px",
+    "font-weight": "700",
+  },
+);
+
+const xvibe_semantic_malformed_nested_edit_action_engine =
+  xvibe_test_intent_engine({
+    _semantic_generate_json: async () => ({
+      _message_type: "edit",
+      _execution_level: "artifact",
+      _should_mutate: true,
+      _confidence: 0.84,
+      _reason: "mock_semantic_malformed_nested_edit_action",
+      _actions: [
+        {
+          _id: "semantic-malformed-nested-edit-action",
+          _title: "Update title styles",
+          _action_type: "apply-view-edit",
+          _status: "suggested",
+          _params: {
+            _view_id: "view-main",
+            _target_id: "Dashboard",
+            _target_type: "label",
+            _edit_action: {
+              properties: {
+                fontSize: "32px",
+              },
+            },
+          },
+        },
+      ],
+      _warnings: [],
+    }),
+  });
+const xvibe_semantic_malformed_nested_edit_action_res =
+  await xvibe_semantic_malformed_nested_edit_action_engine.analyze({
+    _message: "Make the Dashboard title 32px",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "view-main",
+    },
+  });
+assert.equal(xvibe_semantic_malformed_nested_edit_action_res._ok, true);
+assert.equal(
+  xvibe_semantic_malformed_nested_edit_action_res._intent?._actions[0]._executable,
+  false,
+);
+assert.equal(
+  xvibe_semantic_malformed_nested_edit_action_res._intent?._actions[0]._non_executable_reason,
+  "invalid_edit_action",
+);
+assert.equal(
+  xvibe_semantic_malformed_nested_edit_action_res._intent?._actions[0]._execution_payload,
+  undefined,
+);
+
+const xvibe_semantic_action_alias_cases: Array<{
+  _alias: string;
+  _expected_edit_action?: string;
+  _expected_executable: boolean;
+  _expected_non_executable_reason?: string;
+}> = [
+  {
+    _alias: "edit",
+    _expected_executable: false,
+    _expected_non_executable_reason: "missing_edit_action",
+  },
+  {
+    _alias: "edit_view",
+    _expected_executable: false,
+    _expected_non_executable_reason: "missing_edit_action",
+  },
+  {
+    _alias: "modify_view",
+    _expected_executable: false,
+    _expected_non_executable_reason: "missing_edit_action",
+  },
+  {
+    _alias: "update_view",
+    _expected_executable: false,
+    _expected_non_executable_reason: "missing_edit_action",
+  },
+  {
+    _alias: "add_section",
+    _expected_edit_action: "add-child",
+    _expected_executable: true,
+  },
+  {
+    _alias: "add_view_section",
+    _expected_edit_action: "add-child",
+    _expected_executable: true,
+  },
+  {
+    _alias: "add_component",
+    _expected_edit_action: "add-child",
+    _expected_executable: true,
+  },
+  {
+    _alias: "add_ui",
+    _expected_edit_action: "add-child",
+    _expected_executable: true,
+  },
+];
+for (const alias_case of xvibe_semantic_action_alias_cases) {
+  const xvibe_semantic_action_alias_engine = xvibe_test_intent_engine({
+    _semantic_generate_json: async () => ({
+      _message_type: "edit",
+      _execution_level: "artifact",
+      _should_mutate: true,
+      _confidence: 0.81,
+      _reason: "mock_semantic_action_alias",
+      _actions: [
+        {
+          _id: `semantic-action-alias-${alias_case._alias}`,
+          _title: "Add customer list section",
+          _action_type: alias_case._alias,
+          _status: "suggested",
+          _params: {
+            _view_id: "view-main",
+            _target_type: "view",
+            _edit_object_value: {
+              _type: "xsection",
+              _title: "Customers",
+            },
+          },
+        },
+      ],
+      _warnings: [],
+    }),
+  });
+  const xvibe_semantic_action_alias_res =
+    await xvibe_semantic_action_alias_engine.analyze({
+      _message: "Add a customer list section to the current view. Keep it aligned with the current project focus.",
+      _runtime_context: {
+        _app_id: "intent-test-app",
+        _env: "test",
+        _active_view_id: "view-main",
+      },
+    });
+  assert.equal(
+    xvibe_semantic_action_alias_res._ok,
+    true,
+    `semantic alias ${alias_case._alias} should execute through the semantic processor`,
+  );
+  assert.equal(
+    xvibe_semantic_action_alias_res._processor,
+    "SemanticIntentProcessor",
+  );
+  assert.equal(
+    xvibe_semantic_action_alias_res._intent?._actions[0]._action_type,
+    "apply-view-edit",
+  );
+  assert.equal(
+    xvibe_semantic_action_alias_res._intent?._actions[0]._requires_approval,
+    alias_case._expected_executable,
+  );
+  assert.equal(
+    xvibe_semantic_action_alias_res._intent?._actions[0]._executable,
+    alias_case._expected_executable,
+  );
+  if (alias_case._expected_edit_action) {
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._edit_action,
+      alias_case._expected_edit_action,
+    );
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._app_id,
+      "intent-test-app",
+    );
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._env,
+      "test",
+    );
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._view_id,
+      "view-main",
+    );
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._target_id,
+      "view-main",
+    );
+    assert.deepEqual(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._params?._child,
+      {
+        _type: "xsection",
+        _title: "Customers",
+      },
+    );
+    assert.deepEqual(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._execution_payload,
+      {
+        _module: "xvibe",
+        _op: "apply-view-edit",
+        _params: xvibe_semantic_action_alias_res._intent?._actions[0]._params,
+      },
+    );
+  } else {
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._non_executable_reason,
+      alias_case._expected_non_executable_reason,
+    );
+    assert.equal(
+      xvibe_semantic_action_alias_res._intent?._actions[0]._execution_payload,
+      undefined,
+    );
+  }
+}
+
+const xvibe_semantic_customer_list_section_child_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_customer_list_section_child",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _target_id: null,
+          _target_type: "view",
+          _edit_action: "add-section",
+          section_name: "Customer List",
+          alignment: "current project focus",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_customer_list_section_child_res =
+  await xvibe_semantic_customer_list_section_child_engine.analyze({
+    _message: "Add a customer list section to the current view. Keep it aligned with the current project focus.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_customer_list_section_child_res._ok, true);
+const xvibe_semantic_customer_list_section_child_action =
+  xvibe_semantic_customer_list_section_child_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_customer_list_section_child_action?._action_type,
+  "apply-view-edit",
+);
+assert.equal(
+  xvibe_semantic_customer_list_section_child_action?._params?._edit_action,
+  "add-child",
+);
+assert.equal(
+  xvibe_semantic_customer_list_section_child_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_customer_list_section_child_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_customer_list_section_child_action?._requires_approval,
+  true,
+);
+assert.deepEqual(
+  xvibe_semantic_customer_list_section_child_action?._params?._child,
+  {
+    _type: "xsection",
+    _id: "customer-list-section",
+    _children: [
+      {
+        _type: "label",
+        _id: "customer-list-section-title",
+        _text: "Customer List",
+      },
+      {
+        _type: "table",
+        _id: "customer-list-section-table",
+        _columns: [],
+        _empty_text: "No data yet.",
+      },
+    ],
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_customer_list_section_child_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_customer_list_section_child_action?._params,
+  },
+);
+
+const xvibe_semantic_footer_label_child_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_footer_label_child",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _parent_id: "main",
+          _target_id: "main",
+          _target_type: "view",
+          _edit_action: "add-child",
+          _location: "footer",
+          _component_type: "label",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_footer_label_child_res =
+  await xvibe_semantic_footer_label_child_engine.analyze({
+    _message: "add a footer label to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_footer_label_child_res._ok, true);
+const xvibe_semantic_footer_label_child_action =
+  xvibe_semantic_footer_label_child_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_footer_label_child_action?._action_type,
+  "apply-view-edit",
+);
+assert.equal(
+  xvibe_semantic_footer_label_child_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_footer_label_child_action?._non_executable_reason,
+  undefined,
+);
+assert.deepEqual(
+  xvibe_semantic_footer_label_child_action?._params?._child,
+  {
+    _type: "label",
+    _text: "New Footer Label",
+    class: "xvibe-generated-label xvibe-footer-label",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_footer_label_child_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_footer_label_child_action?._params,
+  },
+);
+
+const xvibe_semantic_add_object_footer_label_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_add_object_footer_label",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_action: "add-object",
+          _new_object_props: {
+            _object_type: "text-label",
+            layoutPosition: "footer",
+            content: "Footer Label",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_add_object_footer_label_res =
+  await xvibe_semantic_add_object_footer_label_engine.analyze({
+    _message: "add a footer label to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_add_object_footer_label_res._ok, true);
+const xvibe_semantic_add_object_footer_label_action =
+  xvibe_semantic_add_object_footer_label_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._action_type,
+  "apply-view-edit",
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._non_executable_reason,
+  undefined,
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._params?._edit_action,
+  "add-child",
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._params?._parent_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._params?._component_type,
+  "label",
+);
+assert.equal(
+  xvibe_semantic_add_object_footer_label_action?._params?._location,
+  "footer",
+);
+assert.deepEqual(
+  xvibe_semantic_add_object_footer_label_action?._params?._props,
+  {
+    _text: "Footer Label",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_add_object_footer_label_action?._params?._child,
+  {
+    _type: "label",
+    _text: "Footer Label",
+    class: "xvibe-generated-label xvibe-footer-label",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_add_object_footer_label_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_add_object_footer_label_action?._params,
+  },
+);
+
+const xvibe_semantic_alt_add_child_footer_label_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_alt_add_child_footer_label",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_action: "add-child",
+          _target_type: "text",
+          _parent_slot: "footer",
+          properties: {
+            text: "New Footer Label",
+            class: "footer-label custom",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_alt_add_child_footer_label_res =
+  await xvibe_semantic_alt_add_child_footer_label_engine.analyze({
+    _message: "add a footer label to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_alt_add_child_footer_label_res._ok, true);
+const xvibe_semantic_alt_add_child_footer_label_action =
+  xvibe_semantic_alt_add_child_footer_label_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._action_type,
+  "apply-view-edit",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._non_executable_reason,
+  undefined,
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._parent_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._component_type,
+  "label",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._location,
+  "footer",
+);
+assert.deepEqual(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._props,
+  {
+    _text: "New Footer Label",
+    class: "footer-label custom",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_alt_add_child_footer_label_action?._params?._child,
+  {
+    _type: "label",
+    _text: "New Footer Label",
+    class: "footer-label custom",
+  },
+);
+assert.deepEqual(
+  xvibe_semantic_alt_add_child_footer_label_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_alt_add_child_footer_label_action?._params,
+  },
+);
+
+const xvibe_semantic_alt_add_child_generated_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_alt_add_child_generated_target",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_action: "add-child",
+          _target_id: "main-footer-label",
+          _target_type: "label",
+          _parent_slot: "footer",
+          properties: {
+            text: "Footer Label",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_alt_add_child_generated_target_res =
+  await xvibe_semantic_alt_add_child_generated_target_engine.analyze({
+    _message: "add a footer label to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_alt_add_child_generated_target_res._ok, true);
+const xvibe_semantic_alt_add_child_generated_target_action =
+  xvibe_semantic_alt_add_child_generated_target_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_alt_add_child_generated_target_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_generated_target_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_generated_target_action?._params?._parent_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_alt_add_child_generated_target_action?._params?._child_id,
+  "main-footer-label",
+);
+assert.deepEqual(
+  xvibe_semantic_alt_add_child_generated_target_action?._params?._child,
+  {
+    _id: "main-footer-label",
+    _type: "label",
+    _text: "Footer Label",
+    class: "xvibe-generated-label xvibe-footer-label",
+  },
+);
+
+const xvibe_semantic_add_object_generated_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_add_object_generated_target",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_action: "add-object",
+          _target_id: "main-footer-label",
+          _new_object_props: {
+            _object_type: "text-label",
+            layoutPosition: "footer",
+            content: "Footer Label",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_add_object_generated_target_res =
+  await xvibe_semantic_add_object_generated_target_engine.analyze({
+    _message: "add a footer label to the main view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_add_object_generated_target_res._ok, true);
+const xvibe_semantic_add_object_generated_target_action =
+  xvibe_semantic_add_object_generated_target_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_add_object_generated_target_action?._executable,
+  true,
+);
+assert.equal(
+  xvibe_semantic_add_object_generated_target_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_add_object_generated_target_action?._params?._parent_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_add_object_generated_target_action?._params?._child_id,
+  "main-footer-label",
+);
+assert.deepEqual(
+  xvibe_semantic_add_object_generated_target_action?._params?._child,
+  {
+    _id: "main-footer-label",
+    _type: "label",
+    _text: "Footer Label",
+    class: "xvibe-generated-label xvibe-footer-label",
+  },
+);
+
+const xvibe_semantic_generic_section_child_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_generic_section_child",
+    _actions: [
+      {
+        _action_type: "apply-view-edit",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _target_type: "view",
+          _edit_action: "add-section",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_generic_section_child_res =
+  await xvibe_semantic_generic_section_child_engine.analyze({
+    _message: "Add a section to the current view.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_generic_section_child_res._ok, true);
+const xvibe_semantic_generic_section_child_action =
+  xvibe_semantic_generic_section_child_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_generic_section_child_action?._executable,
+  true,
+);
+assert.deepEqual(
+  xvibe_semantic_generic_section_child_action?._params?._child,
+  {
+    _type: "xsection",
+    _id: "section-section",
+    _children: [
+      {
+        _type: "label",
+        _id: "section-section-title",
+        _text: "Section",
+      },
+    ],
+  },
+);
+
+const xvibe_semantic_add_section_root_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_add_section_root_target",
+    _actions: [
+      {
+        _action_type: "add_section",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_object_value: {
+            _type: "xsection",
+            _title: "Customers",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_add_section_root_target_res =
+  await xvibe_semantic_add_section_root_target_engine.analyze({
+    _message: "Add a customer list section to the current view. Keep it aligned with the current project focus.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_add_section_root_target_res._ok, true);
+const xvibe_semantic_add_section_root_target_action =
+  xvibe_semantic_add_section_root_target_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_add_section_root_target_action?._params?._target_id,
+  "main",
+);
+assert.equal(
+  xvibe_semantic_add_section_root_target_action?._executable,
+  true,
+);
+assert.deepEqual(
+  xvibe_semantic_add_section_root_target_action?._execution_payload,
+  {
+    _module: "xvibe",
+    _op: "apply-view-edit",
+    _params: xvibe_semantic_add_section_root_target_action?._params,
+  },
+);
+
+const xvibe_semantic_add_section_selected_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_add_section_selected_target",
+    _actions: [
+      {
+        _action_type: "add_section",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _edit_object_value: {
+            _type: "xsection",
+            _title: "Customers",
+          },
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_add_section_selected_target_res =
+  await xvibe_semantic_add_section_selected_target_engine.analyze({
+    _message: "Add a customer list section to the current view. Keep it aligned with the current project focus.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+      _selected_object: {
+        _json_id: "customer-stack",
+        _id: "customer-stack-runtime",
+        _type: "stack",
+        _source_view_id: "main",
+        _children: [],
+      },
+    },
+  });
+assert.equal(xvibe_semantic_add_section_selected_target_res._ok, true);
+const xvibe_semantic_add_section_selected_target_action =
+  xvibe_semantic_add_section_selected_target_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_add_section_selected_target_action?._params?._target_id,
+  "customer-stack",
+);
+assert.equal(
+  xvibe_semantic_add_section_selected_target_action?._params?._target_type,
+  "stack",
+);
+assert.equal(
+  xvibe_semantic_add_section_selected_target_action?._executable,
+  true,
+);
+
+const xvibe_semantic_add_section_non_view_target_engine = xvibe_test_intent_engine({
+  _semantic_generate_json: async () => ({
+    _message_type: "edit",
+    _execution_level: "artifact",
+    _should_mutate: true,
+    _confidence: 0.9,
+    _reason: "mock_semantic_add_section_non_view_target",
+    _actions: [
+      {
+        _action_type: "add_section",
+        _status: "suggested",
+        _requires_approval: true,
+        _params: {
+          _view_id: "main",
+          _target_type: "entity",
+          section_name: "Customer List",
+        },
+      },
+    ],
+    _warnings: [],
+  }),
+});
+const xvibe_semantic_add_section_non_view_target_res =
+  await xvibe_semantic_add_section_non_view_target_engine.analyze({
+    _message: "Add a customer list section to the current view. Keep it aligned with the current project focus.",
+    _runtime_context: {
+      _app_id: "intent-test-app",
+      _env: "test",
+      _active_view_id: "main",
+    },
+  });
+assert.equal(xvibe_semantic_add_section_non_view_target_res._ok, true);
+const xvibe_semantic_add_section_non_view_target_action =
+  xvibe_semantic_add_section_non_view_target_res._intent?._actions[0];
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._params?._target_id,
+  undefined,
+);
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._params?._child,
+  undefined,
+);
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._executable,
+  false,
+);
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._requires_approval,
+  false,
+);
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._non_executable_reason,
+  "missing_target_id",
+);
+assert.equal(
+  xvibe_semantic_add_section_non_view_target_action?._execution_payload,
+  undefined,
+);
+
 const xvibe_semantic_missing_edit_defaults_engine = xvibe_test_intent_engine({
   _semantic_generate_json: async () => ({
     _message_type: "ViewEditIntent",
@@ -1940,6 +7564,11 @@ const xvibe_semantic_missing_edit_defaults_res =
     _runtime_context: {
       _app_id: "intent-test-app",
       _env: "test",
+      _active_view_id: "view-main",
+      _current_view: xvibe_semantic_preflight_view_main,
+      _available_artifacts: {
+        _views: ["view-main"],
+      },
     },
   });
 assert.equal(xvibe_semantic_missing_edit_defaults_res._ok, true);
@@ -2223,7 +7852,7 @@ const xvibe_semantic_invalid_engine = xvibe_test_intent_engine({
 });
 const xvibe_semantic_invalid_res =
   await xvibe_semantic_invalid_engine.analyze({
-    _message: "what can you do?",
+    _message: "semantic invalid response fixture",
     _runtime_context: {
       _app_id: "intent-test-app",
       _env: "test",
@@ -2254,7 +7883,7 @@ const xvibe_semantic_unknown_alias_engine = xvibe_test_intent_engine({
 });
 const xvibe_semantic_unknown_alias_res =
   await xvibe_semantic_unknown_alias_engine.analyze({
-    _message: "what can you do?",
+    _message: "semantic unknown alias fixture",
     _runtime_context: {
       _app_id: "intent-test-app",
       _env: "test",
@@ -3983,7 +9612,7 @@ assert.equal(
       ],
     },
   })._reason,
-  "ambiguous_normalized_text_target",
+  "eligible_text_match",
 );
 const hide_admin_button_by_text_type_resolved_task = resolve_xvibe_task({
   _prompt: "hide Admin button from view main",
@@ -4570,6 +10199,99 @@ assert.deepEqual(
     _next_value: "green",
   },
 );
+const set_styles_by_text_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "set-styles",
+      _edit_target_id: "Dashboard",
+      _edit_target_type: "label",
+      _edit_styles: {
+        fontSize: "32px",
+        fontWeight: "700",
+        marginBottom: "16px",
+      },
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "dashboard-title",
+          _type: "label",
+          _text: "Dashboard",
+          _style: {
+            "background-color": "navy",
+            padding: "8px",
+          },
+        },
+      ],
+    },
+  });
+assert.equal(set_styles_by_text_result._ok, true);
+assert.deepEqual(
+  (set_styles_by_text_result._view as any)._children[0]._style,
+  {
+    "background-color": "navy",
+    padding: "8px",
+    "font-size": "32px",
+    "font-weight": "700",
+    "margin-bottom": "16px",
+  },
+);
+assert.deepEqual(set_styles_by_text_result._mutation?._styles_applied, {
+  "font-size": "32px",
+  "font-weight": "700",
+  "margin-bottom": "16px",
+});
+assert.deepEqual(set_styles_by_text_result._mutation?._previous_styles, {});
+const set_styles_invalid_view = {
+  _id: "main",
+  _type: "view",
+  _children: [
+    {
+      _id: "dashboard-title",
+      _type: "label",
+      _text: "Dashboard",
+      _style: {
+        color: "red",
+      },
+    },
+  ],
+};
+const set_styles_invalid_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "set-styles",
+      _edit_target_id: "Dashboard",
+      _edit_target_type: "label",
+      _edit_styles: {
+        fontSize: "32px",
+        fontWeight: null,
+      },
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: set_styles_invalid_view,
+  });
+assert.equal(set_styles_invalid_result._ok, false);
+assert.equal(set_styles_invalid_result._reason, "invalid_style_value");
+assert.deepEqual(set_styles_invalid_view._children[0]._style, { color: "red" });
 const replace_existing_style_result =
   apply_deterministic_view_edit({
     _resolved_task: set_play_background_green_resolved_task,
@@ -4985,12 +10707,17 @@ assert.deepEqual(
       _skill_design_found: false,
       _allowed_field_keys: [
         "_class",
+        "_on",
+        "_on_mount",
+        "_once",
+        "_requires",
         "_style",
         "_text",
         "class",
         "disabled",
         "placeholder",
         "style",
+        "value",
       ],
     },
   },
@@ -5047,11 +10774,16 @@ assert.deepEqual(
     _action: "move-object",
     _target_id: "pause-button",
     _resolved_by: "id",
+    _position: "before",
     _move_position: "before",
+    _moved_id: "pause-button",
+    _destination_id: "play-button",
     _anchor_id: "play-button",
     _before_id: "play-button",
     _anchor_resolved_by: "id",
     _parent_id: "main",
+    _source_parent_id: "main",
+    _destination_parent_id: "main",
     _previous_index: 1,
     _next_index: 0,
   },
@@ -5115,6 +10847,7 @@ assert.deepEqual(
 );
 assert.equal(move_bottom_result._mutation?._resolved_by, "text");
 assert.equal(move_bottom_result._mutation?._move_position, "bottom");
+assert.equal(move_bottom_result._mutation?._position, "append");
 assert.equal(move_bottom_result._mutation?._previous_index, 1);
 assert.equal(move_bottom_result._mutation?._next_index, 2);
 const move_top_result =
@@ -5141,8 +10874,8 @@ assert.deepEqual(
   (move_top_result._view as any)._children.map((child: any) => child._id),
   ["title-label", "controls-stack"],
 );
-assert.deepEqual(
-  can_apply_deterministic_view_edit({
+const move_before_cross_parent_result =
+  apply_deterministic_view_edit({
     _resolved_task: move_pause_before_play_task,
     _current_view: {
       _id: "main",
@@ -5172,8 +10905,17 @@ assert.deepEqual(
         },
       ],
     },
-  })._reason,
-  "different_parent",
+  });
+assert.equal(move_before_cross_parent_result._ok, true);
+assert.deepEqual(
+  (move_before_cross_parent_result._view as any)._children.map((child: any) => ({
+    _id: child._id,
+    _children: child._children.map((nested: any) => nested._id),
+  })),
+  [
+    { _id: "left", _children: [] },
+    { _id: "right", _children: ["pause-button", "play-button"] },
+  ],
 );
 assert.deepEqual(
   can_apply_deterministic_view_edit({
@@ -5192,6 +10934,290 @@ assert.deepEqual(
   })._reason,
   "anchor_not_found",
 );
+const visible_text_resolution_with_id =
+  resolveViewTarget(
+    {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "refresh-button",
+          _type: "button",
+          _text: "Refresh",
+        },
+      ],
+    },
+    {
+      _target_text: "Refresh",
+      _target_type: "button",
+    },
+  );
+assert.equal(visible_text_resolution_with_id._ok, true);
+if (visible_text_resolution_with_id._ok) {
+  assert.equal(visible_text_resolution_with_id._resolved_target_id, "refresh-button");
+  assert.deepEqual(
+    visible_text_resolution_with_id._resolved_target_path,
+    ["main", "refresh-button"],
+  );
+  assert.equal(
+    !visible_text_resolution_with_id._ok ||
+      Boolean(
+        visible_text_resolution_with_id._resolved_target_id ||
+          visible_text_resolution_with_id._resolved_target_path,
+      ),
+    true,
+  );
+}
+const visible_text_resolution_without_id =
+  resolveViewTarget(
+    {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _type: "button",
+          _text: "Refresh",
+        },
+      ],
+    },
+    {
+      _target_text: "Refresh",
+      _target_type: "button",
+    },
+  );
+assert.equal(visible_text_resolution_without_id._ok, true);
+if (visible_text_resolution_without_id._ok) {
+  assert.equal(visible_text_resolution_without_id._resolved_target_id, undefined);
+  assert.deepEqual(
+    visible_text_resolution_without_id._resolved_target_path,
+    ["main", "0"],
+  );
+  assert.equal(
+    !visible_text_resolution_without_id._ok ||
+      Boolean(
+        visible_text_resolution_without_id._resolved_target_id ||
+          visible_text_resolution_without_id._resolved_target_path,
+      ),
+    true,
+  );
+}
+const move_refresh_into_toolbar_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "move-object",
+      _edit_target_id: "Refresh",
+      _edit_target_type: "button",
+      _edit_position: "append",
+      _edit_destination_id: "main-toolbar",
+      _edit_destination_type: "stack",
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "refresh-button",
+          _type: "button",
+          _text: "Refresh",
+          _on: { _click: { _op: "refresh" } },
+        },
+        {
+          _id: "main-toolbar",
+          _type: "stack",
+          _children: [],
+        },
+      ],
+    },
+  });
+assert.equal(move_refresh_into_toolbar_result._ok, true);
+assert.deepEqual(
+  (move_refresh_into_toolbar_result._view as any)._children.map((child: any) => child._id),
+  ["main-toolbar"],
+);
+assert.equal((move_refresh_into_toolbar_result._view as any)._children[0]._children[0]._id, "refresh-button");
+assert.deepEqual(
+  (move_refresh_into_toolbar_result._view as any)._children[0]._children[0]._on,
+  { _click: { _op: "refresh" } },
+);
+assert.equal(move_refresh_into_toolbar_result._mutation?._moved_id, "refresh-button");
+assert.equal(move_refresh_into_toolbar_result._mutation?._source_parent_id, "main");
+assert.equal(move_refresh_into_toolbar_result._mutation?._destination_parent_id, "main-toolbar");
+assert.equal(move_refresh_into_toolbar_result._mutation?._position, "append");
+const move_exact_id_prepend_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "move-object",
+      _edit_target_id: "new-record-button",
+      _edit_target_type: "button",
+      _edit_position: "prepend",
+      _edit_destination_id: "main-toolbar",
+      _edit_destination_type: "stack",
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "main-toolbar",
+          _type: "stack",
+          _children: [
+            {
+              _id: "refresh-button",
+              _type: "button",
+              _text: "Refresh",
+            },
+          ],
+        },
+        {
+          _id: "new-record-button",
+          _type: "button",
+          _text: "New Record",
+        },
+      ],
+    },
+  });
+assert.equal(move_exact_id_prepend_result._ok, true);
+assert.deepEqual(
+  (move_exact_id_prepend_result._view as any)._children[0]._children.map((child: any) => child._id),
+  ["new-record-button", "refresh-button"],
+);
+const move_before_sibling_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "move-object",
+      _edit_target_id: "search-field",
+      _edit_target_type: "field",
+      _edit_position: "before",
+      _edit_destination_id: "title-label",
+      _edit_destination_type: "label",
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "section",
+          _type: "xsection",
+          _children: [
+            {
+              _id: "title-label",
+              _type: "label",
+              _text: "Title",
+            },
+          ],
+        },
+        {
+          _id: "search-field",
+          _type: "field",
+          _text: "Search",
+        },
+      ],
+    },
+  });
+assert.equal(move_before_sibling_result._ok, true);
+assert.deepEqual(
+  (move_before_sibling_result._view as any)._children[0]._children.map((child: any) => child._id),
+  ["search-field", "title-label"],
+);
+const move_parent_into_descendant_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "move-object",
+      _edit_target_id: "parent-section",
+      _edit_target_type: "xsection",
+      _edit_position: "append",
+      _edit_destination_id: "child-stack",
+      _edit_destination_type: "stack",
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "parent-section",
+          _type: "xsection",
+          _children: [
+            {
+              _id: "child-stack",
+              _type: "stack",
+              _children: [],
+            },
+          ],
+        },
+      ],
+    },
+  });
+assert.equal(move_parent_into_descendant_result._ok, false);
+assert.equal(move_parent_into_descendant_result._reason, "destination_is_descendant");
+const move_missing_destination_result =
+  apply_deterministic_view_edit({
+    _resolved_task: {
+      _action: "update",
+      _artifact_type: "view",
+      _target_id: "main",
+      _edit_action: "move-object",
+      _edit_target_id: "refresh-button",
+      _edit_target_type: "button",
+      _edit_position: "append",
+      _edit_destination_id: "missing-toolbar",
+      _edit_destination_type: "stack",
+      _explicit_artifact_type: true,
+      _explicit_target_id: true,
+      _module_ops: [],
+      _source: "test",
+      _confidence: 1,
+      _warnings: [],
+    },
+    _current_view: {
+      _id: "main",
+      _type: "view",
+      _children: [
+        {
+          _id: "refresh-button",
+          _type: "button",
+          _text: "Refresh",
+        },
+      ],
+    },
+  });
+assert.equal(move_missing_destination_result._ok, false);
+assert.equal(move_missing_destination_result._reason, "destination_not_found");
 assert.deepEqual(
   can_apply_deterministic_view_edit({
     _resolved_task: {
@@ -6036,11 +12062,29 @@ const simple_label_runtime_skills = {
 };
 const simple_label_views: any[] = [];
 let simple_label_final_prompt = "";
+const simple_label_project_memory = {
+  _version: 1,
+  _vision: "CRM",
+  _goal: "CRM",
+  _current_focus: "Customer CRUD",
+  _completed: [],
+  _parking_lot: ["Reports"],
+  _decisions: ["SQLite", "No authentication"],
+  _notes: [],
+  _updated_at: "2026-07-06T00:00:00.000Z",
+};
 const original_execute_for_simple_label = (_x as any).execute;
 const original_get_skills_for_simple_label = (_x as any).getSkills;
+const original_get_module_for_simple_label = (_x as any).getModule;
 try {
   (xvibe as any).latest_runtime_skills = simple_label_runtime_skills;
   (_x as any).getSkills = () => simple_label_runtime_skills;
+  (_x as any).getModule = (name: string) => {
+    if (name === "server-xvm") return {};
+    return typeof original_get_module_for_simple_label === "function"
+      ? original_get_module_for_simple_label.call(_x, name)
+      : undefined;
+  };
   (_x as any).execute = async (command: any) => {
     if (command?._module === "server-xvm" && command?._op === "get_app") {
       return {
@@ -6057,6 +12101,15 @@ try {
           _flow_ids: [],
           _entity_ids: [],
           _entities: {},
+        },
+      };
+    }
+
+    if (command?._module === "server-xvm" && command?._op === "get-project-memory") {
+      return {
+        _ok: true,
+        _result: {
+          _memory: simple_label_project_memory,
         },
       };
     }
@@ -6115,10 +12168,17 @@ try {
   assert.equal(simple_label_final_prompt.includes("- stack"), false);
   assert.equal(simple_label_final_prompt.includes("Prefer stack"), false);
   assert.equal(simple_label_final_prompt.includes("stack/card/grid"), false);
+  assert.ok(simple_label_final_prompt.includes("Runtime Context:"));
+  assert.ok(simple_label_final_prompt.includes("\"_project_memory\""));
+  assert.ok(simple_label_final_prompt.includes("\"_goal\": \"CRM\""));
+  assert.ok(simple_label_final_prompt.includes("\"_current_focus\": \"Customer CRUD\""));
+  assert.ok(simple_label_final_prompt.includes("\"Reports\""));
+  assert.ok(simple_label_final_prompt.includes("\"SQLite\""));
   assert.equal(simple_label_views[0]._children[0]._type, "label");
 } finally {
   (_x as any).execute = original_execute_for_simple_label;
   (_x as any).getSkills = original_get_skills_for_simple_label;
+  (_x as any).getModule = original_get_module_for_simple_label;
 }
 
 const new_view_negative_constraint_result = await run_locked_new_view_prompt(
@@ -8295,6 +14355,187 @@ try {
   await rm(missing_app_artifacts_work_folder, { recursive: true, force: true });
 }
 
+const active_app_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-active-app-"));
+try {
+  const active_app_server_xvm =
+    new ServerXVMModule({ _work_folder: active_app_work_folder });
+
+  for (const app of [
+    { _app_id: "vibe-system", _env: "default", _name: "System Fallback" },
+    { _app_id: "default-app", _env: "default", _name: "Default App" },
+    { _app_id: "secondary-app", _env: "default", _name: "Secondary App" },
+    { _app_id: "production-app", _env: "production", _name: "Production App" },
+    { _app_id: "production-other", _env: "production", _name: "Production Other" },
+  ]) {
+    const create_res = await (active_app_server_xvm as any)._create_app({
+      _params: {
+        _app_id: app._app_id,
+        _env: app._env,
+        _name: app._name,
+      },
+    });
+    assert.equal(create_res._ok, true);
+  }
+
+  const set_default_active_res =
+    await (active_app_server_xvm as any)._set_active_app({
+      _params: {
+        _app_id: "default-app",
+        _env: "default",
+      },
+    });
+  assert.deepEqual(set_default_active_res, {
+    _ok: true,
+    _result: {
+      _app_id: "default-app",
+      _env: "default",
+      _persisted: true,
+    },
+  });
+
+  const set_production_active_res =
+    await (active_app_server_xvm as any)._set_active_app({
+      _params: {
+        _app_id: "production-app",
+        _env: "production",
+      },
+    });
+  assert.deepEqual(set_production_active_res._result, {
+    _app_id: "production-app",
+    _env: "production",
+    _persisted: true,
+  });
+
+  const active_app_settings_path = path.join(
+    active_app_work_folder,
+    "settings",
+    "server-settings.json",
+  );
+  const active_app_settings = JSON.parse(
+    await readFile(active_app_settings_path, "utf-8"),
+  );
+  assert.deepEqual(active_app_settings._active_apps, {
+    default: "default-app",
+    production: "production-app",
+  });
+
+  const active_default_get_app_res =
+    await (active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "default",
+      },
+    });
+  assert.equal(active_default_get_app_res._result._app._app_id, "default-app");
+
+  const explicit_default_get_app_res =
+    await (active_app_server_xvm as any)._get_app({
+      _params: {
+        _app_id: "secondary-app",
+        _env: "default",
+      },
+    });
+  assert.equal(explicit_default_get_app_res._result._app._app_id, "secondary-app");
+
+  const active_production_get_app_res =
+    await (active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "production",
+      },
+    });
+  assert.equal(active_production_get_app_res._result._app._app_id, "production-app");
+
+  const restarted_active_app_server_xvm =
+    new ServerXVMModule({ _work_folder: active_app_work_folder });
+  const restarted_active_app_boot_res =
+    await restarted_active_app_server_xvm.init_on_boot();
+  assert.equal(restarted_active_app_boot_res._active_apps_restored, 2);
+
+  const restored_default_active_res =
+    await (restarted_active_app_server_xvm as any)._get_active_app({
+      _params: {
+        _env: "default",
+      },
+    });
+  assert.deepEqual(restored_default_active_res._result, {
+    _app_id: "default-app",
+    _env: "default",
+  });
+
+  const restored_default_get_app_res =
+    await (restarted_active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "default",
+      },
+    });
+  assert.equal(restored_default_get_app_res._result._app._app_id, "default-app");
+
+  const restored_explicit_get_app_res =
+    await (restarted_active_app_server_xvm as any)._get_app({
+      _params: {
+        _app_id: "secondary-app",
+        _env: "default",
+      },
+    });
+  assert.equal(restored_explicit_get_app_res._result._app._app_id, "secondary-app");
+
+  const restored_production_get_app_res =
+    await (restarted_active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "production",
+      },
+    });
+  assert.equal(restored_production_get_app_res._result._app._app_id, "production-app");
+
+  await writeFile(
+    active_app_settings_path,
+    JSON.stringify({
+      _active_apps: {
+        default: "missing-app",
+        production: "production-app",
+        "../bad-env": "default-app",
+        test: "../bad-app",
+      },
+    }, null, 2),
+    "utf-8",
+  );
+
+  const invalid_active_app_server_xvm =
+    new ServerXVMModule({ _work_folder: active_app_work_folder });
+  const invalid_active_app_boot_res =
+    await invalid_active_app_server_xvm.init_on_boot();
+  assert.equal(invalid_active_app_boot_res._active_apps_restored, 1);
+
+  const invalid_default_active_res =
+    await (invalid_active_app_server_xvm as any)._get_active_app({
+      _params: {
+        _env: "default",
+      },
+    });
+  assert.deepEqual(invalid_default_active_res._result, {
+    _app_id: "vibe-system",
+    _env: "default",
+  });
+
+  const invalid_default_get_app_res =
+    await (invalid_active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "default",
+      },
+    });
+  assert.equal(invalid_default_get_app_res._result._app._app_id, "vibe-system");
+
+  const invalid_production_get_app_res =
+    await (invalid_active_app_server_xvm as any)._get_app({
+      _params: {
+        _env: "production",
+      },
+    });
+  assert.equal(invalid_production_get_app_res._result._app._app_id, "production-app");
+} finally {
+  await rm(active_app_work_folder, { recursive: true, force: true });
+}
+
 const create_view_work_folder =
   await mkdtemp(path.join(tmpdir(), "server-xvm-create-view-"));
 try {
@@ -8471,6 +14712,558 @@ try {
   assert.ok(create_view_list_ids.includes("profile_card"));
 } finally {
   await rm(create_view_work_folder, { recursive: true, force: true });
+}
+
+const project_view_integrity_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-project-view-integrity-"));
+const project_view_integrity_original_execute = (_x as any).execute;
+try {
+  const project_view_integrity_server_xvm =
+    new ServerXVMModule({ _work_folder: project_view_integrity_work_folder });
+  const project_view_integrity_xvibe = new XVibeModule();
+  const project_view_integrity_app_id = "view-integrity-app";
+  const project_view_integrity_env = "test";
+
+  await (project_view_integrity_server_xvm as any)._create_app({
+    _params: {
+      _app_id: project_view_integrity_app_id,
+      _env: project_view_integrity_env,
+      _entry_view_id: "main",
+    },
+  });
+  await (project_view_integrity_server_xvm as any)._push_update({
+    _params: {
+      _app_id: project_view_integrity_app_id,
+      _env: project_view_integrity_env,
+      _view: {
+        _id: "main",
+        _type: "view",
+        _children: [
+          {
+            _type: "button",
+            _text: "+ New Record",
+          },
+          {
+            _id: "footer-label",
+            _type: "label",
+            _text: "Existing Footer",
+          },
+          {
+            _type: "label",
+            _text: "Footer Label",
+          },
+          {
+            _type: "grid",
+            _children: [
+              {
+                _type: "button",
+                _text: "+ New Record",
+              },
+            ],
+          },
+        ],
+      },
+    },
+  });
+
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (project_view_integrity_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(project_view_integrity_server_xvm, command);
+      }
+    }
+
+    return project_view_integrity_original_execute.call(_x, command);
+  };
+
+  const project_view_integrity_fix_res =
+    await (project_view_integrity_xvibe as any)._fix_project_views({
+      _params: {
+        _app_id: project_view_integrity_app_id,
+        _env: project_view_integrity_env,
+      },
+    });
+  assert.equal(project_view_integrity_fix_res._ok, true);
+  assert.equal(project_view_integrity_fix_res._views_scanned, 1);
+  assert.equal(project_view_integrity_fix_res._views_updated, 1);
+  assert.equal(project_view_integrity_fix_res._objects_scanned, 6);
+  assert.equal(project_view_integrity_fix_res._ids_added, 4);
+  assert.equal(project_view_integrity_fix_res._collisions_resolved, 2);
+  assert.deepEqual(
+    project_view_integrity_fix_res._result._views[0]._added_ids.map((item: any) => item._id),
+    ["new-record-button", "footer-label-2", "grid-1", "new-record-button-2"],
+  );
+
+  const project_view_integrity_fixed_view =
+    await (project_view_integrity_server_xvm as any)._get_view({
+      _params: {
+        _app_id: project_view_integrity_app_id,
+        _env: project_view_integrity_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    project_view_integrity_fixed_view._result._view._children.map((child: any) => child._id),
+    ["new-record-button", "footer-label", "footer-label-2", "grid-1"],
+  );
+  assert.equal(
+    project_view_integrity_fixed_view._result._view._children[3]._children[0]._id,
+    "new-record-button-2",
+  );
+
+  const project_view_integrity_persisted =
+    JSON.parse(
+      await readFile(
+        path.join(
+          project_view_integrity_work_folder,
+          "xvm",
+          "apps",
+          project_view_integrity_env,
+          project_view_integrity_app_id,
+          "views",
+          "main.json",
+        ),
+        "utf-8",
+      ),
+    );
+  assert.deepEqual(
+    project_view_integrity_persisted._children.map((child: any) => child._id),
+    ["new-record-button", "footer-label", "footer-label-2", "grid-1"],
+  );
+  assert.equal(project_view_integrity_persisted._children[3]._children[0]._id, "new-record-button-2");
+
+  const project_view_integrity_second_fix_res =
+    await (project_view_integrity_xvibe as any)._fix_project_views({
+      _params: {
+        _app_id: project_view_integrity_app_id,
+        _env: project_view_integrity_env,
+      },
+    });
+  assert.equal(project_view_integrity_second_fix_res._ok, true);
+  assert.equal(project_view_integrity_second_fix_res._views_updated, 0);
+  assert.equal(project_view_integrity_second_fix_res._ids_added, 0);
+} finally {
+  (_x as any).execute = project_view_integrity_original_execute;
+  await rm(project_view_integrity_work_folder, { recursive: true, force: true });
+}
+
+const project_memory_work_folder =
+  await mkdtemp(path.join(tmpdir(), "server-xvm-project-memory-"));
+try {
+  const project_memory_server_xvm =
+    new ServerXVMModule({ _work_folder: project_memory_work_folder });
+  const project_memory_app_id = "memory-app";
+  const project_memory_env = "test";
+  const project_memory_file = path.join(
+    project_memory_work_folder,
+    "xvm",
+    "apps",
+    project_memory_env,
+    project_memory_app_id,
+    "project-memory.json",
+  );
+  const default_project_memory = {
+    _version: 1,
+    _stage: "planning",
+    _vision: "",
+    _goal: "",
+    _current_focus: "",
+    _completed: [],
+    _achievements: [],
+    _milestones: [],
+    _parking_lot: [],
+    _decisions: [],
+    _notes: [],
+    _updated_at: "",
+  };
+
+  await (project_memory_server_xvm as any)._create_app({
+    _params: {
+      _app_id: project_memory_app_id,
+      _env: project_memory_env,
+    },
+  });
+
+  await assert.rejects(access(project_memory_file));
+
+  const get_project_memory_res =
+    await (project_memory_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+      },
+    });
+  assert.equal(get_project_memory_res._ok, true);
+  assert.deepEqual(get_project_memory_res._result._memory, default_project_memory);
+  assert.deepEqual(
+    JSON.parse(await readFile(project_memory_file, "utf-8")),
+    default_project_memory,
+  );
+
+  const save_project_memory_res =
+    await (project_memory_server_xvm as any)._save_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _memory: {
+          _version: 2,
+          _vision: "Ship deterministic project memory",
+          _goal: "Persist human project facts",
+          _current_focus: "Server support",
+          _completed: ["app shell"],
+          _parking_lot: ["client editor"],
+          _decisions: ["store beside app.json"],
+          _notes: ["no generation"],
+        },
+      },
+    });
+  assert.equal(save_project_memory_res._ok, true);
+  assert.equal(save_project_memory_res._result._memory._version, 2);
+  assert.equal(save_project_memory_res._result._memory._stage, "building");
+  assert.equal(
+    save_project_memory_res._result._memory._vision,
+    "Ship deterministic project memory",
+  );
+  assert.ok(Number.isFinite(Date.parse(save_project_memory_res._result._memory._updated_at)));
+  assert.deepEqual(
+    JSON.parse(await readFile(project_memory_file, "utf-8")),
+    save_project_memory_res._result._memory,
+  );
+
+  const patch_project_memory_res =
+    await (project_memory_server_xvm as any)._patch_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _patch: {
+          _goal: "Keep project facts inspectable",
+          _parking_lot: ["client editor", "import/export"],
+        },
+      },
+    });
+  assert.equal(patch_project_memory_res._ok, true);
+  assert.equal(
+    patch_project_memory_res._result._memory._vision,
+    "Ship deterministic project memory",
+  );
+  assert.equal(
+    patch_project_memory_res._result._memory._goal,
+    "Keep project facts inspectable",
+  );
+  assert.deepEqual(
+    patch_project_memory_res._result._memory._parking_lot,
+    ["client editor", "import/export"],
+  );
+
+  const focus_patch_project_memory_res =
+    await (project_memory_server_xvm as any)._patch_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _patch: {
+          _current_focus: "Authentication",
+        },
+      },
+    });
+  assert.equal(focus_patch_project_memory_res._ok, true);
+  const focus_patch_achievements =
+    focus_patch_project_memory_res._result._memory._achievements as any[];
+  const focus_patch_milestones =
+    focus_patch_project_memory_res._result._memory._milestones as any[];
+  assert.equal(focus_patch_achievements.length, 1);
+  assert.deepEqual(focus_patch_milestones, [
+    {
+      _id: "authentication",
+      _title: "Authentication",
+      _items: [
+        {
+          _id: "user-crud",
+          _title: "User CRUD",
+          _completed: false,
+        },
+        {
+          _id: "login",
+          _title: "Login",
+          _completed: false,
+        },
+        {
+          _id: "roles",
+          _title: "Roles",
+          _completed: false,
+        },
+        {
+          _id: "permissions",
+          _title: "Permissions",
+          _completed: false,
+        },
+      ],
+    },
+  ]);
+  assert.deepEqual(
+    {
+      ...focus_patch_achievements[0],
+      _completed_at: "<iso>",
+    },
+    {
+      _id: "first-project-memory-focus",
+      _title: "First project focus set",
+      _type: "onboarding",
+      _completed_at: "<iso>",
+    },
+  );
+  assert.ok(Number.isFinite(Date.parse(focus_patch_achievements[0]._completed_at)));
+
+  const duplicate_focus_patch_project_memory_res =
+    await (project_memory_server_xvm as any)._patch_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _patch: {
+          _current_focus: "Authentication",
+        },
+      },
+    });
+  assert.equal(duplicate_focus_patch_project_memory_res._ok, true);
+  assert.equal(
+    (duplicate_focus_patch_project_memory_res._result._memory._achievements as any[])
+      .filter((achievement) =>
+        achievement?._id === "first-project-memory-focus"
+      )
+      .length,
+    1,
+  );
+
+  const completed_user_crud_project_memory_res =
+    await (project_memory_server_xvm as any)._patch_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _patch: {
+          _completed: [
+            {
+              _id: "user-crud",
+              _title: "User CRUD",
+              _type: "crud",
+            },
+          ],
+        },
+      },
+    });
+  assert.equal(completed_user_crud_project_memory_res._ok, true);
+  const completed_user_crud_milestone =
+    (completed_user_crud_project_memory_res._result._memory._milestones as any[])
+      .find((milestone) => milestone?._id === "authentication");
+  const completed_user_crud_item =
+    completed_user_crud_milestone?._items?.find((item: any) =>
+      item?._id === "user-crud"
+    );
+  const login_milestone_item =
+    completed_user_crud_milestone?._items?.find((item: any) =>
+      item?._id === "login"
+    );
+  assert.equal(completed_user_crud_item?._completed, true);
+  assert.equal(login_milestone_item?._completed, false);
+
+  const normalize_project_memory_res =
+    await (project_memory_server_xvm as any)._save_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+        _memory: {
+          _version: "bad",
+          _stage: "bad",
+          _vision: 42,
+          _goal: "Normalize fields",
+          _current_focus: null,
+          _completed: "done",
+          _achievements: "bad",
+          _milestones: "bad",
+          _parking_lot: [],
+          _decisions: {},
+          _notes: ["kept"],
+          _updated_at: "old",
+        },
+      },
+    });
+  assert.equal(normalize_project_memory_res._ok, true);
+  assert.equal(normalize_project_memory_res._result._memory._version, 1);
+  assert.equal(normalize_project_memory_res._result._memory._stage, "planning");
+  assert.equal(normalize_project_memory_res._result._memory._vision, "");
+  assert.equal(normalize_project_memory_res._result._memory._goal, "Normalize fields");
+  assert.equal(normalize_project_memory_res._result._memory._current_focus, "");
+  assert.deepEqual(normalize_project_memory_res._result._memory._completed, []);
+  assert.deepEqual(normalize_project_memory_res._result._memory._achievements, []);
+  assert.deepEqual(normalize_project_memory_res._result._memory._milestones, []);
+  assert.deepEqual(normalize_project_memory_res._result._memory._parking_lot, []);
+  assert.deepEqual(normalize_project_memory_res._result._memory._decisions, []);
+  assert.deepEqual(normalize_project_memory_res._result._memory._notes, ["kept"]);
+  assert.notEqual(normalize_project_memory_res._result._memory._updated_at, "old");
+  assert.ok(Number.isFinite(Date.parse(normalize_project_memory_res._result._memory._updated_at)));
+
+  const original_project_memory_execute = (_x as any).execute;
+  const original_project_memory_get_module = (_x as any).getModule;
+  try {
+    (_x as any).getModule = (name: string) =>
+      name === "server-xvm"
+        ? project_memory_server_xvm
+        : typeof original_project_memory_get_module === "function"
+          ? original_project_memory_get_module.call(_x, name)
+          : undefined;
+    (_x as any).execute = async (command: any) => {
+      if (command?._module === "server-xvm") {
+        const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+        const method = (project_memory_server_xvm as any)[method_name];
+        if (typeof method === "function") {
+          return method.call(project_memory_server_xvm, command);
+        }
+      }
+
+      return original_project_memory_execute.call(_x, command);
+    };
+
+    const staged_runtime_context: any =
+      await RuntimeContextManager.attachProjectMemoryToRuntimeContext({
+        _app_id: project_memory_app_id,
+        _env: project_memory_env,
+      });
+    assert.equal(staged_runtime_context._stage, "planning");
+    assert.equal(staged_runtime_context._project_memory?._stage, "planning");
+  } finally {
+    (_x as any).execute = original_project_memory_execute;
+    (_x as any).getModule = original_project_memory_get_module;
+  }
+
+  await assert.rejects(
+    (project_memory_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: "../memory-app",
+        _env: project_memory_env,
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_INVALID_APP_ID",
+  );
+  await assert.rejects(
+    (project_memory_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: project_memory_app_id,
+        _env: "../test",
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_INVALID_ENV",
+  );
+  await assert.rejects(
+    (project_memory_server_xvm as any)._save_project_memory({
+      _params: {
+        _app_id: "missing-memory-app",
+        _env: project_memory_env,
+        _memory: {},
+      },
+    }),
+    (error: any) => error?._code === "E_XVM_APP_NOT_FOUND",
+  );
+} finally {
+  await rm(project_memory_work_folder, { recursive: true, force: true });
+}
+
+const guide_achievement_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-guide-achievement-"));
+try {
+  const guide_achievement_server_xvm =
+    new ServerXVMModule({ _work_folder: guide_achievement_work_folder });
+  const guide_achievement_xvibe = new XVibeModule();
+  const guide_achievement_app_id = "guide-achievement-app";
+  const guide_achievement_env = "test";
+
+  await (guide_achievement_server_xvm as any)._create_app({
+    _params: {
+      _app_id: guide_achievement_app_id,
+      _env: guide_achievement_env,
+    },
+  });
+  await (guide_achievement_server_xvm as any)._patch_project_memory({
+    _params: {
+      _app_id: guide_achievement_app_id,
+      _env: guide_achievement_env,
+      _patch: {
+        _current_focus: "Authentication",
+      },
+    },
+  });
+
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? guide_achievement_server_xvm
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (guide_achievement_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(guide_achievement_server_xvm, command);
+      }
+    }
+
+    return original_execute.call(_x, command);
+  };
+
+  const guide_achievement_recommendation =
+    await guide_achievement_xvibe.getGuideRecommendation({
+      _app_id: guide_achievement_app_id,
+      _env: guide_achievement_env,
+    });
+  assert.deepEqual(guide_achievement_recommendation, {
+    _title: "User CRUD",
+    _reason: "Current focus is Authentication.",
+    _type: "crud",
+    _priority: 100,
+    _action: {
+      _prompt: "Create User CRUD.",
+    },
+  });
+
+  const guide_achievement_memory_after_first =
+    await (guide_achievement_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: guide_achievement_app_id,
+        _env: guide_achievement_env,
+      },
+    });
+  assert.equal(
+    (guide_achievement_memory_after_first._result._memory._achievements as any[])
+      .filter((achievement) =>
+        achievement?._id === "first-guide-recommendation"
+      )
+      .length,
+    1,
+  );
+
+  await guide_achievement_xvibe.getGuideRecommendation({
+    _app_id: guide_achievement_app_id,
+    _env: guide_achievement_env,
+  });
+  const guide_achievement_memory_after_duplicate =
+    await (guide_achievement_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: guide_achievement_app_id,
+        _env: guide_achievement_env,
+      },
+    });
+  assert.equal(
+    (guide_achievement_memory_after_duplicate._result._memory._achievements as any[])
+      .filter((achievement) =>
+        achievement?._id === "first-guide-recommendation"
+      )
+      .length,
+    1,
+  );
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getModule = original_get_module;
+  await rm(guide_achievement_work_folder, { recursive: true, force: true });
 }
 
 const view_starter_override_work_folder =
@@ -8712,18 +15505,28 @@ try {
         : undefined;
   (_x as any).getSkills = () => runtime_skills_for_view_edit;
   (_x as any).execute = async (command: any) => {
-    if (command?._module === "server-xvm" && command?._op === "get_app") {
-      return {
-        _ok: true,
-        _result: {
-          _view_ids: ["main", ...Object.keys(referenced_views_for_remove)],
-          _flow_ids: [],
-          _entity_ids: [],
-        },
-      };
-    }
+	    if (command?._module === "server-xvm" && command?._op === "get_app") {
+	      return {
+	        _ok: true,
+	        _result: {
+	          _view_ids: ["main", ...Object.keys(referenced_views_for_remove)],
+	          _flow_ids: [],
+	          _entity_ids: [],
+	        },
+	      };
+	    }
 
-    if (command?._module === "server-xvm" && command?._op === "get_view") {
+	    if (command?._module === "server-xvm" && command?._op === "list_views") {
+	      return {
+	        _ok: true,
+	        _result: {
+	          _views: ["main", ...Object.keys(referenced_views_for_remove)]
+	            .map((_id) => ({ _id })),
+	        },
+	      };
+	    }
+
+	    if (command?._module === "server-xvm" && command?._op === "get_view") {
       const view_id = command?._params?._view_id ?? "main";
       const view =
         view_id === "main"
@@ -8815,6 +15618,75 @@ try {
     }
 
     throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "refresh-button",
+        _type: "button",
+        _text: "Refresh",
+      },
+      {
+        _id: "main-toolbar",
+        _type: "stack",
+        _children: [],
+      },
+    ],
+  };
+  const apply_view_edit_move_push_count_before = push_update_count;
+  const apply_view_edit_move_result = await (xvibe as any)._apply_view_edit({
+    _params: {
+      _app_id: "view-edit-refine-app",
+      _env: "test",
+      _view_id: "main",
+      _edit_action: "move-object",
+      _target_id: "Refresh",
+      _target_type: "button",
+      _destination_id: "main-toolbar",
+      _destination_type: "stack",
+      _position: "append",
+      _generation_id: "apply-view-edit-move-refresh",
+    },
+  });
+  assert.equal(apply_view_edit_move_result._ok, true);
+  assert.equal(apply_view_edit_move_result._moved_id, "refresh-button");
+  assert.equal(apply_view_edit_move_result._source_parent_id, "main");
+  assert.equal(apply_view_edit_move_result._destination_parent_id, "main-toolbar");
+  assert.equal(apply_view_edit_move_result._position, "append");
+  assert.equal(push_update_count, apply_view_edit_move_push_count_before + 1);
+  const apply_view_edit_move_pushed_view =
+    pushed_views_by_generation_id.get("apply-view-edit-move-refresh");
+  assert.deepEqual(
+    apply_view_edit_move_pushed_view._children.map((child: any) => child._id),
+    ["main-toolbar"],
+  );
+  assert.deepEqual(
+    apply_view_edit_move_pushed_view._children[0]._children.map((child: any) => child._id),
+    ["refresh-button"],
+  );
+  current_view_for_remove = {
+    _id: "main",
+    _type: "view",
+    _children: [
+      {
+        _id: "logout-button",
+        _type: "button",
+        _text: "Logout",
+      },
+      {
+        _id: "play-button",
+        _type: "button",
+        _text: "▶ Start Music",
+      },
+      {
+        _id: "powered-label",
+        _type: "label",
+        _text: "Powered by Xpell",
+      },
+    ],
   };
 
   const remove_button_push_count_before = push_update_count;
@@ -10881,15 +17753,18 @@ try {
     _generation_id: "view-edit-deterministic-move-different-parent",
   });
   assert.equal(deterministic_move_different_parent_result._ok, true);
-  assert.equal(deterministic_move_different_parent_result._result._deterministic, undefined);
+  assert.equal(deterministic_move_different_parent_result._result._deterministic, true);
   assert.equal(xai_generate_count, deterministic_move_different_parent_xai_count_before + 1);
   const deterministic_move_different_parent_run_dir =
     await latest_vibe_run_dir(view_edit_refine_work_folder, "view-edit-refine-app");
   const deterministic_move_different_parent_mutation_json = JSON.parse(
     await readFile(path.join(deterministic_move_different_parent_run_dir, "deterministic-mutation.json"), "utf-8"),
   );
-  assert.equal(deterministic_move_different_parent_mutation_json._eligible, false);
-  assert.equal(deterministic_move_different_parent_mutation_json._reason, "different_parent");
+  assert.equal(deterministic_move_different_parent_mutation_json._eligible, true);
+  assert.equal(deterministic_move_different_parent_mutation_json._action, "move-object");
+  assert.equal(deterministic_move_different_parent_mutation_json._source_parent_id, "left");
+  assert.equal(deterministic_move_different_parent_mutation_json._destination_parent_id, "right");
+  assert.equal(deterministic_move_different_parent_mutation_json._position, "before");
 
   current_view_for_remove = {
     _id: "main",
@@ -11795,6 +18670,3566 @@ try {
   await rm(referenced_view_persist_work_folder, { recursive: true, force: true });
 }
 
+const create_toolbar_work_folder =
+  await mkdtemp(path.join(tmpdir(), "xvibe-create-toolbar-"));
+try {
+  const create_toolbar_server_xvm =
+    new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+  const create_toolbar_xvibe = new XVibeModule();
+  const create_toolbar_app_id = "create-toolbar-app";
+  const create_toolbar_env = "test";
+  const create_toolbar_flow_manager = new FlowManagerModule();
+  const create_toolbar_runtime_skills = {
+    _modules: [
+      {
+        _objects: [
+          { _id: "view" },
+          { _id: "label" },
+          { _id: "button" },
+          { _id: "toolbar" },
+          { _id: "modal" },
+          { _id: "xvm-view" },
+          { _id: "table" },
+        ],
+      },
+    ],
+  };
+
+  await (create_toolbar_server_xvm as any)._create_app({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _entry_view_id: "main",
+    },
+  });
+  await (create_toolbar_server_xvm as any)._set_flow({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _flow: {
+        _id: "save-project",
+        _steps: [
+          {
+            _id: "save-status",
+            _command: {
+              _module: "xd",
+              _op: "set",
+              _params: {
+                key: "save-status",
+                value: "Project saved",
+              },
+            },
+            _output: {
+              _to: {
+                _type: "xdata",
+                _key: "save-status",
+              },
+              _value: "$step.save-status._result",
+            },
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "main",
+        _type: "view",
+        _children: [
+          {
+            _id: "main-refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _id: "main-new-record-button",
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "home",
+        _type: "view",
+        _children: [
+          {
+            _id: "home-title",
+            _type: "label",
+            _text: "Meals",
+          },
+          {
+            _type: "button",
+            _id: "add-meal-button",
+            _text: "Add Meal",
+            _on: {
+              _focus: {
+                _op: "add-class",
+                _params: {
+                  class: "is-focused",
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "create-meal",
+        _type: "view",
+        _children: [
+          {
+            _id: "create-meal-title",
+            _type: "label",
+            _text: "Create Meal",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "homepage",
+        _type: "view",
+        _children: [
+          {
+            _id: "homepage-title",
+            _type: "label",
+            _text: "Meals",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "button-flow-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "main-toolbar",
+            _type: "toolbar",
+            _children: [],
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "anonymous-plan-main",
+        _type: "view",
+        _children: [
+          {
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "anonymous-move-main",
+        _type: "view",
+        _children: [
+          {
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "toolbar-empty-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "visible-text-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "visible-text-toolbar",
+            _type: "toolbar",
+            _children: [],
+          },
+          {
+            _id: "visible-refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _id: "visible-new-record-button",
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "nested-toolbar-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "toolbar-region",
+            _type: "view",
+            _children: [
+              {
+                _id: "existing-nested-toolbar",
+                _type: "toolbar",
+                _children: [],
+              },
+            ],
+          },
+          {
+            _id: "nested-refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "direct-id-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "direct-id-toolbar",
+            _type: "toolbar",
+            _children: [],
+          },
+          {
+            _id: "direct-refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "ambiguous-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "ambiguous-toolbar",
+            _type: "toolbar",
+            _children: [],
+          },
+          {
+            _id: "ambiguous-refresh-primary",
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _id: "ambiguous-refresh-secondary",
+            _type: "button",
+            _text: "Refresh",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+          {
+            _id: "new-record-button",
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "single-move-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "single-toolbar",
+            _type: "toolbar",
+            _children: [],
+          },
+          {
+            _id: "single-refresh-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "toolbar-title-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "toolbar-page-title",
+            _type: "label",
+            _text: "Page Title",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "toolbar-existing-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "toolbar-existing-main-toolbar",
+            _type: "toolbar",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "deterministic-text-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "deterministic-my-app-label",
+            _type: "label",
+            _text: "My App",
+          },
+        ],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-failure-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-reject-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+
+  (create_toolbar_xvibe as any).latest_runtime_skills = create_toolbar_runtime_skills;
+  const create_toolbar_xvibe_execute_order: string[] = [];
+  let create_toolbar_flow_client_trigger_count = 0;
+  let create_toolbar_flow_run_count = 0;
+  let create_toolbar_xd_set_count = 0;
+  const create_toolbar_flow_client_commands: any[] = [];
+  const create_toolbar_flow_run_commands: any[] = [];
+  (_x as any).getModule = (name: string) =>
+    name === "server-xvm"
+      ? create_toolbar_server_xvm
+      : name === "xvibe"
+        ? create_toolbar_xvibe
+      : typeof original_get_module === "function"
+        ? original_get_module.call(_x, name)
+        : undefined;
+  (_x as any).getSkills = () => create_toolbar_runtime_skills;
+  (_x as any).execute = async (command: any) => {
+    if (command?._module === "xvibe") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (create_toolbar_xvibe as any)[method_name];
+      if (typeof method === "function") {
+        if (command?._op === "apply-view-edit") {
+          const child_id =
+            command?._params?._child?._id;
+          const target_text =
+            command?._params?._target_text ?? command?._params?._target_id;
+          create_toolbar_xvibe_execute_order.push(
+            command?._params?._edit_action === "add-child" && typeof child_id === "string"
+              ? `add-child:${child_id}`
+              : command?._params?._edit_action === "move-object" && typeof target_text === "string"
+                ? `move-object:${target_text}`
+              : command?._params?._edit_action === "bind-flow" && typeof target_text === "string"
+                ? `bind-flow:${target_text}`
+              : String(command?._params?._edit_action),
+          );
+        }
+        return method.call(create_toolbar_xvibe, command);
+      }
+    }
+
+    if (command?._module === "server-xvm") {
+      const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+      const method = (create_toolbar_server_xvm as any)[method_name];
+      if (typeof method === "function") {
+        return method.call(create_toolbar_server_xvm, command);
+      }
+    }
+
+    if (command?._module === "entity-manager" && command?._op === "register") {
+      return {
+        _ok: true,
+        _result: {
+          _entity_id: command?._params?._entity?._id,
+          _action: "create",
+        },
+      };
+    }
+
+    if (command?._module === "flow-client" && command?._op === "trigger") {
+      create_toolbar_flow_client_trigger_count += 1;
+      create_toolbar_flow_client_commands.push(command);
+      const params = command?._params ?? {};
+      const flow_run_command = {
+        _module: "flow",
+        _op: "run",
+        _params: {
+          _flow_id: params._flow_id,
+          _app_id: params._app_id,
+          ...(params._env !== undefined ? { _env: params._env } : {}),
+          _event_payload:
+            params._event_payload &&
+            typeof params._event_payload === "object"
+              ? params._event_payload
+              : {},
+          ...(typeof params._event_name === "string"
+            ? { _event_name: params._event_name }
+            : {}),
+        },
+      };
+      create_toolbar_flow_run_commands.push(flow_run_command);
+      const flow_run_result = await (_x as any).execute(flow_run_command);
+      const flow = flow_run_result?._flow ?? flow_run_result?._result?._flow;
+      if (flow?._outputs && typeof flow._outputs === "object") {
+        for (const key of Object.keys(flow._outputs)) {
+          const raw = flow._outputs[key];
+          const value =
+            raw &&
+            typeof raw === "object" &&
+            raw._ok === true &&
+            Object.prototype.hasOwnProperty.call(raw, "_result")
+              ? raw._result
+              : raw;
+          _xd.set(key, value, { source: "flow-client" });
+        }
+      }
+      return {
+        _ok: true,
+        _queued: true,
+        _flow_id: params._flow_id,
+        _result: flow_run_result,
+      };
+    }
+
+    if (command?._module === "flow" && command?._op === "run") {
+      create_toolbar_flow_run_count += 1;
+      return (create_toolbar_flow_manager as any)._run(command);
+    }
+
+    if (command?._module === "xd" && command?._op === "set") {
+      create_toolbar_xd_set_count += 1;
+      _xd.set(command?._params?.key, command?._params?.value, {
+        source: "create-toolbar-flow",
+      });
+      return {
+        _ok: true,
+        _result: command?._params?.value,
+      };
+    }
+
+    if (command?._module === "xai" && command?._op === "generate") {
+      throw new Error("xai.generate should not be called for create-toolbar");
+    }
+
+    throw new Error(`Unexpected command ${JSON.stringify(command)}`);
+  };
+
+  const create_toolbar_meal_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _entity: {
+        _id: "meal",
+        _schema: {
+          name: {
+            _type: "String",
+          },
+          calories: {
+            _type: "String",
+          },
+          notes: {
+            _type: "String",
+          },
+        },
+      },
+    },
+  });
+  assert.equal(create_toolbar_meal_entity_res._ok, true);
+
+  set_xvibe_semantic_intent_env("true", "create-toolbar-fixture-semantic");
+  let deterministic_text_apply_semantic_generate_count = 0;
+  const deterministic_text_apply_engine = xvibe_test_intent_engine({
+    _semantic_generate_json: async () => {
+      deterministic_text_apply_semantic_generate_count += 1;
+      return XVIBE_SEMANTIC_VALID_INTENT;
+    },
+  });
+  const deterministic_text_apply_intent =
+    await deterministic_text_apply_engine.analyze({
+      _message: 'update main view change "My App" label text to "Dashboard"',
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "deterministic-text-main",
+        _current_view: {
+          _id: "deterministic-text-main",
+          _type: "view",
+          _children: [
+            {
+              _id: "deterministic-my-app-label",
+              _type: "label",
+              _text: "My App",
+            },
+          ],
+        },
+      },
+    });
+  assert_xvibe_text_replacement_action(
+    deterministic_text_apply_intent,
+    {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view_id: "deterministic-text-main",
+      _target_id: "My App",
+      _target_type: "label",
+      _property_value: "Dashboard",
+    },
+  );
+  assert.equal(deterministic_text_apply_semantic_generate_count, 0);
+  const deterministic_text_apply_action =
+    deterministic_text_apply_intent._intent?._actions[0];
+  const deterministic_text_apply_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: deterministic_text_apply_action?._execution_payload?._params,
+    });
+  assert.equal(deterministic_text_apply_result._ok, true);
+  assert.equal(deterministic_text_apply_result._mutation_action, "set-property");
+  assert.equal(deterministic_text_apply_result._target_id, "deterministic-my-app-label");
+  const deterministic_text_apply_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "deterministic-text-main",
+      },
+    });
+  assert.equal(
+    deterministic_text_apply_after._result._view._children[0]._text,
+    "Dashboard",
+  );
+  const deterministic_text_apply_file =
+    path.join(
+      create_toolbar_work_folder,
+      "xvm",
+      "apps",
+      create_toolbar_env,
+      create_toolbar_app_id,
+      "views",
+      "deterministic-text-main.json",
+    );
+  assert.equal(
+    JSON.parse(await readFile(deterministic_text_apply_file, "utf-8"))._children[0]._text,
+    "Dashboard",
+  );
+
+  let deterministic_button_creation_semantic_generate_count = 0;
+  const deterministic_button_creation_engine = xvibe_test_intent_engine({
+    _semantic_generate_json: async () => {
+      deterministic_button_creation_semantic_generate_count += 1;
+      return XVIBE_SEMANTIC_VALID_INTENT;
+    },
+  });
+  const deterministic_button_creation_intent =
+    await deterministic_button_creation_engine.analyze({
+      _message: 'Add an "Add Meal" button to the homepage.',
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "main",
+      },
+    });
+  assert_xvibe_button_creation_action(
+    deterministic_button_creation_intent,
+    {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view_id: "homepage",
+      _button_id: "add-meal-button",
+      _button_text: "Add Meal",
+    },
+  );
+  assert.equal(deterministic_button_creation_semantic_generate_count, 0);
+  create_toolbar_xvibe_execute_order.length = 0;
+  const deterministic_button_creation_action =
+    deterministic_button_creation_intent._intent?._actions[0];
+  const deterministic_button_creation_apply_result =
+    await (_x as any).execute(deterministic_button_creation_action?._execution_payload);
+  assert.equal(deterministic_button_creation_apply_result._ok, true);
+  assert.equal(deterministic_button_creation_apply_result._mutation_action, "add-child");
+  assert.equal(deterministic_button_creation_apply_result._target_id, "homepage");
+  assert.equal(deterministic_button_creation_apply_result._parent_id, "homepage");
+  assert.equal(
+    deterministic_button_creation_apply_result._result._mutation._child_id,
+    "add-meal-button",
+  );
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    ["add-child:add-meal-button"],
+  );
+  const deterministic_button_creation_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+      },
+    });
+  assert.deepEqual(
+    deterministic_button_creation_after._result._view._children,
+    [
+      {
+        _id: "homepage-title",
+        _type: "label",
+        _text: "Meals",
+      },
+      {
+        _type: "button",
+        _id: "add-meal-button",
+        _text: "Add Meal",
+      },
+    ],
+  );
+  const deterministic_button_creation_file =
+    path.join(
+      create_toolbar_work_folder,
+      "xvm",
+      "apps",
+      create_toolbar_env,
+      create_toolbar_app_id,
+      "views",
+      "homepage.json",
+    );
+  assert.deepEqual(
+    JSON.parse(await readFile(deterministic_button_creation_file, "utf-8"))._children,
+    deterministic_button_creation_after._result._view._children,
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const deterministic_button_creation_retry_result =
+    await (_x as any).execute(deterministic_button_creation_action?._execution_payload);
+  assert.equal(deterministic_button_creation_retry_result._ok, true);
+  assert.equal(deterministic_button_creation_retry_result._mutation_action, "add-child");
+  assert.equal(deterministic_button_creation_retry_result._reason, "already_exists");
+  const deterministic_button_creation_retry_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+      },
+    });
+  assert.equal(
+    deterministic_button_creation_retry_after._result._view._children
+      .filter((child: any) => child._id === "add-meal-button")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    deterministic_button_creation_retry_after._result._view._children,
+    deterministic_button_creation_after._result._view._children,
+  );
+
+  const deterministic_button_creation_reloaded_xvm =
+    new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+  await (deterministic_button_creation_reloaded_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+    },
+  });
+  const deterministic_button_creation_reloaded_view =
+    await (deterministic_button_creation_reloaded_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+      },
+    });
+  assert.deepEqual(
+    deterministic_button_creation_reloaded_view._result._view,
+    deterministic_button_creation_after._result._view,
+  );
+  set_xvibe_semantic_intent_env(undefined);
+
+  const create_toolbar_empty_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-empty-main",
+        _edit_action: "create-toolbar",
+        _location: "top",
+      },
+    });
+  assert.equal(create_toolbar_empty_result._ok, true);
+  assert.equal(create_toolbar_empty_result._mutation_action, "create-toolbar");
+  assert.equal(create_toolbar_empty_result._toolbar_id, "toolbar-empty-main-toolbar");
+  assert.equal(create_toolbar_empty_result._created, true);
+  assert.equal(create_toolbar_empty_result._location, "top");
+  const create_toolbar_empty_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-empty-main",
+      },
+    });
+  assert.deepEqual(
+    create_toolbar_empty_after._result._view._children,
+    [
+      {
+        _id: "toolbar-empty-main-toolbar",
+        _type: "toolbar",
+      },
+    ],
+  );
+
+  const create_toolbar_duplicate_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-empty-main",
+        _edit_action: "create-toolbar",
+        _location: "top",
+      },
+    });
+  assert.equal(create_toolbar_duplicate_result._ok, true);
+  assert.equal(create_toolbar_duplicate_result._mutation_action, "create-toolbar");
+  assert.equal(create_toolbar_duplicate_result._toolbar_id, "toolbar-empty-main-toolbar");
+  assert.equal(create_toolbar_duplicate_result._created, false);
+  assert.equal(create_toolbar_duplicate_result._reason, "already_exists");
+  const create_toolbar_duplicate_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-empty-main",
+      },
+    });
+  assert.equal(
+    create_toolbar_duplicate_after._result._view._children
+      .filter((child: any) => child?._type === "toolbar")
+      .length,
+    1,
+  );
+
+  const create_toolbar_top_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-title-main",
+        _edit_action: "create-toolbar",
+        _location: "top",
+        _toolbar_props: {
+          _id: "toolbar-title-main-toolbar",
+        },
+      },
+    });
+  assert.equal(create_toolbar_top_result._ok, true);
+  assert.equal(create_toolbar_top_result._toolbar_id, "toolbar-title-main-toolbar");
+  assert.equal(create_toolbar_top_result._created, true);
+  const create_toolbar_top_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-title-main",
+      },
+    });
+  assert.equal(create_toolbar_top_after._result._view._children[0]._id, "toolbar-title-main-toolbar");
+  assert.equal(create_toolbar_top_after._result._view._children[0]._type, "toolbar");
+  assert.equal(create_toolbar_top_after._result._view._children[1]._id, "toolbar-page-title");
+  const create_toolbar_top_file =
+    path.join(
+      create_toolbar_work_folder,
+      "xvm",
+      "apps",
+      create_toolbar_env,
+      create_toolbar_app_id,
+      "views",
+      "toolbar-title-main.json",
+    );
+  const create_toolbar_top_persisted =
+    JSON.parse(await readFile(create_toolbar_top_file, "utf-8"));
+  assert.equal(create_toolbar_top_persisted._children[0]._id, "toolbar-title-main-toolbar");
+  assert.equal(create_toolbar_top_persisted._children[0]._type, "toolbar");
+
+  const create_toolbar_existing_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "toolbar-existing-main",
+        _edit_action: "create-toolbar",
+      },
+    });
+  assert.equal(create_toolbar_existing_result._ok, true);
+  assert.equal(create_toolbar_existing_result._toolbar_id, "toolbar-existing-main-toolbar");
+  assert.equal(create_toolbar_existing_result._created, false);
+  assert.equal(create_toolbar_existing_result._reason, "already_exists");
+
+  const existing_move_object_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "single-move-main",
+        _target_id: "Refresh",
+        _target_text: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "single-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(existing_move_object_result._ok, true);
+  assert.equal(existing_move_object_result._mutation_action, "move-object");
+  assert.equal(existing_move_object_result._destination_parent_id, "single-toolbar");
+  const existing_move_object_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "single-move-main",
+      },
+    });
+  assert.deepEqual(
+    existing_move_object_after._result._view._children.map((child: any) => child._id),
+    ["single-toolbar"],
+  );
+  assert.equal(
+    existing_move_object_after._result._view._children[0]._children[0]._id,
+    "single-refresh-button",
+  );
+
+  const visible_text_refresh_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "visible-text-move-main",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "visible-text-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(visible_text_refresh_move_result._ok, true);
+  assert.equal(visible_text_refresh_move_result._mutation_action, "move-object");
+  assert.equal(visible_text_refresh_move_result._target_id, "visible-refresh-button");
+  assert.equal(
+    visible_text_refresh_move_result._destination_parent_id,
+    "visible-text-toolbar",
+  );
+
+  const visible_text_new_record_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "visible-text-move-main",
+        _target_id: "New Record",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "visible-text-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(visible_text_new_record_move_result._ok, true);
+  assert.equal(visible_text_new_record_move_result._target_id, "visible-new-record-button");
+  const visible_text_move_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "visible-text-move-main",
+      },
+    });
+  assert.deepEqual(
+    visible_text_move_after._result._view._children.map((child: any) => child._id),
+    ["visible-text-toolbar"],
+  );
+  assert.deepEqual(
+    visible_text_move_after._result._view._children[0]._children.map(
+      (child: any) => child._id,
+    ),
+    ["visible-refresh-button", "visible-new-record-button"],
+  );
+
+  const already_moved_refresh_retry_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "visible-text-move-main",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "visible-text-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(already_moved_refresh_retry_result._ok, true);
+  const already_moved_retry_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "visible-text-move-main",
+      },
+    });
+  assert.deepEqual(
+    already_moved_retry_after._result._view._children[0]._children.map(
+      (child: any) => child._id,
+    ),
+    ["visible-new-record-button", "visible-refresh-button"],
+  );
+
+  const anonymous_toolbar_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "anonymous-move-main",
+        _edit_action: "create-toolbar",
+        _location: "top",
+        _toolbar_props: {
+          _id: "anonymous-main-toolbar",
+          _children: [],
+        },
+      },
+    });
+  assert.equal(anonymous_toolbar_result._ok, true);
+  const anonymous_refresh_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "anonymous-move-main",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "anonymous-main-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(anonymous_refresh_move_result._ok, true);
+  assert.equal(anonymous_refresh_move_result._target_id, undefined);
+  assert.deepEqual(anonymous_refresh_move_result._target_path, ["anonymous-move-main", "1"]);
+  assert.deepEqual(
+    anonymous_refresh_move_result._mutation?._target_path,
+    ["anonymous-move-main", "1"],
+  );
+  const anonymous_move_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "anonymous-move-main",
+      },
+    });
+  assert.deepEqual(
+    anonymous_move_after._result._view._children.map((child: any) => child._id),
+    ["anonymous-main-toolbar", undefined],
+  );
+  assert.deepEqual(
+    anonymous_move_after._result._view._children[0]._children.map(
+      (child: any) => ({
+        _id: child._id,
+        _text: child._text,
+      }),
+    ),
+    [
+      {
+        _id: undefined,
+        _text: "Refresh",
+      },
+    ],
+  );
+
+  const nested_toolbar_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "nested-toolbar-move-main",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "existing-nested-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(nested_toolbar_move_result._ok, true);
+  assert.equal(nested_toolbar_move_result._destination_parent_id, "existing-nested-toolbar");
+  const nested_toolbar_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "nested-toolbar-move-main",
+      },
+    });
+  assert.equal(
+    nested_toolbar_after._result._view._children[0]._children[0]._children[0]._id,
+    "nested-refresh-button",
+  );
+
+  const direct_id_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "direct-id-move-main",
+        _target_id: "direct-refresh-button",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "direct-id-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(direct_id_move_result._ok, true);
+  assert.equal(direct_id_move_result._target_id, "direct-refresh-button");
+  assert.equal(direct_id_move_result._destination_parent_id, "direct-id-toolbar");
+
+  const ambiguous_visible_text_move_result =
+    await (create_toolbar_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "ambiguous-move-main",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _edit_action: "move-object",
+        _position: "append",
+        _destination_id: "ambiguous-toolbar",
+        _destination_type: "toolbar",
+      },
+    });
+  assert.equal(ambiguous_visible_text_move_result._ok, false);
+  assert.equal(ambiguous_visible_text_move_result._reason, "ambiguous_text_target");
+  assert.equal(
+    ambiguous_visible_text_move_result._error._details._details._match_count,
+    2,
+  );
+
+  const create_toolbar_mutation_plan = (view_id: string, overrides: Record<string, any> = {}) => ({
+    _type: "mutation-plan",
+    _title: "Toolbar",
+    _goal: "Add a toolbar with Save and Cancel.",
+    _summary: "This change requires several deterministic mutations.",
+    _estimated_mutations: 3,
+    _executable_steps: 3,
+    _unsupported_steps: 0,
+    _can_apply: true,
+    _status: "planned",
+    _steps: [
+      {
+        _id: "create-toolbar",
+        _title: "Create toolbar",
+        _status: "planned",
+        _primitive: {
+          _module: "xvibe",
+          _op: "apply-view-edit",
+          _params: {
+            _app_id: create_toolbar_app_id,
+            _env: create_toolbar_env,
+            _view_id: view_id,
+            _edit_action: "create-toolbar",
+            _location: "top",
+            _toolbar_props: {
+              _id: `${view_id}-toolbar`,
+              _children: [],
+            },
+          },
+        },
+      },
+      {
+        _id: "create-save-button",
+        _title: "Add Save button to toolbar",
+        _status: "planned",
+        _primitive: {
+          _module: "xvibe",
+          _op: "apply-view-edit",
+          _params: {
+            _app_id: create_toolbar_app_id,
+            _env: create_toolbar_env,
+            _view_id: view_id,
+            _target_id: `${view_id}-toolbar`,
+            _target_type: "toolbar",
+            _edit_action: "add-child",
+            _location: "bottom",
+            _child: {
+              _type: "button",
+              _id: "save-button",
+              _text: "Save",
+            },
+          },
+        },
+      },
+      {
+        _id: "create-cancel-button",
+        _title: "Add Cancel button to toolbar",
+        _status: "planned",
+        _primitive: {
+          _module: "xvibe",
+          _op: "apply-view-edit",
+          _params: {
+            _app_id: create_toolbar_app_id,
+            _env: create_toolbar_env,
+            _view_id: view_id,
+            _target_id: `${view_id}-toolbar`,
+            _target_type: "toolbar",
+            _edit_action: "add-child",
+            _location: "bottom",
+            _child: {
+              _type: "button",
+              _id: "cancel-button",
+              _text: "Cancel",
+            },
+          },
+        },
+      },
+    ],
+    _buttons: [
+      { _id: "apply-plan", _title: "Apply Plan", _status: "placeholder" },
+      { _id: "edit-plan", _title: "Edit Plan", _status: "placeholder" },
+      { _id: "cancel-plan", _title: "Cancel", _status: "placeholder" },
+    ],
+    ...overrides,
+  });
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const mutation_plan_execute_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "mutation-plan-conversation",
+      _message_id: "mutation-plan-message",
+      _plan: create_toolbar_mutation_plan("mutation-plan-main"),
+    },
+  } as any);
+  assert.equal(mutation_plan_execute_result._ok, true);
+  assert.equal(mutation_plan_execute_result._status, "done");
+  assert.equal(mutation_plan_execute_result._completed_steps, 3);
+  assert.equal(mutation_plan_execute_result._failed_steps, 0);
+  assert.deepEqual(
+    mutation_plan_execute_result._steps.map((step: any) => ({
+      _id: step._id,
+      _status: step._status,
+    })),
+    [
+      { _id: "create-toolbar", _status: "done" },
+      { _id: "create-save-button", _status: "done" },
+      { _id: "create-cancel-button", _status: "done" },
+    ],
+  );
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "create-toolbar",
+      "add-child:save-button",
+      "add-child:cancel-button",
+    ],
+  );
+  const mutation_plan_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "mutation-plan-main",
+      },
+    });
+  assert.deepEqual(
+    mutation_plan_view_after._result._view._children,
+    [
+      {
+        _id: "mutation-plan-main-toolbar",
+        _type: "toolbar",
+        _children: [
+          {
+            _type: "button",
+            _id: "save-button",
+            _text: "Save",
+          },
+          {
+            _type: "button",
+            _id: "cancel-button",
+            _text: "Cancel",
+          },
+        ],
+      },
+    ],
+  );
+  const mutation_plan_persisted =
+    JSON.parse(await readFile(
+      path.join(
+        create_toolbar_work_folder,
+        "xvm",
+        "apps",
+        create_toolbar_env,
+        create_toolbar_app_id,
+        "views",
+        "mutation-plan-main.json",
+      ),
+      "utf-8",
+    ));
+  assert.equal(
+    mutation_plan_persisted._children[0]._children.some(
+      (child: any) => child._id === "save-button",
+    ),
+    true,
+  );
+  assert.equal(
+    mutation_plan_persisted._children[0]._children.some(
+      (child: any) => child._id === "cancel-button",
+    ),
+    true,
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const mutation_plan_retry_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: create_toolbar_mutation_plan("mutation-plan-main"),
+    },
+  } as any);
+  assert.equal(mutation_plan_retry_result._ok, true);
+  assert.equal(mutation_plan_retry_result._completed_steps, 3);
+  const mutation_plan_retry_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "mutation-plan-main",
+      },
+    });
+  assert.equal(
+    mutation_plan_retry_view_after._result._view._children
+      .filter((child: any) => child._id === "mutation-plan-main-toolbar")
+      .length,
+    1,
+  );
+  assert.equal(
+    mutation_plan_retry_view_after._result._view._children[0]._children
+      .filter((child: any) => child._id === "save-button")
+      .length,
+    1,
+  );
+  assert.equal(
+    mutation_plan_retry_view_after._result._view._children[0]._children
+      .filter((child: any) => child._id === "cancel-button")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    ["create-toolbar"],
+  );
+
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-state-success-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+  await (create_toolbar_server_xvm as any)._push_update({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _view: {
+        _id: "mutation-plan-state-failure-main",
+        _type: "view",
+        _children: [],
+      },
+    },
+  });
+
+  const mutation_plan_state_conversation_res =
+    await (create_toolbar_xvibe as any)._create_conversation({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _conversation_id: "mutation-plan-state-chat",
+        _title: "Mutation Plan State",
+      },
+    });
+  assert.equal(mutation_plan_state_conversation_res._ok, true);
+
+  const mutation_plan_state_success_plan =
+    create_toolbar_mutation_plan("mutation-plan-state-success-main");
+  const mutation_plan_state_success_plan_before =
+    JSON.parse(JSON.stringify(mutation_plan_state_success_plan));
+  const mutation_plan_state_failure_plan =
+    create_toolbar_mutation_plan("mutation-plan-state-failure-main");
+  mutation_plan_state_failure_plan._steps[1]._primitive._params._target_id = "missing-toolbar";
+  const mutation_plan_state_failure_plan_before =
+    JSON.parse(JSON.stringify(mutation_plan_state_failure_plan));
+
+  const append_mutation_plan_success_message_res =
+    await (create_toolbar_xvibe as any)._append_message({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _conversation_id: "mutation-plan-state-chat",
+        _message: {
+          _id: "mutation-plan-state-success-message",
+          _role: "assistant",
+          _text: "Toolbar plan",
+          _intent: {
+            _message_type: "planning",
+            _execution_level: "planning",
+            _should_mutate: false,
+            _confidence: 1,
+            _reason: "unit-test",
+            _artifact_type: "mutation-plan",
+            _artifact_request: mutation_plan_state_success_plan,
+            _actions: [
+              {
+                _id: "apply-mutation-plan-action",
+                _title: "Apply Plan",
+                _action_type: "apply-mutation-plan",
+                _status: "suggested",
+              },
+            ],
+            _warnings: [],
+          },
+        },
+      },
+    });
+  assert.equal(append_mutation_plan_success_message_res._ok, true);
+  const append_mutation_plan_failure_message_res =
+    await (create_toolbar_xvibe as any)._append_message({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _conversation_id: "mutation-plan-state-chat",
+        _message: {
+          _id: "mutation-plan-state-failure-message",
+          _role: "assistant",
+          _text: "Toolbar failure plan",
+          _intent: {
+            _message_type: "planning",
+            _execution_level: "planning",
+            _should_mutate: false,
+            _confidence: 1,
+            _reason: "unit-test",
+            _artifact_type: "mutation-plan",
+            _artifact_request: mutation_plan_state_failure_plan,
+            _actions: [],
+            _warnings: [],
+          },
+        },
+      },
+    });
+  assert.equal(append_mutation_plan_failure_message_res._ok, true);
+
+  const mutation_plan_state_before =
+    await (create_toolbar_xvibe as any)._get_conversation({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _conversation_id: "mutation-plan-state-chat",
+      },
+    });
+  assert.equal(mutation_plan_state_before._ok, true);
+  assert.equal(mutation_plan_state_before._result._messages.length, 2);
+
+  const mutation_plan_state_success_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "mutation-plan-state-chat",
+      _message_id: "mutation-plan-state-success-message",
+      _action_id: "apply-mutation-plan-action",
+      _plan: mutation_plan_state_success_plan,
+    },
+  } as any);
+  assert.equal(mutation_plan_state_success_result._ok, true);
+  assert.deepEqual(
+    mutation_plan_state_success_plan,
+    mutation_plan_state_success_plan_before,
+  );
+
+  const mutation_plan_state_failure_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "mutation-plan-state-chat",
+      _message_id: "mutation-plan-state-failure-message",
+      _plan: mutation_plan_state_failure_plan,
+    },
+  } as any);
+  assert.equal(mutation_plan_state_failure_result._ok, false);
+  assert.equal(mutation_plan_state_failure_result._completed_steps, 1);
+  assert.equal(mutation_plan_state_failure_result._failed_steps, 1);
+  assert.deepEqual(
+    mutation_plan_state_failure_plan,
+    mutation_plan_state_failure_plan_before,
+  );
+
+  const mutation_plan_state_after =
+    await (create_toolbar_xvibe as any)._get_conversation({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _conversation_id: "mutation-plan-state-chat",
+      },
+    });
+  assert.equal(mutation_plan_state_after._ok, true);
+  assert.equal(mutation_plan_state_after._result._messages.length, 2);
+  assert.equal(
+    mutation_plan_state_after._result._conversation._message_count,
+    2,
+  );
+  const persisted_success_plan_message =
+    mutation_plan_state_after._result._messages.find(
+      (message: any) => message._id === "mutation-plan-state-success-message",
+    );
+  const persisted_failure_plan_message =
+    mutation_plan_state_after._result._messages.find(
+      (message: any) => message._id === "mutation-plan-state-failure-message",
+    );
+  assert.ok(persisted_success_plan_message);
+  assert.ok(persisted_failure_plan_message);
+  assert.equal(persisted_success_plan_message._intent._artifact_status, "done");
+  assert.equal(
+    persisted_success_plan_message._intent._artifact_result._status,
+    "done",
+  );
+  assert.equal(
+    persisted_success_plan_message._intent._artifact_result._completed_steps,
+    3,
+  );
+  assert.equal(
+    persisted_success_plan_message._intent._artifact_result._failed_steps,
+    0,
+  );
+  assert.match(
+    persisted_success_plan_message._intent._artifact_result._completed_at,
+    /^\d{4}-\d{2}-\d{2}T/u,
+  );
+  assert.deepEqual(
+    persisted_success_plan_message._intent._artifact_result._steps.map((step: any) => ({
+      _id: step._id,
+      _status: step._status,
+    })),
+    [
+      { _id: "create-toolbar", _status: "done" },
+      { _id: "create-save-button", _status: "done" },
+      { _id: "create-cancel-button", _status: "done" },
+    ],
+  );
+  assert.equal(
+    persisted_success_plan_message._intent._actions[0]._status,
+    "done",
+  );
+  assert.equal(
+    persisted_success_plan_message._intent._actions[0]._result._completed_steps,
+    3,
+  );
+  assert.deepEqual(
+    persisted_success_plan_message._intent._artifact_request,
+    mutation_plan_state_success_plan_before,
+  );
+  assert.equal(persisted_failure_plan_message._intent._artifact_status, "failed");
+  assert.equal(
+    persisted_failure_plan_message._intent._artifact_result._status,
+    "failed",
+  );
+  assert.equal(
+    persisted_failure_plan_message._intent._artifact_result._completed_steps,
+    1,
+  );
+  assert.equal(
+    persisted_failure_plan_message._intent._artifact_result._failed_steps,
+    1,
+  );
+  assert.equal(
+    persisted_failure_plan_message._intent._artifact_result._failed_step_id,
+    "create-save-button",
+  );
+  assert.deepEqual(
+    persisted_failure_plan_message._intent._artifact_request,
+    mutation_plan_state_failure_plan_before,
+  );
+  assert.deepEqual(
+    persisted_success_plan_message._intent._artifact_request,
+    mutation_plan_state_success_plan_before,
+  );
+  assert_json_compatible_for_test(
+    persisted_success_plan_message._intent._artifact_result,
+    "persisted success mutation plan execution state",
+  );
+  assert_json_compatible_for_test(
+    persisted_failure_plan_message._intent._artifact_result,
+    "persisted failed mutation plan execution state",
+  );
+
+  const mutation_plan_state_messages_file =
+    path.join(
+      create_toolbar_work_folder,
+      "xvm",
+      "apps",
+      create_toolbar_env,
+      create_toolbar_app_id,
+      "conversations",
+      "mutation-plan-state-chat",
+      "messages.jsonl",
+    );
+  const mutation_plan_state_reloaded_messages =
+    (await readFile(mutation_plan_state_messages_file, "utf-8"))
+      .trim()
+      .split(/\r?\n/u)
+      .map((line) => JSON.parse(line));
+  assert.equal(mutation_plan_state_reloaded_messages.length, 2);
+  assert.equal(
+    mutation_plan_state_reloaded_messages[0]._intent._artifact_status,
+    "done",
+  );
+  assert.equal(
+    mutation_plan_state_reloaded_messages[1]._intent._artifact_status,
+    "failed",
+  );
+
+  const production_path_logs: Array<{ _message: string; _data: any }> = [];
+  const production_path_original_log = _xlog.log;
+  try {
+    (_xlog as any).log = (message: string, data?: any) => {
+      if (
+        message === "[xvibe] move object source resolved" ||
+        message === "[xvibe] move object destination resolved" ||
+        message === "[xvibe] mutation plan step" ||
+        message === "[xvibe] structured view edit persisted source view"
+      ) {
+        production_path_logs.push({ _message: message, _data: data });
+      }
+      return production_path_original_log.call(_xlog, message, data);
+    };
+
+    const production_path_engine = xvibe_test_intent_engine();
+    const production_path_plan_res =
+      await production_path_engine.analyze({
+        _message: "Create a toolbar and move Refresh and New Record into it.",
+        _runtime_context: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _active_view_id: "main",
+        },
+      });
+    assert_xvibe_mutation_plan(
+      production_path_plan_res,
+      {
+        _title: "Toolbar",
+        _min_steps: 3,
+        _executable_steps: 3,
+        _unsupported_steps: 0,
+        _can_apply: true,
+        _step_ids: [
+          "create-toolbar",
+          "move-refresh-button",
+          "move-new-record-button",
+        ],
+      },
+    );
+    assert.equal(production_path_plan_res._processor, "MutationPlanningProcessor");
+    const production_path_plan: any =
+      production_path_plan_res._intent?._artifact_request;
+    assert.ok(production_path_plan);
+    assert.deepEqual(
+      production_path_plan._steps.map((step: any) =>
+        step._primitive?._params?._edit_action
+      ),
+      ["create-toolbar", "move-object", "move-object"],
+    );
+    assert.deepEqual(
+      production_path_plan._steps.map((step: any) => step._primitive?._params),
+      [
+        {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+          _edit_action: "create-toolbar",
+          _location: "top",
+          _toolbar_props: {
+            _id: "main-toolbar",
+            _children: [],
+          },
+        },
+        {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+          _target_id: "Refresh",
+          _target_text: "Refresh",
+          _target_type: "button",
+          _edit_action: "move-object",
+          _position: "append",
+          _destination_id: "main-toolbar",
+          _destination_type: "toolbar",
+        },
+        {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+          _target_id: "New Record",
+          _target_text: "New Record",
+          _target_type: "button",
+          _edit_action: "move-object",
+          _position: "append",
+          _destination_id: "main-toolbar",
+          _destination_type: "toolbar",
+        },
+      ],
+    );
+
+    create_toolbar_xvibe_execute_order.length = 0;
+    const production_path_execute_result = await _x.execute({
+      _module: "xvibe",
+      _op: "apply-mutation-plan",
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _plan: production_path_plan,
+      },
+    } as any);
+    assert.equal(production_path_execute_result._ok, true);
+    assert.equal(production_path_execute_result._status, "done");
+    assert.equal(production_path_execute_result._completed_steps, 3);
+    assert.deepEqual(
+      production_path_execute_result._steps.map((step: any) => ({
+        _id: step._id,
+        _status: step._status,
+      })),
+      [
+        { _id: "create-toolbar", _status: "done" },
+        { _id: "move-refresh-button", _status: "done" },
+        { _id: "move-new-record-button", _status: "done" },
+      ],
+    );
+    assert.deepEqual(
+      create_toolbar_xvibe_execute_order,
+      [
+        "create-toolbar",
+        "move-object:Refresh",
+        "move-object:New Record",
+      ],
+    );
+    const source_resolution_logs =
+      production_path_logs.filter((entry) =>
+        entry._message === "[xvibe] move object source resolved"
+      );
+    const destination_resolution_logs =
+      production_path_logs.filter((entry) =>
+        entry._message === "[xvibe] move object destination resolved"
+      );
+    assert.deepEqual(
+      source_resolution_logs.map((entry) => ({
+        _requested_target: entry._data._requested_target,
+        _resolved_target_id: entry._data._resolved_target_id,
+        _strategy: entry._data._strategy,
+      })),
+      [
+        {
+          _requested_target: "Refresh",
+          _resolved_target_id: "main-refresh-button",
+          _strategy: "text",
+        },
+        {
+          _requested_target: "New Record",
+          _resolved_target_id: "main-new-record-button",
+          _strategy: "text",
+        },
+      ],
+    );
+    assert.deepEqual(
+      source_resolution_logs.map((entry) => entry._data._resolved_target_path),
+      [
+        ["main", "main-refresh-button"],
+        ["main", "main-new-record-button"],
+      ],
+    );
+    assert.deepEqual(
+      destination_resolution_logs.map((entry) => ({
+        _requested_destination: entry._data._requested_destination,
+        _resolved_destination_id: entry._data._resolved_destination_id,
+        _strategy: entry._data._strategy,
+      })),
+      [
+        {
+          _requested_destination: "main-toolbar",
+          _resolved_destination_id: "main-toolbar",
+          _strategy: "id",
+        },
+        {
+          _requested_destination: "main-toolbar",
+          _resolved_destination_id: "main-toolbar",
+          _strategy: "id",
+        },
+      ],
+    );
+    assert.deepEqual(
+      destination_resolution_logs.map((entry) => entry._data._resolved_destination_path),
+      [
+        ["main", "main-toolbar"],
+        ["main", "main-toolbar"],
+      ],
+    );
+
+    const production_path_view_after =
+      await (create_toolbar_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      production_path_view_after._result._view._children.map((child: any) => child._id),
+      ["main-toolbar"],
+    );
+    assert.deepEqual(
+      production_path_view_after._result._view._children[0]._children.map(
+        (child: any) => ({
+          _id: child._id,
+          _text: child._text,
+        }),
+      ),
+      [
+        {
+          _id: "main-refresh-button",
+          _text: "Refresh",
+        },
+        {
+          _id: "main-new-record-button",
+          _text: "New Record",
+        },
+      ],
+    );
+
+    const production_path_reloaded_server_xvm =
+      new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+    await (production_path_reloaded_server_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+      },
+    });
+    const production_path_reloaded_view =
+      await (production_path_reloaded_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      production_path_reloaded_view._result._view,
+      production_path_view_after._result._view,
+    );
+
+    create_toolbar_xvibe_execute_order.length = 0;
+    const production_path_retry_result = await _x.execute({
+      _module: "xvibe",
+      _op: "apply-mutation-plan",
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _plan: production_path_plan,
+      },
+    } as any);
+    assert.equal(production_path_retry_result._ok, true);
+    assert.equal(production_path_retry_result._completed_steps, 3);
+    assert.deepEqual(
+      create_toolbar_xvibe_execute_order,
+      ["create-toolbar"],
+    );
+    const production_path_retry_view_after =
+      await (create_toolbar_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "main",
+        },
+      });
+    assert.equal(
+      production_path_retry_view_after._result._view._children
+        .filter((child: any) => child._id === "main-toolbar")
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      production_path_retry_view_after._result._view._children[0]._children.map(
+        (child: any) => child._id,
+      ),
+      ["main-refresh-button", "main-new-record-button"],
+    );
+  } finally {
+    (_xlog as any).log = production_path_original_log;
+  }
+
+  const anonymous_plan_logs: Array<{ _message: string; _data: any }> = [];
+  const anonymous_plan_original_log = (_xlog as any).log;
+  try {
+    (_xlog as any).log = (message: string, data?: any) => {
+      if (
+        message === "[xvibe] move object eligibility resolution" ||
+        message === "[xvibe] move object source resolved" ||
+        message === "[xvibe] move object destination resolved" ||
+        message === "[xvibe] mutation plan execution completed"
+      ) {
+        anonymous_plan_logs.push({ _message: message, _data: data });
+      }
+      return anonymous_plan_original_log.call(_xlog, message, data);
+    };
+
+    const anonymous_plan_engine = xvibe_test_intent_engine();
+    const anonymous_plan_res =
+      await anonymous_plan_engine.analyze({
+        _message: "Create a toolbar and move Refresh and New Record into it.",
+        _runtime_context: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _active_view_id: "anonymous-plan-main",
+        },
+      });
+    assert.equal(anonymous_plan_res._processor, "MutationPlanningProcessor");
+    assert_xvibe_mutation_plan(
+      anonymous_plan_res,
+      {
+        _title: "Toolbar",
+        _min_steps: 3,
+        _executable_steps: 3,
+        _unsupported_steps: 0,
+        _can_apply: true,
+        _step_ids: [
+          "create-toolbar",
+          "move-refresh-button",
+          "move-new-record-button",
+        ],
+      },
+    );
+    const anonymous_plan: any =
+      anonymous_plan_res._intent?._artifact_request;
+    assert.deepEqual(
+      anonymous_plan._steps.map((step: any) => step._primitive?._params?._edit_action),
+      ["create-toolbar", "move-object", "move-object"],
+    );
+
+    const anonymous_plan_execute_result = await _x.execute({
+      _module: "xvibe",
+      _op: "apply-mutation-plan",
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _plan: anonymous_plan,
+      },
+    } as any);
+    assert.equal(anonymous_plan_execute_result._ok, true);
+    assert.equal(anonymous_plan_execute_result._status, "done");
+    assert.equal(anonymous_plan_execute_result._completed_steps, 3);
+    assert.equal(anonymous_plan_execute_result._failed_steps, 0);
+    assert.equal(
+      anonymous_plan_logs.some((entry) =>
+        entry._message === "[xvibe] move object eligibility resolution" &&
+        entry._data?._ok === true &&
+        entry._data?._resolved_target_id === undefined &&
+        Array.isArray(entry._data?._resolved_target_path)
+      ),
+      true,
+    );
+    assert.equal(
+      anonymous_plan_logs.some((entry) =>
+        entry._message === "[xvibe] move object source resolved" &&
+        entry._data?._resolved_target_id === undefined &&
+        Array.isArray(entry._data?._resolved_target_path)
+      ),
+      true,
+    );
+    assert.equal(
+      anonymous_plan_logs.some((entry) =>
+        entry._message === "[xvibe] move object destination resolved" &&
+        entry._data?._resolved_destination_id === "anonymous-plan-main-toolbar"
+      ),
+      true,
+    );
+    const anonymous_plan_view_after =
+      await (create_toolbar_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "anonymous-plan-main",
+        },
+      });
+    assert.deepEqual(
+      anonymous_plan_view_after._result._view._children.map((child: any) => child._id),
+      ["anonymous-plan-main-toolbar"],
+    );
+    assert.deepEqual(
+      anonymous_plan_view_after._result._view._children[0]._children.map(
+        (child: any) => ({
+          _id: child._id,
+          _text: child._text,
+        }),
+      ),
+      [
+        {
+          _id: undefined,
+          _text: "Refresh",
+        },
+        {
+          _id: undefined,
+          _text: "New Record",
+        },
+      ],
+    );
+    const anonymous_plan_reloaded_server_xvm =
+      new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+    await (anonymous_plan_reloaded_server_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+      },
+    });
+    const anonymous_plan_reloaded_view =
+      await (anonymous_plan_reloaded_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "anonymous-plan-main",
+        },
+      });
+    assert.deepEqual(
+      anonymous_plan_reloaded_view._result._view,
+      anonymous_plan_view_after._result._view,
+    );
+
+    const anonymous_plan_retry_result = await _x.execute({
+      _module: "xvibe",
+      _op: "apply-mutation-plan",
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _plan: anonymous_plan,
+      },
+    } as any);
+    assert.equal(anonymous_plan_retry_result._ok, true);
+    assert.equal(anonymous_plan_retry_result._completed_steps, 3);
+    const anonymous_plan_retry_view_after =
+      await (create_toolbar_server_xvm as any)._get_view({
+        _params: {
+          _app_id: create_toolbar_app_id,
+          _env: create_toolbar_env,
+          _view_id: "anonymous-plan-main",
+        },
+      });
+    assert.equal(
+      anonymous_plan_retry_view_after._result._view._children
+        .filter((child: any) => child._id === "anonymous-plan-main-toolbar")
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      anonymous_plan_retry_view_after._result._view._children[0]._children.map(
+        (child: any) => child._text,
+      ),
+      ["Refresh", "New Record"],
+    );
+  } finally {
+    (_xlog as any).log = anonymous_plan_original_log;
+  }
+
+  const dist_xvibe_module_source =
+    await readFile(
+      path.join(process.cwd(), "dist", "XVIBE", "XVibeModule.js"),
+      "utf-8",
+    ).catch(() => "");
+  assert.ok(
+    dist_xvibe_module_source.includes("[xvibe] move object eligibility resolution"),
+  );
+
+  const built_entry: any = await import("./index.js");
+  const built_work_folder =
+    await mkdtemp(path.join(tmpdir(), "xvibe-built-entry-mutation-plan-"));
+  const built_server_xvm =
+    new built_entry.ServerXVMModule({ _work_folder: built_work_folder });
+  const built_xvibe =
+    new built_entry.XVibeModule();
+  const built_app_id = "built-entry-mutation-plan-app";
+  const built_env = "test";
+  const built_logs: Array<{ _message: string; _data: any }> = [];
+  const built_execute_order: string[] = [];
+  const built_original_execute = built_entry._x.execute;
+  const built_original_log = built_entry._xlog.log;
+  let built_active_server_xvm = built_server_xvm;
+  try {
+    built_entry._xlog.log = (message: string, data?: any) => {
+      if (
+        message === "[xvibe] move object eligibility input" ||
+        message === "[xvibe] move object eligibility resolution" ||
+        message === "[xvibe] move object source resolved" ||
+        message === "[xvibe] move object destination resolved" ||
+        message === "[xvibe] mutation plan execution completed"
+      ) {
+        built_logs.push({ _message: message, _data: data });
+      }
+      return built_original_log.call(built_entry._xlog, message, data);
+    };
+    built_entry._x.execute = async (command: any) => {
+      if (command?._module === "xvibe") {
+        const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+        const method = (built_xvibe as any)[method_name];
+        if (typeof method === "function") {
+          if (command?._op === "apply-view-edit") {
+            const target_text =
+              command?._params?._target_text ?? command?._params?._target_id;
+            built_execute_order.push(
+              command?._params?._edit_action === "move-object" &&
+                typeof target_text === "string"
+                ? `move-object:${target_text}`
+                : command?._params?._edit_action === "add-child" &&
+                  typeof command?._params?._child?._id === "string"
+                  ? `add-child:${command._params._child._id}`
+                : String(command?._params?._edit_action),
+            );
+          }
+          return method.call(built_xvibe, command);
+        }
+      }
+
+      if (command?._module === "server-xvm") {
+        const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+        const method = (built_active_server_xvm as any)[method_name];
+        if (typeof method === "function") {
+          return method.call(built_active_server_xvm, command);
+        }
+      }
+
+      return built_original_execute.call(built_entry._x, command);
+    };
+
+    await built_entry._x.execute({
+      _module: "server-xvm",
+      _op: "create-app",
+      _params: {
+        _app_id: built_app_id,
+        _env: built_env,
+        _entry_view_id: "main",
+      },
+    });
+    await built_entry._x.execute({
+      _module: "server-xvm",
+      _op: "push-update",
+      _params: {
+        _app_id: built_app_id,
+        _env: built_env,
+        _view: {
+          _id: "main",
+          _type: "view",
+          _children: [
+            {
+              _type: "button",
+              _text: "Refresh",
+            },
+            {
+              _type: "button",
+              _text: "New Record",
+            },
+          ],
+        },
+      },
+    });
+    await built_entry._x.execute({
+      _module: "server-xvm",
+      _op: "push-update",
+      _params: {
+        _app_id: built_app_id,
+        _env: built_env,
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _children: [
+            {
+              _id: "homepage-title",
+              _type: "label",
+              _text: "Meals",
+            },
+          ],
+        },
+      },
+    });
+
+    const built_processor_module: any =
+      await import("./XVIBE/Processors/DeterministicIntentProcessor.js");
+    const built_button_processor =
+      new built_processor_module.DeterministicIntentProcessor();
+    const built_button_intent =
+      await built_button_processor.analyze({
+        _message: 'Add an "Add Meal" button to the homepage.',
+        _runtime_context: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _active_view_id: "main",
+        },
+      });
+    assert.equal(built_button_intent?._reason, "deterministic_button_creation");
+    assert.deepEqual(
+      built_button_intent?._actions?.[0]?._execution_payload,
+      {
+        _module: "xvibe",
+        _op: "apply-view-edit",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "homepage",
+          _target_id: "homepage",
+          _target_type: "view",
+          _edit_action: "add-child",
+          _location: "bottom",
+          _child: {
+            _type: "button",
+            _id: "add-meal-button",
+            _text: "Add Meal",
+          },
+        },
+      },
+    );
+    built_execute_order.length = 0;
+    const built_button_apply_result =
+      await built_entry._x.execute(
+        built_button_intent?._actions?.[0]?._execution_payload,
+      );
+    assert.equal(built_button_apply_result._ok, true);
+    assert.equal(built_button_apply_result._mutation_action, "add-child");
+    assert.equal(built_button_apply_result._target_id, "homepage");
+    assert.deepEqual(built_execute_order, ["add-child:add-meal-button"]);
+    const built_homepage_after =
+      await built_entry._x.execute({
+        _module: "server-xvm",
+        _op: "get-view",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      built_homepage_after._result._view._children,
+      [
+        {
+          _id: "homepage-title",
+          _type: "label",
+          _text: "Meals",
+        },
+        {
+          _type: "button",
+          _id: "add-meal-button",
+          _text: "Add Meal",
+        },
+      ],
+    );
+    built_execute_order.length = 0;
+    const built_button_retry_result =
+      await built_entry._x.execute(
+        built_button_intent?._actions?.[0]?._execution_payload,
+      );
+    assert.equal(built_button_retry_result._ok, true);
+    assert.equal(built_button_retry_result._reason, "already_exists");
+    const built_homepage_retry_after =
+      await built_entry._x.execute({
+        _module: "server-xvm",
+        _op: "get-view",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "homepage",
+        },
+      });
+    assert.equal(
+      built_homepage_retry_after._result._view._children
+        .filter((child: any) => child._id === "add-meal-button")
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      built_homepage_retry_after._result._view,
+      built_homepage_after._result._view,
+    );
+
+    const built_mutation_plan = {
+      _type: "mutation-plan",
+      _title: "Toolbar",
+      _goal: "Create a toolbar and move Refresh and New Record into it.",
+      _summary: "This change requires several deterministic mutations.",
+      _estimated_mutations: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _status: "planned",
+      _steps: [
+        {
+          _id: "create-toolbar",
+          _title: "Create toolbar",
+          _status: "planned",
+          _primitive: {
+            _module: "xvibe",
+            _op: "apply-view-edit",
+            _params: {
+              _app_id: built_app_id,
+              _env: built_env,
+              _view_id: "main",
+              _edit_action: "create-toolbar",
+              _location: "top",
+              _toolbar_props: {
+                _id: "main-toolbar",
+                _children: [],
+              },
+            },
+          },
+        },
+        {
+          _id: "move-refresh-button",
+          _title: "Move Refresh button",
+          _status: "planned",
+          _primitive: {
+            _module: "xvibe",
+            _op: "apply-view-edit",
+            _params: {
+              _app_id: built_app_id,
+              _env: built_env,
+              _view_id: "main",
+              _target_id: "Refresh",
+              _target_type: "button",
+              _edit_action: "move-object",
+              _position: "append",
+              _destination_id: "main-toolbar",
+              _destination_type: "toolbar",
+            },
+          },
+        },
+        {
+          _id: "move-new-record-button",
+          _title: "Move New Record button",
+          _status: "planned",
+          _primitive: {
+            _module: "xvibe",
+            _op: "apply-view-edit",
+            _params: {
+              _app_id: built_app_id,
+              _env: built_env,
+              _view_id: "main",
+              _target_id: "New Record",
+              _target_type: "button",
+              _edit_action: "move-object",
+              _position: "append",
+              _destination_id: "main-toolbar",
+              _destination_type: "toolbar",
+            },
+          },
+        },
+      ],
+    };
+    const built_acceptance_envelope = {
+      _module: "xvibe",
+      _op: "apply-mutation-plan",
+      _params: {
+        _app_id: built_app_id,
+        _env: built_env,
+        _conversation_id: "built-entry-conversation",
+        _message_id: "built-entry-message",
+        _plan: built_mutation_plan,
+      },
+    };
+
+    built_execute_order.length = 0;
+    const built_acceptance_result =
+      await built_entry._x.execute(built_acceptance_envelope);
+    assert.equal(built_acceptance_result._ok, true);
+    assert.equal(built_acceptance_result._status, "done");
+    assert.equal(built_acceptance_result._completed_steps, 3);
+    assert.equal(built_acceptance_result._failed_steps, 0);
+    assert.deepEqual(
+      built_execute_order,
+      [
+        "create-toolbar",
+        "move-object:Refresh",
+        "move-object:New Record",
+      ],
+    );
+    assert.equal(
+      built_logs.some((entry) =>
+        entry._message === "[xvibe] move object eligibility resolution" &&
+        entry._data?._ok === true &&
+        entry._data?._resolved_target_id === undefined &&
+        JSON.stringify(entry._data?._resolved_target_path) ===
+          JSON.stringify(["main", "1"])
+      ),
+      true,
+    );
+    assert.equal(
+      built_logs.some((entry) =>
+        entry._message === "[xvibe] move object source resolved" &&
+        entry._data?._resolved_target_id === undefined &&
+        JSON.stringify(entry._data?._resolved_target_path) ===
+          JSON.stringify(["main", "1"])
+      ),
+      true,
+    );
+    assert.equal(
+      built_logs.some((entry) =>
+        entry._message === "[xvibe] move object destination resolved" &&
+        entry._data?._resolved_destination_id === "main-toolbar"
+      ),
+      true,
+    );
+    assert.equal(
+      built_logs.some((entry) =>
+        entry._message === "[xvibe] mutation plan execution completed" &&
+        entry._data?._completed_steps === 3 &&
+        entry._data?._failed_steps === 0 &&
+        entry._data?._status === "done"
+      ),
+      true,
+    );
+
+    const built_view_after =
+      await built_entry._x.execute({
+        _module: "server-xvm",
+        _op: "get-view",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      built_view_after._result._view._children.map((child: any) => child._id),
+      ["main-toolbar"],
+    );
+    assert.deepEqual(
+      built_view_after._result._view._children[0]._children.map(
+        (child: any) => ({
+          _id: child._id,
+          _text: child._text,
+        }),
+      ),
+      [
+        {
+          _id: undefined,
+          _text: "Refresh",
+        },
+        {
+          _id: undefined,
+          _text: "New Record",
+        },
+      ],
+    );
+
+    built_active_server_xvm =
+      new built_entry.ServerXVMModule({ _work_folder: built_work_folder });
+    await built_entry._x.execute({
+      _module: "server-xvm",
+      _op: "load-app-from-disk",
+      _params: {
+        _app_id: built_app_id,
+        _env: built_env,
+      },
+    });
+    const built_reloaded_view =
+      await built_entry._x.execute({
+        _module: "server-xvm",
+        _op: "get-view",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      built_reloaded_view._result._view,
+      built_view_after._result._view,
+    );
+
+    built_execute_order.length = 0;
+    const built_retry_result =
+      await built_entry._x.execute(built_acceptance_envelope);
+    assert.equal(built_retry_result._ok, true);
+    assert.equal(built_retry_result._completed_steps, 3);
+    assert.deepEqual(built_execute_order, ["create-toolbar"]);
+    const built_retry_view_after =
+      await built_entry._x.execute({
+        _module: "server-xvm",
+        _op: "get-view",
+        _params: {
+          _app_id: built_app_id,
+          _env: built_env,
+          _view_id: "main",
+        },
+      });
+    assert.equal(
+      built_retry_view_after._result._view._children
+        .filter((child: any) => child._id === "main-toolbar")
+        .length,
+      1,
+    );
+    assert.deepEqual(
+      built_retry_view_after._result._view._children[0]._children.map(
+        (child: any) => child._text,
+      ),
+      ["Refresh", "New Record"],
+    );
+  } finally {
+    built_entry._x.execute = built_original_execute;
+    built_entry._xlog.log = built_original_log;
+    await rm(built_work_folder, { recursive: true, force: true });
+  }
+
+  set_xvibe_semantic_intent_env("true", "button-flow-composition");
+  let button_flow_composition_semantic_calls = 0;
+  const button_flow_composition_engine = xvibe_test_intent_engine({
+    _semantic_generate_json: async () => {
+      button_flow_composition_semantic_calls += 1;
+      return XVIBE_SEMANTIC_VALID_INTENT;
+    },
+  });
+  const button_flow_composition_plan_res =
+    await button_flow_composition_engine.analyze({
+      _message: "Create a Save button in the main toolbar and bind it to save-project.",
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "button-flow-main",
+      },
+    });
+  assert.equal(button_flow_composition_plan_res._processor, "MutationPlanningProcessor");
+  assert_xvibe_mutation_plan(
+    button_flow_composition_plan_res,
+    {
+      _title: "Save Button Flow Binding",
+      _min_steps: 2,
+      _executable_steps: 2,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "add-save-button-to-toolbar",
+        "bind-save-button-to-save-project",
+      ],
+    },
+  );
+  assert.equal(button_flow_composition_semantic_calls, 0);
+  const button_flow_composition_plan: any =
+    button_flow_composition_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    button_flow_composition_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["add-child", "bind-flow"],
+  );
+  assert.deepEqual(
+    button_flow_composition_plan._steps.map((step: any) => step._primitive?._params),
+    [
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "button-flow-main",
+        _target_id: "main-toolbar",
+        _target_type: "toolbar",
+        _edit_action: "add-child",
+        _location: "bottom",
+        _child: {
+          _type: "button",
+          _id: "save-button",
+          _text: "Save",
+        },
+      },
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "button-flow-main",
+        _target_id: "save-button",
+        _target_type: "button",
+        _edit_action: "bind-flow",
+        _flow: {
+          _id: "save-project",
+          _payload: {},
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    ],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const button_flow_composition_apply_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "button-flow-composition-conversation",
+      _message_id: "button-flow-composition-message",
+      _plan: button_flow_composition_plan,
+    },
+  } as any);
+  assert.equal(button_flow_composition_apply_result._ok, true);
+  assert.equal(button_flow_composition_apply_result._status, "done");
+  assert.equal(button_flow_composition_apply_result._completed_steps, 2);
+  assert.equal(button_flow_composition_apply_result._failed_steps, 0);
+  assert.deepEqual(
+    button_flow_composition_apply_result._steps.map((step: any) => ({
+      _id: step._id,
+      _status: step._status,
+    })),
+    [
+      { _id: "add-save-button-to-toolbar", _status: "done" },
+      { _id: "bind-save-button-to-save-project", _status: "done" },
+    ],
+  );
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "add-child:save-button",
+      "bind-flow:save-button",
+    ],
+  );
+
+  const button_flow_composition_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "button-flow-main",
+      },
+    });
+  const button_flow_composition_toolbar =
+    button_flow_composition_view_after._result._view._children[0];
+  assert.equal(button_flow_composition_toolbar._id, "main-toolbar");
+  assert.equal(button_flow_composition_toolbar._children.length, 1);
+  assert.deepEqual(
+    button_flow_composition_toolbar._children[0],
+    {
+      _type: "button",
+      _id: "save-button",
+      _text: "Save",
+      _flow: {
+        _id: "save-project",
+        _payload: {},
+      },
+      _flow_event: "click",
+      _flow_auto: true,
+    },
+  );
+
+  const button_flow_composition_reloaded_xvm =
+    new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+  await (button_flow_composition_reloaded_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+    },
+  });
+  const button_flow_composition_reloaded_view =
+    await (button_flow_composition_reloaded_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "button-flow-main",
+      },
+    });
+  assert.deepEqual(
+    button_flow_composition_reloaded_view._result._view,
+    button_flow_composition_view_after._result._view,
+  );
+
+  const button_flow_composition_listener_ids: string[] = [];
+  const button_flow_composition_start_counts = {
+    _flow_client_trigger: create_toolbar_flow_client_trigger_count,
+    _flow_run: create_toolbar_flow_run_count,
+    _xd_set: create_toolbar_xd_set_count,
+  };
+  _xd.delete("save-status", { source: "button-flow-composition-reset" });
+  try {
+    button_flow_composition_listener_ids.push(
+      _xem.on("ui:flow-trigger", async (payload: any) => {
+        assert.equal(payload?._flow_id, "save-project");
+        assert.equal(payload?._event_name, "click");
+        assert.equal(payload?._object_id, "save-button");
+        await (_x as any).execute({
+          _module: "flow-client",
+          _op: "trigger",
+          _params: {
+            _flow_id: payload._flow_id,
+            _event_name: payload._event_name,
+            _event_payload:
+              payload?._event_payload &&
+              typeof payload._event_payload === "object"
+                ? payload._event_payload
+                : {},
+            _object_id: payload._object_id,
+            _app_id: payload._app_id,
+            _env: payload._env,
+            _source: "ui",
+          },
+        });
+      }),
+    );
+
+    const save_button =
+      button_flow_composition_reloaded_view._result._view._children[0]._children[0];
+    await _xem.fire("ui:flow-trigger", {
+      _flow_id: save_button._flow._id,
+      _event_name: save_button._flow_event,
+      _event_payload: save_button._flow._payload,
+      _object_id: save_button._id,
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _source: "ui",
+    });
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  } finally {
+    for (const listener_id of button_flow_composition_listener_ids) {
+      _xem.remove(listener_id);
+    }
+  }
+  assert.equal(
+    create_toolbar_flow_client_trigger_count,
+    button_flow_composition_start_counts._flow_client_trigger + 1,
+  );
+  assert.equal(
+    create_toolbar_flow_run_count,
+    button_flow_composition_start_counts._flow_run + 1,
+  );
+  assert.equal(
+    create_toolbar_xd_set_count,
+    button_flow_composition_start_counts._xd_set + 1,
+  );
+  assert.deepEqual(
+    create_toolbar_flow_client_commands[
+      create_toolbar_flow_client_commands.length - 1
+    ],
+    {
+      _module: "flow-client",
+      _op: "trigger",
+      _params: {
+        _flow_id: "save-project",
+        _event_name: "click",
+        _event_payload: {},
+        _object_id: "save-button",
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _source: "ui",
+      },
+    },
+  );
+  assert.deepEqual(
+    create_toolbar_flow_run_commands[
+      create_toolbar_flow_run_commands.length - 1
+    ],
+    {
+      _module: "flow",
+      _op: "run",
+      _params: {
+        _flow_id: "save-project",
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _event_payload: {},
+        _event_name: "click",
+      },
+    },
+  );
+  assert.equal(_xd.get("save-status"), "Project saved");
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const button_flow_composition_retry_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: button_flow_composition_plan,
+    },
+  } as any);
+  assert.equal(button_flow_composition_retry_result._ok, true);
+  assert.equal(button_flow_composition_retry_result._completed_steps, 2);
+  assert.deepEqual(create_toolbar_xvibe_execute_order, []);
+  const button_flow_composition_retry_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "button-flow-main",
+      },
+    });
+  assert.equal(
+    button_flow_composition_retry_view_after._result._view._children[0]._children
+      .filter((child: any) => child._id === "save-button")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    button_flow_composition_retry_view_after._result._view._children[0]._children[0]._flow,
+    {
+      _id: "save-project",
+      _payload: {},
+    },
+  );
+
+  const entity_list_semantic_calls_before =
+    button_flow_composition_semantic_calls;
+  const entity_list_plan_res =
+    await button_flow_composition_engine.analyze({
+      _message: "Show recent Meal records on the homepage.",
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "home",
+      },
+    });
+  assert.equal(entity_list_plan_res._processor, "MutationPlanningProcessor");
+  assert_xvibe_mutation_plan(
+    entity_list_plan_res,
+    {
+      _title: "Meal Entity List",
+      _min_steps: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "require-wormhole-for-meal-records",
+        "load-recent-meal-records",
+        "add-recent-meal-records-table",
+      ],
+    },
+  );
+  assert.equal(
+    button_flow_composition_semantic_calls,
+    entity_list_semantic_calls_before,
+  );
+  const missing_entity_list_plan_res =
+    await button_flow_composition_engine.analyze({
+      _message: "Show recent Snack records on the homepage.",
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "home",
+      },
+    });
+  assert.equal(missing_entity_list_plan_res._processor, "MutationPlanningProcessor");
+  assert_xvibe_mutation_plan(
+    missing_entity_list_plan_res,
+    {
+      _title: "Snack Entity List",
+      _min_steps: 2,
+      _executable_steps: 0,
+      _unsupported_steps: 2,
+      _can_apply: false,
+      _step_ids: [
+        "load-recent-snack-records",
+        "add-recent-snack-records-table",
+      ],
+    },
+  );
+  assert.deepEqual(
+    missing_entity_list_plan_res._intent?._artifact_request?._steps.map(
+      (step: any) => step._reason,
+    ),
+    ["entity_not_found", "entity_not_found"],
+  );
+  assert.equal(
+    button_flow_composition_semantic_calls,
+    entity_list_semantic_calls_before,
+  );
+  const entity_list_plan: any =
+    entity_list_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    entity_list_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["update-property", "update-property", "add-child"],
+  );
+  assert.deepEqual(
+    entity_list_plan._steps.map((step: any) => step._primitive?._params),
+    [
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+        _target_id: "homepage",
+        _target_type: "view",
+        _edit_action: "update-property",
+        _property_name: "_requires",
+        _property_value: [`system.ready.server-xvm.${create_toolbar_env}.${create_toolbar_app_id}.subscribed`],
+      },
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+        _target_id: "homepage",
+        _target_type: "view",
+        _edit_action: "update-property",
+        _property_name: "_on_mount",
+        _property_value: {
+          _mode: "chain",
+          _stop_on_error: true,
+          _commands: [
+            {
+              _module: "xd",
+              _op: "set",
+              _params: {
+                key: "meal:records",
+                value: [],
+                source: "entity-list:on-mount",
+              },
+            },
+            test_entity_manager_call_server(
+              "find",
+              {
+                _app_id: create_toolbar_app_id,
+                _env: create_toolbar_env,
+                _entity: "meal",
+                _filter: {},
+                _sort: {
+                  _sort_by: "_created_at",
+                  _sort_order: "desc",
+                },
+                _limit: 10,
+              },
+              {
+                key: "meal:records",
+                path: "_records._data",
+              },
+            ),
+          ],
+        },
+      },
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+        _target_id: "homepage",
+        _target_type: "view",
+        _edit_action: "add-child",
+        _location: "bottom",
+        _child: {
+          _id: "recent-meal-records",
+          _type: "table",
+          _data_source: "meal:records",
+          _empty_text: "No meal records yet.",
+          _query: {
+            _entity: "meal",
+            _filter: {},
+            _sort: {
+              _sort_by: "_created_at",
+              _sort_order: "desc",
+            },
+            _limit: 10,
+          },
+          _columns: [
+            {
+              _key: "name",
+              _label: "Name",
+            },
+            {
+              _key: "calories",
+              _label: "Calories",
+            },
+            {
+              _key: "notes",
+              _label: "Notes",
+            },
+          ],
+        },
+      },
+    ],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const entity_list_apply_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "entity-list-conversation",
+      _message_id: "entity-list-message",
+      _plan: entity_list_plan,
+    },
+  } as any);
+  assert.equal(entity_list_apply_result._ok, true);
+  assert.equal(entity_list_apply_result._status, "done");
+  assert.equal(entity_list_apply_result._completed_steps, 3);
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "update-property",
+      "update-property",
+      "add-child:recent-meal-records",
+    ],
+  );
+
+  const entity_list_home_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+    },
+  });
+  assert.deepEqual(
+    entity_list_home_after._result._view._requires,
+    entity_list_plan._steps[0]._primitive._params._property_value,
+  );
+  assert.deepEqual(
+    entity_list_home_after._result._view._on_mount,
+    entity_list_plan._steps[1]._primitive._params._property_value,
+  );
+  const entity_list_table_after =
+    entity_list_home_after._result._view._children.find(
+      (child: any) => child._id === "recent-meal-records",
+    );
+  assert.deepEqual(
+    entity_list_table_after,
+    entity_list_plan._steps[2]._primitive._params._child,
+  );
+
+  const entity_list_reloaded_xvm =
+    new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+  await (entity_list_reloaded_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+    },
+  });
+  const entity_list_reloaded_home =
+    await (entity_list_reloaded_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+      },
+    });
+  assert.deepEqual(
+    entity_list_reloaded_home._result._view,
+    entity_list_home_after._result._view,
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const entity_list_retry_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: entity_list_plan,
+    },
+  } as any);
+  assert.equal(entity_list_retry_result._ok, true);
+  assert.equal(entity_list_retry_result._completed_steps, 3);
+  assert.deepEqual(create_toolbar_xvibe_execute_order, []);
+  const entity_list_retry_home_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "homepage",
+      },
+    });
+  assert.equal(
+    entity_list_retry_home_after._result._view._children
+      .filter((child: any) => child._id === "recent-meal-records")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    entity_list_retry_home_after._result._view._on_mount,
+    entity_list_home_after._result._view._on_mount,
+  );
+
+  const meal_modal_plan_res =
+    await button_flow_composition_engine.analyze({
+      _message: "Make the Add Meal button open the create-meal view in a modal.",
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "home",
+      },
+    });
+  assert.equal(meal_modal_plan_res._processor, "MutationPlanningProcessor");
+  assert_xvibe_mutation_plan(
+    meal_modal_plan_res,
+    {
+      _title: "Add Meal Modal",
+      _min_steps: 2,
+      _executable_steps: 2,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-create-meal-modal",
+        "bind-add-meal-button-to-modal",
+      ],
+    },
+  );
+  assert.equal(button_flow_composition_semantic_calls, 0);
+  const meal_modal_plan: any =
+    meal_modal_plan_res._intent?._artifact_request;
+  assert.deepEqual(
+    meal_modal_plan._steps.map((step: any) =>
+      step._primitive?._params?._edit_action
+    ),
+    ["add-child", "update-property"],
+  );
+  assert.deepEqual(
+    meal_modal_plan._steps.map((step: any) => step._primitive?._params),
+    [
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "home",
+        _target_id: "home",
+        _target_type: "view",
+        _edit_action: "add-child",
+        _location: "bottom",
+        _child: {
+          _type: "modal",
+          _id: "create-meal-modal",
+          _open: false,
+          _title: "Add Meal",
+          _size: "lg",
+          _closable: true,
+          _close_on_backdrop: true,
+          _children: [
+            {
+              _type: "xvm-view",
+              _view_id: "create-meal",
+            },
+          ],
+        },
+      },
+      {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "home",
+        _target_id: "add-meal-button",
+        _target_type: "button",
+        _edit_action: "update-property",
+        _property_name: "_on",
+        _property_value: {
+          _focus: {
+            _op: "add-class",
+            _params: {
+              class: "is-focused",
+            },
+          },
+          _click: {
+            _op: "open-object",
+            _params: {
+              _id: "create-meal-modal",
+            },
+          },
+        },
+      },
+    ],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const meal_modal_apply_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _conversation_id: "meal-modal-conversation",
+      _message_id: "meal-modal-message",
+      _plan: meal_modal_plan,
+    },
+  } as any);
+  assert.equal(meal_modal_apply_result._ok, true);
+  assert.equal(meal_modal_apply_result._status, "done");
+  assert.equal(meal_modal_apply_result._completed_steps, 2);
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "add-child:create-meal-modal",
+      "update-property",
+    ],
+  );
+
+  const meal_modal_home_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "home",
+      },
+    });
+  const meal_modal_after =
+    meal_modal_home_after._result._view._children.find(
+      (child: any) => child._id === "create-meal-modal",
+    );
+  assert.deepEqual(
+    meal_modal_after,
+    {
+      _type: "modal",
+      _id: "create-meal-modal",
+      _open: false,
+      _title: "Add Meal",
+      _size: "lg",
+      _closable: true,
+      _close_on_backdrop: true,
+      _children: [
+        {
+          _id: "xvm-view",
+          _type: "xvm-view",
+          _view_id: "create-meal",
+        },
+      ],
+    },
+  );
+  const meal_modal_button_after =
+    meal_modal_home_after._result._view._children.find(
+      (child: any) => child._id === "add-meal-button",
+    );
+  assert.deepEqual(
+    meal_modal_button_after?._on,
+    {
+      _focus: {
+        _op: "add-class",
+        _params: {
+          class: "is-focused",
+        },
+      },
+      _click: {
+        _op: "open-object",
+        _params: {
+          _id: "create-meal-modal",
+        },
+      },
+    },
+  );
+
+  const meal_modal_reloaded_xvm =
+    new ServerXVMModule({ _work_folder: create_toolbar_work_folder });
+  await (meal_modal_reloaded_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+    },
+  });
+  const meal_modal_reloaded_home =
+    await (meal_modal_reloaded_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "home",
+      },
+    });
+  assert.deepEqual(
+    meal_modal_reloaded_home._result._view,
+    meal_modal_home_after._result._view,
+  );
+
+  const meal_modal_runtime_modal = {
+    ...meal_modal_after,
+    open() {
+      this._open = true;
+    },
+  };
+  const meal_modal_runtime_objects: Record<string, any> = {
+    "create-meal-modal": meal_modal_runtime_modal,
+  };
+  const meal_modal_click_handler =
+    meal_modal_button_after?._on?._click;
+  assert.equal(meal_modal_click_handler?._op, "open-object");
+  meal_modal_runtime_objects[
+    meal_modal_click_handler._params._id
+  ]?.open?.();
+  assert.equal(meal_modal_runtime_modal._open, true);
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const meal_modal_retry_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: meal_modal_plan,
+    },
+  } as any);
+  assert.equal(meal_modal_retry_result._ok, true);
+  assert.equal(meal_modal_retry_result._completed_steps, 2);
+  assert.deepEqual(create_toolbar_xvibe_execute_order, []);
+  const meal_modal_retry_home_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "home",
+      },
+    });
+  assert.equal(
+    meal_modal_retry_home_after._result._view._children
+      .filter((child: any) => child._id === "create-meal-modal")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    meal_modal_retry_home_after._result._view._children.find(
+      (child: any) => child._id === "add-meal-button",
+    )?._on,
+    meal_modal_button_after._on,
+  );
+  set_xvibe_semantic_intent_env(undefined);
+
+  const composed_mutation_plan_engine = xvibe_test_intent_engine();
+  const composed_mutation_plan_res =
+    await composed_mutation_plan_engine.analyze({
+      _message: "Create a toolbar and move Refresh and New Record into it",
+      _runtime_context: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _active_view_id: "mutation-plan-move-main",
+      },
+    });
+  assert_xvibe_mutation_plan(
+    composed_mutation_plan_res,
+    {
+      _title: "Toolbar",
+      _min_steps: 3,
+      _executable_steps: 3,
+      _unsupported_steps: 0,
+      _can_apply: true,
+      _step_ids: [
+        "create-toolbar",
+        "move-refresh-button",
+        "move-new-record-button",
+      ],
+    },
+  );
+  const composed_mutation_plan: any =
+    composed_mutation_plan_res._intent?._artifact_request;
+  assert.ok(composed_mutation_plan);
+  assert.deepEqual(
+    composed_mutation_plan._steps.map((step: any) =>
+      step._primitive._params._edit_action
+    ),
+    ["create-toolbar", "move-object", "move-object"],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const composed_mutation_plan_execute_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: composed_mutation_plan,
+    },
+  } as any);
+  assert.equal(composed_mutation_plan_execute_result._ok, true);
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "create-toolbar",
+      "move-object:Refresh",
+      "move-object:New Record",
+    ],
+  );
+  const composed_mutation_plan_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "mutation-plan-move-main",
+      },
+    });
+  assert.deepEqual(
+    composed_mutation_plan_view_after._result._view._children.map((child: any) => child._id),
+    ["mutation-plan-move-main-toolbar"],
+  );
+  assert.deepEqual(
+    composed_mutation_plan_view_after._result._view._children[0]._children.map(
+      (child: any) => ({
+        _id: child._id,
+        _text: child._text,
+      }),
+    ),
+    [
+      {
+        _id: "refresh-button",
+        _text: "Refresh",
+      },
+      {
+        _id: "new-record-button",
+        _text: "New Record",
+      },
+    ],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const composed_mutation_plan_retry_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: composed_mutation_plan,
+    },
+  } as any);
+  assert.equal(composed_mutation_plan_retry_result._ok, true);
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    ["create-toolbar"],
+  );
+  const composed_mutation_plan_retry_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "mutation-plan-move-main",
+      },
+    });
+  assert.equal(
+    composed_mutation_plan_retry_view_after._result._view._children
+      .filter((child: any) => child._id === "mutation-plan-move-main-toolbar")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    composed_mutation_plan_retry_view_after._result._view._children[0]._children.map(
+      (child: any) => child._id,
+    ),
+    ["refresh-button", "new-record-button"],
+  );
+
+  create_toolbar_xvibe_execute_order.length = 0;
+  const mutation_plan_failure_plan =
+    create_toolbar_mutation_plan("mutation-plan-failure-main");
+  mutation_plan_failure_plan._steps[1]._primitive._params._target_id = "missing-toolbar";
+  const mutation_plan_failure_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: mutation_plan_failure_plan,
+    },
+  } as any);
+  assert.equal(mutation_plan_failure_result._ok, false);
+  assert.equal(mutation_plan_failure_result._status, "failed");
+  assert.equal(mutation_plan_failure_result._completed_steps, 1);
+  assert.equal(mutation_plan_failure_result._failed_steps, 1);
+  assert.equal(mutation_plan_failure_result._failed_step_id, "create-save-button");
+  assert.equal(mutation_plan_failure_result._steps.length, 2);
+  assert.deepEqual(
+    create_toolbar_xvibe_execute_order,
+    [
+      "create-toolbar",
+      "add-child:save-button",
+    ],
+  );
+  const mutation_plan_failure_view_after =
+    await (create_toolbar_server_xvm as any)._get_view({
+      _params: {
+        _app_id: create_toolbar_app_id,
+        _env: create_toolbar_env,
+        _view_id: "mutation-plan-failure-main",
+      },
+    });
+  assert.equal(mutation_plan_failure_view_after._result._view._children.length, 1);
+  assert.deepEqual(
+    mutation_plan_failure_view_after._result._view._children[0]._children,
+    [],
+  );
+
+  const mutation_plan_not_ready_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: create_toolbar_mutation_plan("mutation-plan-reject-main", {
+        _can_apply: false,
+        _unsupported_steps: 1,
+      }),
+    },
+  } as any);
+  assert.equal(mutation_plan_not_ready_result._ok, false);
+  assert.equal(
+    mutation_plan_not_ready_result._error._code,
+    "E_XVIBE_MUTATION_PLAN_NOT_READY",
+  );
+
+  const mutation_plan_malformed_plan =
+    create_toolbar_mutation_plan("mutation-plan-reject-main");
+  mutation_plan_malformed_plan._steps[0]._primitive._module = "server-xvm";
+  const mutation_plan_malformed_result = await _x.execute({
+    _module: "xvibe",
+    _op: "apply-mutation-plan",
+    _params: {
+      _app_id: create_toolbar_app_id,
+      _env: create_toolbar_env,
+      _plan: mutation_plan_malformed_plan,
+    },
+  } as any);
+  assert.equal(mutation_plan_malformed_result._ok, false);
+  assert.equal(
+    mutation_plan_malformed_result._error._code,
+    "E_XVIBE_MUTATION_PLAN_PRIMITIVE_NOT_ALLOWED",
+  );
+} finally {
+  (_x as any).execute = original_execute;
+  (_x as any).getSkills = original_get_skills;
+  (_x as any).getModule = original_get_module;
+  await rm(create_toolbar_work_folder, { recursive: true, force: true });
+}
+
 const apply_view_edit_work_folder =
   await mkdtemp(path.join(tmpdir(), "xvibe-apply-view-edit-"));
 try {
@@ -11803,9 +22238,18 @@ try {
   const apply_view_edit_xvibe = new XVibeModule();
   const apply_view_edit_app_id = "apply-view-edit-app";
   const apply_view_edit_env = "test";
+  const apply_view_edit_flow_manager = new FlowManagerModule();
   let apply_view_edit_xai_generate_count = 0;
   let apply_view_edit_push_update_count = 0;
+  let apply_view_edit_project_memory_patch_count = 0;
+  let apply_view_edit_server_flow_run_count = 0;
+  let apply_view_edit_flow_client_trigger_count = 0;
+  let apply_view_edit_flow_client_output_write_count = 0;
+  let apply_view_edit_server_xvm_get_flow_count = 0;
+  let apply_view_edit_project_save_count = 0;
   const apply_view_edit_push_update_view_ids: string[] = [];
+  const apply_view_edit_flow_client_commands: any[] = [];
+  const apply_view_edit_flow_run_commands: any[] = [];
   const apply_view_edit_runtime_skills = {
     _modules: [
       {
@@ -11845,6 +22289,51 @@ try {
       _entry_view_id: "main",
     },
   });
+  await (apply_view_edit_server_xvm as any)._set_flow({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _flow: {
+        _id: "save-project",
+        _steps: [
+          {
+            _id: "save",
+            _command: {
+              _module: "project",
+              _op: "save",
+              _params: {},
+            },
+            _output: {
+              _to: {
+                _type: "xdata",
+                _key: "xvibe.bind_flow.runtime.saved",
+              },
+              _value: "$step.save._result",
+            },
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._set_flow({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _flow: {
+        _id: "refresh-data",
+        _steps: [
+          {
+            _id: "refresh",
+            _command: {
+              _module: "data",
+              _op: "refresh",
+              _params: {},
+            },
+          },
+        ],
+      },
+    },
+  });
   await (apply_view_edit_server_xvm as any)._push_update({
     _params: {
       _app_id: apply_view_edit_app_id,
@@ -11863,6 +22352,193 @@ try {
             _id: "toolbar-ref",
             _type: "xvm-view",
             _view_id: "page-toolbar",
+          },
+          {
+            _id: "dashboard-title-in-main",
+            _type: "label",
+            _text: "Dashboard",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "bind-flow-runtime-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "runtime-save-button",
+            _type: "button",
+            _text: "Save",
+            _class: "primary",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "visual-edit-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "visual-dashboard-title",
+            _type: "label",
+            _text: "Dashboard",
+            _style: {
+              color: "red",
+              "font-weight": "600",
+            },
+          },
+          {
+            _id: "refresh-button",
+            _type: "button",
+            _text: "Refresh",
+            class: "refresh",
+          },
+          {
+            _id: "secondary-refresh-button",
+            _type: "button",
+            _text: "Secondary Refresh",
+            _class: "secondary primary",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "bind-flow-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "save-button",
+            _type: "button",
+            _text: "Save",
+            _class: "primary",
+          },
+          {
+            _id: "refresh-bind-button",
+            _type: "button",
+            _text: "Refresh",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "bind-flow-anonymous-main",
+        _type: "view",
+        _children: [
+          {
+            _type: "button",
+            _text: "Save",
+            _style: {
+              color: "green",
+            },
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "text-replacement-no-id-main",
+        _type: "view",
+        _children: [
+          {
+            _type: "label",
+            _text: "Dashboard",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "text-replacement-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "dashboard-heading",
+            _type: "label",
+            _text: "Dashboard",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "property-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "dashboard-title",
+            _type: "label",
+            _text: "Dashboard",
+          },
+          {
+            _id: "subtitle-label",
+            _type: "label",
+            _text: "Subtitle",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "simple-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "simple-title",
+            _type: "label",
+            _text: "Simple Title",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "object-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "object-title",
+            _type: "label",
+            _text: "Object Title",
           },
         ],
       },
@@ -12019,7 +22695,67 @@ try {
       },
     },
   });
-
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "memory-view",
+        _type: "view",
+        _children: [
+          {
+            _id: "memory-childless",
+            _type: "label",
+            _text: "Memory Childless",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "target-text-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "new-record-label",
+            _type: "label",
+            _text: "+ New Record",
+          },
+          {
+            _id: "new-record-button",
+            _type: "button",
+            _text: "+ New Record",
+          },
+        ],
+      },
+    },
+  });
+  await (apply_view_edit_server_xvm as any)._push_update({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _view: {
+        _id: "ambiguous-target-text-main",
+        _type: "view",
+        _children: [
+          {
+            _id: "new-record-button-a",
+            _type: "button",
+            _text: "+ New Record",
+          },
+          {
+            _id: "new-record-button-b",
+            _type: "button",
+            _text: "New Record",
+          },
+        ],
+      },
+    },
+  });
   (xvibe as any).latest_runtime_skills = apply_view_edit_runtime_skills;
   (_x as any).getModule = (name: string) =>
     name === "server-xvm"
@@ -12041,8 +22777,97 @@ try {
               : "";
           if (view_id) apply_view_edit_push_update_view_ids.push(view_id);
         }
+        if (method_name === "_patch_project_memory") {
+          apply_view_edit_project_memory_patch_count += 1;
+        }
+        if (method_name === "_get_flow") {
+          apply_view_edit_server_xvm_get_flow_count += 1;
+        }
         return method.call(apply_view_edit_server_xvm, command);
       }
+    }
+
+    if (command?._module === "xvibe" && command?._op === "apply-view-edit") {
+      return (apply_view_edit_xvibe as any)._apply_view_edit(command);
+    }
+
+    if (command?._module === "flow-client" && command?._op === "trigger") {
+      apply_view_edit_flow_client_trigger_count += 1;
+      apply_view_edit_flow_client_commands.push(command);
+      const params = command?._params ?? {};
+      const flow_run_command = {
+        _module: "flow",
+        _op: "run",
+        _params: {
+          _flow_id: params._flow_id,
+          _app_id: params._app_id,
+          ...(params._env !== undefined ? { _env: params._env } : {}),
+          _event_payload:
+            params._event_payload &&
+            typeof params._event_payload === "object"
+              ? params._event_payload
+              : {},
+          ...(typeof params._event_name === "string"
+            ? { _event_name: params._event_name }
+            : {}),
+        },
+      };
+      apply_view_edit_flow_run_commands.push(flow_run_command);
+      const flow_run_result = await (_x as any).execute(flow_run_command);
+      const flow = flow_run_result?._flow ?? flow_run_result?._result?._flow;
+      if (flow?._outputs && typeof flow._outputs === "object") {
+        for (const key of Object.keys(flow._outputs)) {
+          const raw = flow._outputs[key];
+          const value =
+            raw &&
+            typeof raw === "object" &&
+            raw._ok === true &&
+            Object.prototype.hasOwnProperty.call(raw, "_result")
+              ? raw._result
+              : raw;
+          _xd.set(key, value, { source: "flow-client" });
+          apply_view_edit_flow_client_output_write_count += 1;
+        }
+      }
+      await _xem.fire("flow:completed", {
+        _flow_id: params._flow_id,
+        _app_id: params._app_id,
+        _env: params._env ?? "default",
+        _event_payload: params._event_payload ?? {},
+        _result: flow_run_result,
+      });
+      return {
+        _ok: true,
+        _queued: true,
+        _flow_id: params._flow_id,
+        _result: flow_run_result,
+      };
+    }
+
+    if (command?._module === "flow" && command?._op === "run") {
+      apply_view_edit_server_flow_run_count += 1;
+      return (apply_view_edit_flow_manager as any)._run(command);
+    }
+
+    if (command?._module === "project" && command?._op === "save") {
+      apply_view_edit_project_save_count += 1;
+      return {
+        _ok: true,
+        _result: {
+          _saved: true,
+          _attempt: apply_view_edit_project_save_count,
+          _event_title: command?._params?._title,
+        },
+      };
+    }
+
+    if (command?._module === "data" && command?._op === "refresh") {
+      return {
+        _ok: true,
+        _result: {
+          _refreshed: true,
+        },
+      };
     }
 
     if (command?._module === "xai" && command?._op === "generate") {
@@ -12052,6 +22877,190 @@ try {
 
     throw new Error(`Unexpected command ${JSON.stringify(command)}`);
   };
+
+  const apply_view_edit_memory_patch_count_before_section =
+    apply_view_edit_project_memory_patch_count;
+  const apply_view_edit_memory_section_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "memory-view",
+        _edit_action: "add-child",
+        _target_id: "memory-view",
+        _child: {
+          _id: "customer-list-section",
+          _type: "xsection",
+          _children: [
+            {
+              _id: "customer-list-section-title",
+              _type: "label",
+              _text: "Customer List",
+            },
+          ],
+        },
+      },
+    });
+  assert.equal(apply_view_edit_memory_section_result._ok, true);
+  assert.equal(apply_view_edit_memory_section_result._mutation_action, "add-child");
+  assert.equal(
+    apply_view_edit_project_memory_patch_count,
+    apply_view_edit_memory_patch_count_before_section + 2,
+  );
+  const apply_view_edit_memory_after_section =
+    await (apply_view_edit_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+      },
+    });
+  const apply_view_edit_memory_completed =
+    apply_view_edit_memory_after_section._result._memory._completed as any[];
+  const apply_view_edit_memory_achievements =
+    apply_view_edit_memory_after_section._result._memory._achievements as any[];
+  assert.equal(apply_view_edit_memory_completed.length, 1);
+  assert.equal(
+    apply_view_edit_memory_achievements
+      .filter((achievement) =>
+        achievement?._id === "first-suggested-action-applied"
+      )
+      .length,
+    1,
+  );
+  const apply_view_edit_memory_suggested_action_achievement =
+    apply_view_edit_memory_achievements.find((achievement) =>
+      achievement?._id === "first-suggested-action-applied"
+    );
+  assert.deepEqual(
+    {
+      ...apply_view_edit_memory_suggested_action_achievement,
+      _completed_at: "<iso>",
+    },
+    {
+      _id: "first-suggested-action-applied",
+      _title: "First suggested action applied",
+      _type: "onboarding",
+      _completed_at: "<iso>",
+    },
+  );
+  assert.ok(
+    Number.isFinite(Date.parse(apply_view_edit_memory_suggested_action_achievement._completed_at))
+  );
+  assert.deepEqual(
+    {
+      ...apply_view_edit_memory_completed[0],
+      _created_at: "<iso>",
+    },
+    {
+      _id: "customer-list-section",
+      _title: "Customer List section",
+      _type: "view-section",
+      _source: "suggested-action",
+      _created_at: "<iso>",
+    },
+  );
+  assert.ok(Number.isFinite(Date.parse(apply_view_edit_memory_completed[0]._created_at)));
+
+  const apply_view_edit_memory_patch_count_before_duplicate =
+    apply_view_edit_project_memory_patch_count;
+  const apply_view_edit_memory_duplicate_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "memory-view",
+        _edit_action: "add-child",
+        _target_id: "memory-view",
+        _child: {
+          _id: "customer-list-section",
+          _type: "xsection",
+          _children: [
+            {
+              _id: "customer-list-section-title-duplicate",
+              _type: "label",
+              _text: "Customer List",
+            },
+          ],
+        },
+      },
+    });
+  assert.equal(apply_view_edit_memory_duplicate_result._ok, true);
+  assert.equal(
+    apply_view_edit_project_memory_patch_count,
+    apply_view_edit_memory_patch_count_before_duplicate,
+  );
+  const apply_view_edit_memory_after_duplicate =
+    await (apply_view_edit_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+      },
+    });
+  assert.equal(
+    (apply_view_edit_memory_after_duplicate._result._memory._completed as any[])
+      .filter((item) => item?._id === "customer-list-section")
+      .length,
+    1,
+  );
+  assert.equal(
+    (apply_view_edit_memory_after_duplicate._result._memory._achievements as any[])
+      .filter((achievement) =>
+        achievement?._id === "first-suggested-action-applied"
+      )
+      .length,
+    1,
+  );
+
+  const apply_view_edit_memory_patch_count_before_failed =
+    apply_view_edit_project_memory_patch_count;
+  const apply_view_edit_memory_failed_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "memory-view",
+        _edit_action: "add-child",
+        _target_id: "memory-childless",
+        _target_type: "label",
+        _child: {
+          _id: "failed-section",
+          _type: "xsection",
+          _children: [
+            {
+              _id: "failed-section-title",
+              _type: "label",
+              _text: "Failed",
+            },
+          ],
+        },
+      },
+    });
+  assert.equal(apply_view_edit_memory_failed_result._ok, false);
+  assert.equal(apply_view_edit_memory_failed_result._reason, "target_without_children");
+  assert.equal(
+    apply_view_edit_project_memory_patch_count,
+    apply_view_edit_memory_patch_count_before_failed,
+  );
+  const apply_view_edit_memory_after_failed =
+    await (apply_view_edit_server_xvm as any)._get_project_memory({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+      },
+    });
+  assert.equal(
+    (apply_view_edit_memory_after_failed._result._memory._completed as any[])
+      .some((item) => item?._id === "failed-section"),
+    false,
+  );
+  assert.equal(
+    (apply_view_edit_memory_after_failed._result._memory._achievements as any[])
+      .filter((achievement) =>
+        achievement?._id === "first-suggested-action-applied"
+      )
+      .length,
+    1,
+  );
 
   const apply_view_edit_text_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
@@ -12087,6 +23096,52 @@ try {
     "Updated Title",
   );
 
+  const apply_view_edit_dashboard_to_main_set_styles_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "dashboard",
+        _current_view_id: "main",
+        _edit_action: "set-styles",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _styles: {
+          "font-size": "32px",
+          "font-weight": "bold",
+          "margin-bottom": "16px",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_dashboard_to_main_set_styles_result._ok, true);
+  assert.equal(apply_view_edit_dashboard_to_main_set_styles_result._artifact_id, "main");
+  assert.equal(apply_view_edit_dashboard_to_main_set_styles_result._mutation_action, "set-styles");
+  assert.equal(apply_view_edit_dashboard_to_main_set_styles_result._target_id, "dashboard-title-in-main");
+  assert.deepEqual(apply_view_edit_dashboard_to_main_set_styles_result._styles_applied, {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  });
+  const apply_view_edit_main_after_dashboard_styles =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(
+      apply_view_edit_main_after_dashboard_styles._result._view,
+      "dashboard-title-in-main",
+    )?._style,
+    {
+      "font-size": "32px",
+      "font-weight": "bold",
+      "margin-bottom": "16px",
+    },
+  );
+
   const apply_view_edit_class_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
       _params: {
@@ -12114,6 +23169,648 @@ try {
   assert.equal(
     apply_view_edit_main_after_class._result._view._children[0].class,
     "title new",
+  );
+
+  const apply_view_edit_update_text_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "text-replacement-main",
+        _edit_action: "update-property",
+        _target_id: "Dashboard",
+        _property_name: "_text",
+        _property_value: "My App",
+      },
+    });
+  assert.equal(apply_view_edit_update_text_by_visible_text_result._ok, true);
+  assert.equal(
+    apply_view_edit_update_text_by_visible_text_result._mutation_action,
+    "set-property",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_visible_text_result._target_id,
+    "dashboard-heading",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_visible_text_result._result._mutation._resolved_by,
+    "text",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_visible_text_result._result._mutation._property_name,
+    "_text",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_visible_text_result._result._mutation._next_value,
+    "My App",
+  );
+  const apply_view_edit_text_replacement_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "text-replacement-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_text_replacement_after._result._view, "dashboard-heading")?._text,
+    "My App",
+  );
+
+  const apply_view_edit_update_text_by_no_id_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "text-replacement-no-id-main",
+        _edit_action: "update-property",
+        _target_id: "Dashboard",
+        _property_name: "_text",
+        _property_value: "My App",
+      },
+    });
+  assert.equal(apply_view_edit_update_text_by_no_id_visible_text_result._ok, true);
+  assert.equal(
+    apply_view_edit_update_text_by_no_id_visible_text_result._mutation_action,
+    "set-property",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_no_id_visible_text_result._target_id,
+    "Dashboard",
+  );
+  assert.equal(
+    apply_view_edit_update_text_by_no_id_visible_text_result._result._mutation._resolved_by,
+    "text",
+  );
+  const apply_view_edit_text_replacement_no_id_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "text-replacement-no-id-main",
+      },
+    });
+  assert.equal(
+    apply_view_edit_text_replacement_no_id_after._result._view._children[0]._text,
+    "My App",
+  );
+  assert.equal(
+    apply_view_edit_text_replacement_no_id_after._result._view._children[0]._id,
+    undefined,
+  );
+
+  const apply_view_edit_update_title_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+        _edit_action: "update-property",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _property_name: "title",
+        _property_value: "My App",
+      },
+    });
+  assert.equal(apply_view_edit_update_title_result._ok, true);
+  assert.equal(apply_view_edit_update_title_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_update_title_result._target_id, "dashboard-title");
+  assert.equal(apply_view_edit_update_title_result._result._mutation._property_name, "_text");
+  assert.equal(apply_view_edit_update_title_result._result._mutation._previous_value, "Dashboard");
+  assert.equal(apply_view_edit_update_title_result._result._mutation._next_value, "My App");
+
+  const apply_view_edit_property_after_title =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_property_after_title._result._view, "dashboard-title")?._text,
+    "My App",
+  );
+
+  const apply_view_edit_update_label_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+        _edit_action: "update-property",
+        _target_id: "Subtitle",
+        _target_type: "label",
+        _property_name: "_text",
+        _property_value: "Updated Subtitle",
+      },
+    });
+  assert.equal(apply_view_edit_update_label_text_result._ok, true);
+  assert.equal(apply_view_edit_update_label_text_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_update_label_text_result._target_id, "subtitle-label");
+  assert.equal(apply_view_edit_update_label_text_result._result._mutation._property_name, "_text");
+  const apply_view_edit_property_after_label_text =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_property_after_label_text._result._view, "subtitle-label")?._text,
+    "Updated Subtitle",
+  );
+
+  const apply_view_edit_set_style_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "set-style",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _style_property: "font-size",
+        _style_value: "32px",
+      },
+    });
+  assert.equal(apply_view_edit_set_style_by_visible_text_result._ok, true);
+  assert.equal(apply_view_edit_set_style_by_visible_text_result._mutation_action, "set-style");
+  assert.equal(apply_view_edit_set_style_by_visible_text_result._target_id, "visual-dashboard-title");
+  assert.equal(
+    apply_view_edit_set_style_by_visible_text_result._result._mutation._resolved_by,
+    "text",
+  );
+  const apply_view_edit_visual_after_style =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  const apply_view_edit_visual_title_after_style =
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_style._result._view,
+      "visual-dashboard-title",
+    );
+  assert.deepEqual(apply_view_edit_visual_title_after_style?._style, {
+    color: "red",
+    "font-weight": "600",
+    "font-size": "32px",
+  });
+
+  const apply_view_edit_set_styles_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "set-styles",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _styles: {
+          fontWeight: "700",
+          marginBottom: "16px",
+          backgroundColor: "blue",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_set_styles_by_visible_text_result._ok, true);
+  assert.equal(apply_view_edit_set_styles_by_visible_text_result._mutation_action, "set-styles");
+  assert.equal(apply_view_edit_set_styles_by_visible_text_result._target_id, "visual-dashboard-title");
+  assert.deepEqual(apply_view_edit_set_styles_by_visible_text_result._styles_applied, {
+    "font-weight": "700",
+    "margin-bottom": "16px",
+    "background-color": "blue",
+  });
+  assert.deepEqual(apply_view_edit_set_styles_by_visible_text_result._previous_styles, {
+    "font-weight": "600",
+  });
+  const apply_view_edit_visual_after_set_styles =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_set_styles._result._view,
+      "visual-dashboard-title",
+    )?._style,
+    {
+      color: "red",
+      "font-weight": "700",
+      "font-size": "32px",
+      "margin-bottom": "16px",
+      "background-color": "blue",
+    },
+  );
+
+  const apply_view_edit_set_style_properties_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "set-style",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _style_properties: {
+          "font-size": "32px",
+          "font-weight": "bold",
+          "margin-bottom": "16px",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_set_style_properties_result._ok, true);
+  assert.equal(apply_view_edit_set_style_properties_result._mutation_action, "set-styles");
+  assert.equal(apply_view_edit_set_style_properties_result._target_id, "visual-dashboard-title");
+  assert.deepEqual(apply_view_edit_set_style_properties_result._styles_applied, {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  });
+  assert.deepEqual(apply_view_edit_set_style_properties_result._previous_styles, {
+    "font-size": "32px",
+    "font-weight": "700",
+    "margin-bottom": "16px",
+  });
+  const apply_view_edit_visual_after_style_properties =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_style_properties._result._view,
+      "visual-dashboard-title",
+    )?._style,
+    {
+      color: "red",
+      "font-weight": "bold",
+      "font-size": "32px",
+      "margin-bottom": "16px",
+      "background-color": "blue",
+    },
+  );
+
+  const apply_view_edit_update_properties_styles_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "update-properties",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _properties: {
+          styles: {
+            "font-size": "32px",
+            "font-weight": "bold",
+            "margin-bottom": "16px",
+          },
+        },
+      },
+    });
+  assert.equal(apply_view_edit_update_properties_styles_result._ok, true);
+  assert.equal(apply_view_edit_update_properties_styles_result._mutation_action, "set-styles");
+  assert.equal(apply_view_edit_update_properties_styles_result._target_id, "visual-dashboard-title");
+  assert.deepEqual(apply_view_edit_update_properties_styles_result._styles_applied, {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  });
+  assert.deepEqual(apply_view_edit_update_properties_styles_result._previous_styles, {
+    "font-size": "32px",
+    "font-weight": "bold",
+    "margin-bottom": "16px",
+  });
+  const apply_view_edit_visual_after_update_properties_styles =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_update_properties_styles._result._view,
+      "visual-dashboard-title",
+    )?._style,
+    {
+      color: "red",
+      "font-weight": "bold",
+      "font-size": "32px",
+      "margin-bottom": "16px",
+      "background-color": "blue",
+    },
+  );
+
+  set_xvibe_semantic_intent_env("true", "mock-semantic-provider");
+  try {
+    const apply_view_edit_semantic_style_app_id =
+      "semantic-style-apply-app";
+    await (apply_view_edit_server_xvm as any)._create_app({
+      _params: {
+        _app_id: apply_view_edit_semantic_style_app_id,
+        _env: apply_view_edit_env,
+        _entry_view_id: "main",
+      },
+    });
+    await (apply_view_edit_server_xvm as any)._push_update({
+      _params: {
+        _app_id: apply_view_edit_semantic_style_app_id,
+        _env: apply_view_edit_env,
+        _view: {
+          _id: "main",
+          _type: "view",
+          _children: [
+            {
+              _id: "app-title-real",
+              _type: "label",
+              _text: "My App",
+            },
+          ],
+        },
+      },
+    });
+    const apply_view_edit_semantic_style_processor =
+      new SemanticIntentProcessor({
+        _generate_json: async () => ({
+          _message_type: "edit",
+          _execution_level: "artifact",
+          _should_mutate: true,
+          _confidence: 0.86,
+          _reason: "mock_semantic_structural_style_apply",
+          _actions: [
+            {
+              _id: "semantic-structural-style-apply",
+              _title: "Update app title styles",
+              _action_type: "apply-view-edit",
+              _status: "suggested",
+              _params: {
+                _view_id: "main",
+                _target_id: "label-my-app",
+                _target_type: "label",
+                _edit_action: "set-element-styles",
+                styles: {
+                  fontSize: "32px",
+                  fontWeight: "bold",
+                  marginBottom: "16px",
+                },
+              },
+            },
+          ],
+          _warnings: [],
+        }),
+      });
+    const apply_view_edit_semantic_main_before =
+      await (apply_view_edit_server_xvm as any)._get_view({
+        _params: {
+          _app_id: apply_view_edit_semantic_style_app_id,
+          _env: apply_view_edit_env,
+          _view_id: "main",
+        },
+      });
+    const apply_view_edit_semantic_style_intent =
+      await apply_view_edit_semantic_style_processor.analyze({
+        _message: 'update label "My App" to font size 32px, bold, with 16px margin below.',
+        _runtime_context: {
+          _app_id: apply_view_edit_semantic_style_app_id,
+          _env: apply_view_edit_env,
+          _active_view_id: "main",
+          _current_view: apply_view_edit_semantic_main_before._result._view,
+          _available_artifacts: {
+            _views: ["main"],
+          },
+        },
+      });
+    const apply_view_edit_semantic_style_action =
+      apply_view_edit_semantic_style_intent?._actions[0];
+    assert.equal(apply_view_edit_semantic_style_intent?._message_type, "edit");
+    assert.equal(apply_view_edit_semantic_style_action?._executable, true);
+    assert.equal(
+      apply_view_edit_semantic_style_action?._params?._edit_action,
+      "set-styles",
+    );
+    assert.equal(
+      apply_view_edit_semantic_style_action?._params?._target_id,
+      "app-title-real",
+    );
+    assert.deepEqual(
+      apply_view_edit_semantic_style_action?._params?._styles,
+      {
+        "font-size": "32px",
+        "font-weight": "bold",
+        "margin-bottom": "16px",
+      },
+    );
+
+    const apply_view_edit_semantic_style_apply_result =
+      await (apply_view_edit_xvibe as any)._apply_view_edit({
+        _params: apply_view_edit_semantic_style_action?._execution_payload?._params,
+      });
+    assert.equal(apply_view_edit_semantic_style_apply_result._ok, true);
+    assert.equal(
+      apply_view_edit_semantic_style_apply_result._mutation_action,
+      "set-styles",
+    );
+    assert.equal(
+      apply_view_edit_semantic_style_apply_result._target_id,
+      "app-title-real",
+    );
+    assert.deepEqual(
+      apply_view_edit_semantic_style_apply_result._styles_applied,
+      {
+        "font-size": "32px",
+        "font-weight": "bold",
+        "margin-bottom": "16px",
+      },
+    );
+    const apply_view_edit_semantic_main_after =
+      await (apply_view_edit_server_xvm as any)._get_view({
+        _params: {
+          _app_id: apply_view_edit_semantic_style_app_id,
+          _env: apply_view_edit_env,
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      find_xui_node_for_test(
+        apply_view_edit_semantic_main_after._result._view,
+        "app-title-real",
+      )?._style,
+      {
+        "font-size": "32px",
+        "font-weight": "bold",
+        "margin-bottom": "16px",
+      },
+    );
+  } finally {
+    set_xvibe_semantic_intent_env(undefined);
+  }
+
+  const apply_view_edit_remove_style_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "remove-style",
+        _target_id: "Dashboard",
+        _target_type: "label",
+        _style_property: "font-weight",
+      },
+    });
+  assert.equal(apply_view_edit_remove_style_by_visible_text_result._ok, true);
+  assert.equal(apply_view_edit_remove_style_by_visible_text_result._mutation_action, "remove-style");
+  const apply_view_edit_visual_after_remove_style =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_remove_style._result._view,
+      "visual-dashboard-title",
+    )?._style,
+    {
+      color: "red",
+      "font-size": "32px",
+      "margin-bottom": "16px",
+      "background-color": "blue",
+    },
+  );
+
+  const apply_view_edit_add_class_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "add-class",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _class_name: "primary",
+      },
+    });
+  assert.equal(apply_view_edit_add_class_by_visible_text_result._ok, true);
+  assert.equal(apply_view_edit_add_class_by_visible_text_result._mutation_action, "add-class");
+  assert.equal(apply_view_edit_add_class_by_visible_text_result._target_id, "refresh-button");
+
+  const apply_view_edit_add_duplicate_class_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "add-class",
+        _target_id: "Refresh",
+        _target_type: "button",
+        _class_name: "primary",
+      },
+    });
+  assert.equal(apply_view_edit_add_duplicate_class_by_visible_text_result._ok, true);
+  const apply_view_edit_visual_after_add_class =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_visual_after_add_class._result._view, "refresh-button")?.class,
+    "refresh primary",
+  );
+
+  const apply_view_edit_remove_class_by_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+        _edit_action: "remove-class",
+        _target_id: "Secondary Refresh",
+        _target_type: "button",
+        _class_name: "primary",
+      },
+    });
+  assert.equal(apply_view_edit_remove_class_by_visible_text_result._ok, true);
+  assert.equal(apply_view_edit_remove_class_by_visible_text_result._mutation_action, "remove-class");
+  assert.equal(apply_view_edit_remove_class_by_visible_text_result._target_id, "secondary-refresh-button");
+  const apply_view_edit_visual_after_remove_class =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "visual-edit-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(
+      apply_view_edit_visual_after_remove_class._result._view,
+      "secondary-refresh-button",
+    )?._class,
+    "secondary",
+  );
+
+  const apply_view_edit_update_root_property_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+        _edit_action: "update-property",
+        _target_type: "view",
+        _property_name: "class",
+        _property_value: "property-root",
+      },
+    });
+  assert.equal(apply_view_edit_update_root_property_result._ok, true);
+  assert.equal(apply_view_edit_update_root_property_result._mutation_action, "set-property");
+  assert.equal(apply_view_edit_update_root_property_result._target_id, "property-main");
+  const apply_view_edit_property_after_root =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+      },
+    });
+  assert.equal(apply_view_edit_property_after_root._result._view.class, "property-root");
+
+  const apply_view_edit_push_count_before_unknown_update_property =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_unknown_update_property_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "property-main",
+        _edit_action: "update-property",
+        _target_id: "subtitle-label",
+        _target_type: "label",
+        _property_name: "dangerous",
+        _property_value: "Nope",
+      },
+    });
+  assert.equal(apply_view_edit_unknown_update_property_result._ok, false);
+  assert.equal(apply_view_edit_unknown_update_property_result._reason, "unsupported_property");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_unknown_update_property,
   );
 
   const apply_view_edit_design_value_result =
@@ -12337,6 +24034,226 @@ try {
       },
     });
   assert.equal(JSON.stringify(apply_view_edit_design_host_after._result._view), apply_view_edit_design_host_before);
+
+  const apply_view_edit_footer_label_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "simple-main",
+        _edit_action: "add-child",
+        _target_id: "simple-main",
+        _parent_id: "simple-main",
+        _location: "footer",
+        _component_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_footer_label_result._ok, true);
+  assert.equal(apply_view_edit_footer_label_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_footer_label_result._parent_id, "simple-main");
+  assert.equal(apply_view_edit_footer_label_result._insert_index, 1);
+  assert.equal(apply_view_edit_footer_label_result._result._mutation._resolved_by, "id");
+  assert.equal(apply_view_edit_footer_label_result._result._mutation._child_type, "label");
+  const apply_view_edit_simple_after_footer =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "simple-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_simple_after_footer._result._view._children.map((child: any) => child._text),
+    ["Simple Title", "New Footer Label"],
+  );
+  assert.equal(
+    apply_view_edit_simple_after_footer._result._view._children[1].class,
+    "xvibe-generated-label xvibe-footer-label",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(
+        path.join(
+          apply_view_edit_work_folder,
+          "xvm",
+          "apps",
+          apply_view_edit_env,
+          apply_view_edit_app_id,
+          "views",
+          "simple-main.json",
+        ),
+        "utf-8",
+      ),
+    )._children.map((child: any) => child._text),
+    ["Simple Title", "New Footer Label"],
+  );
+
+  const apply_view_edit_header_label_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "simple-main",
+        _edit_action: "add-child",
+        _target_id: "main",
+        _parent_id: "main",
+        _location: "header",
+        _component_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_header_label_result._ok, true);
+  assert.equal(apply_view_edit_header_label_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_header_label_result._parent_id, "simple-main");
+  assert.equal(apply_view_edit_header_label_result._insert_index, 0);
+  const apply_view_edit_simple_after_header =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "simple-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_simple_after_header._result._view._children.map((child: any) => child._text),
+    ["New Header Label", "Simple Title", "New Footer Label"],
+  );
+  assert.equal(
+    apply_view_edit_simple_after_header._result._view._children[0].class,
+    "xvibe-generated-label xvibe-header-label",
+  );
+
+  const apply_view_edit_push_count_before_missing_parent_label =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_parent_label_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "simple-main",
+        _edit_action: "add-child",
+        _target_id: "missing-container",
+        _parent_id: "missing-container",
+        _location: "footer",
+        _component_type: "label",
+      },
+    });
+  assert.equal(apply_view_edit_missing_parent_label_result._ok, false);
+  assert.equal(apply_view_edit_missing_parent_label_result._reason, "target_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_parent_label,
+  );
+
+  const apply_view_edit_object_props_label_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "object-main",
+        _edit_action: "add-child",
+        _target_id: "main",
+        _parent_id: "main",
+        _location: "footer",
+        _component_type: "label",
+        _props: {
+          _text: "Footer Label",
+          class: "footer-label custom",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_object_props_label_result._ok, true);
+  assert.equal(apply_view_edit_object_props_label_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_object_props_label_result._parent_id, "object-main");
+  assert.equal(apply_view_edit_object_props_label_result._insert_index, 1);
+  const apply_view_edit_object_main_after_label =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "object-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_object_main_after_label._result._view._children.map((child: any) => child._text),
+    ["Object Title", "Footer Label"],
+  );
+  assert.equal(
+    apply_view_edit_object_main_after_label._result._view._children[1].class,
+    "footer-label custom",
+  );
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(
+        path.join(
+          apply_view_edit_work_folder,
+          "xvm",
+          "apps",
+          apply_view_edit_env,
+          apply_view_edit_app_id,
+          "views",
+          "object-main.json",
+        ),
+        "utf-8",
+      ),
+    )._children.map((child: any) => child._text),
+    ["Object Title", "Footer Label"],
+  );
+
+  const apply_view_edit_generated_child_root_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "object-main",
+        _edit_action: "add-child",
+        _target_id: "main",
+        _parent_id: "main",
+        _location: "footer",
+        _child: {
+          _id: "main-footer-label",
+          _type: "label",
+          _text: "Generated Target Footer",
+          class: "footer-label generated",
+        },
+      },
+    });
+  assert.equal(apply_view_edit_generated_child_root_result._ok, true);
+  assert.equal(apply_view_edit_generated_child_root_result._mutation_action, "add-child");
+  assert.equal(apply_view_edit_generated_child_root_result._target_id, "object-main");
+  assert.equal(apply_view_edit_generated_child_root_result._parent_id, "object-main");
+  assert.equal(
+    apply_view_edit_generated_child_root_result._result._mutation._child_id,
+    "main-footer-label",
+  );
+  const apply_view_edit_object_main_after_generated_child =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "object-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_object_main_after_generated_child._result._view._children.map((child: any) => child._id),
+    ["object-title", "label", "main-footer-label"],
+  );
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(
+        path.join(
+          apply_view_edit_work_folder,
+          "xvm",
+          "apps",
+          apply_view_edit_env,
+          apply_view_edit_app_id,
+          "views",
+          "object-main.json",
+        ),
+        "utf-8",
+      ),
+    )._children.map((child: any) => child._id),
+    ["object-title", "label", "main-footer-label"],
+  );
 
   const apply_view_edit_add_view_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
@@ -12628,10 +24545,10 @@ try {
         _view_id: "main",
       },
     });
-  assert.deepEqual(
-    apply_view_edit_main_after_hide._result._view._children.map((child: any) => child._id),
-    ["main-title", "toolbar-ref"],
-  );
+	  assert.deepEqual(
+	    apply_view_edit_main_after_hide._result._view._children.map((child: any) => child._id),
+	    ["main-title", "toolbar-ref", "dashboard-title-in-main"],
+	  );
   assert.equal(
     test_style_has_display_none(apply_view_edit_main_after_hide._result._view._children[0].style),
     true,
@@ -12667,6 +24584,124 @@ try {
   assert.equal(apply_view_edit_main_after_show._result._view._children[0].style, undefined);
   assert.equal(apply_view_edit_main_after_show._result._view._children[0]._visible, true);
   assert.equal(apply_view_edit_main_after_show._result._view._children[0].class, "title new");
+
+  const apply_view_edit_visible_text_hide_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "target-text-main",
+        _edit_action: "hide-object",
+        _target_id: "+ New Record Button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_visible_text_hide_result._ok, true);
+  assert.equal(apply_view_edit_visible_text_hide_result._mutation_action, "hide-object");
+  assert.equal(apply_view_edit_visible_text_hide_result._target_id, "new-record-button");
+  assert.equal(
+    apply_view_edit_visible_text_hide_result._result._mutation._resolved_by,
+    "normalized_text",
+  );
+  const apply_view_edit_target_text_after_hide =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "target-text-main",
+      },
+    });
+  const apply_view_edit_new_record_label =
+    find_xui_node_for_test(apply_view_edit_target_text_after_hide._result._view, "new-record-label");
+  const apply_view_edit_new_record_button =
+    find_xui_node_for_test(apply_view_edit_target_text_after_hide._result._view, "new-record-button");
+  assert.ok(apply_view_edit_new_record_label);
+  assert.ok(apply_view_edit_new_record_button);
+  assert.equal(apply_view_edit_new_record_label._visible, undefined);
+  assert.equal(apply_view_edit_new_record_label.style, undefined);
+  assert.equal(apply_view_edit_new_record_button._visible, false);
+  assert.equal(
+    test_style_has_display_none(apply_view_edit_new_record_button.style),
+    true,
+  );
+  assert.equal(
+    JSON.parse(
+      await readFile(
+        path.join(
+          apply_view_edit_work_folder,
+          "xvm",
+          "apps",
+          apply_view_edit_env,
+          apply_view_edit_app_id,
+          "views",
+          "target-text-main.json",
+        ),
+        "utf-8",
+      ),
+    )._children.find((child: any) => child._id === "new-record-button")._visible,
+    false,
+  );
+
+  const apply_view_edit_visible_text_remove_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "target-text-main",
+        _edit_action: "remove-object",
+        _target_id: "+ New Record Button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_visible_text_remove_result._ok, true);
+  assert.equal(apply_view_edit_visible_text_remove_result._mutation_action, "remove-object");
+  assert.equal(apply_view_edit_visible_text_remove_result._target_id, "new-record-button");
+  assert.equal(
+    apply_view_edit_visible_text_remove_result._result._mutation._resolved_by,
+    "normalized_text",
+  );
+  const apply_view_edit_target_text_after_remove =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "target-text-main",
+      },
+    });
+  assert.equal(
+    find_xui_node_for_test(apply_view_edit_target_text_after_remove._result._view, "new-record-button"),
+    undefined,
+  );
+  assert.ok(
+    find_xui_node_for_test(apply_view_edit_target_text_after_remove._result._view, "new-record-label"),
+  );
+
+  const apply_view_edit_push_count_before_ambiguous_text =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_ambiguous_visible_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "ambiguous-target-text-main",
+        _edit_action: "hide-object",
+        _target_id: "+ New Record Button",
+        _target_type: "button",
+      },
+    });
+  assert.equal(apply_view_edit_ambiguous_visible_text_result._ok, false);
+  assert.equal(
+    apply_view_edit_ambiguous_visible_text_result._reason,
+    "ambiguous_normalized_text_target",
+  );
+  assert.deepEqual(
+    apply_view_edit_ambiguous_visible_text_result._error._details._details._target_ids,
+    ["new-record-button-a", "new-record-button-b"],
+  );
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_ambiguous_text,
+  );
 
   const apply_view_edit_main_before_source =
     JSON.stringify(apply_view_edit_main_after_show._result._view);
@@ -13047,9 +25082,9 @@ try {
     apply_view_edit_push_count_before_missing_show,
   );
 
-  const apply_view_edit_push_count_before_different_parent =
+  const apply_view_edit_push_count_before_cross_parent =
     apply_view_edit_push_update_count;
-  const apply_view_edit_move_different_parent_result =
+  const apply_view_edit_move_cross_parent_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
       _params: {
         _app_id: apply_view_edit_app_id,
@@ -13061,11 +25096,30 @@ try {
         _before_id: "settings-button",
       },
     });
-  assert.equal(apply_view_edit_move_different_parent_result._ok, false);
-  assert.equal(apply_view_edit_move_different_parent_result._reason, "different_parent");
+  assert.equal(apply_view_edit_move_cross_parent_result._ok, true);
+  assert.equal(apply_view_edit_move_cross_parent_result._moved_id, "nested-action");
+  assert.equal(apply_view_edit_move_cross_parent_result._source_parent_id, "toolbar-group");
+  assert.equal(apply_view_edit_move_cross_parent_result._destination_parent_id, "page-toolbar");
+  assert.equal(apply_view_edit_move_cross_parent_result._position, "before");
   assert.equal(
     apply_view_edit_push_update_count,
-    apply_view_edit_push_count_before_different_parent,
+    apply_view_edit_push_count_before_cross_parent + 1,
+  );
+  const apply_view_edit_toolbar_after_cross_parent_move =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_cross_parent_move._result._view._children.map((child: any) => child._id),
+    ["nested-action", "settings-button", "toolbar-group", "toolbar-button"],
+  );
+  assert.deepEqual(
+    apply_view_edit_toolbar_after_cross_parent_move._result._view._children[2]._children.map((child: any) => child._id),
+    [],
   );
 
   const apply_view_edit_push_count_before_missing_anchor =
@@ -13212,10 +25266,10 @@ try {
         _view_id: "main",
       },
     });
-  assert.deepEqual(
-    apply_view_edit_main_after_duplicate_simple._result._view._children.map((child: any) => child._id),
-    ["main-title", "main-title-copy", "toolbar-ref"],
-  );
+	  assert.deepEqual(
+	    apply_view_edit_main_after_duplicate_simple._result._view._children.map((child: any) => child._id),
+	    ["main-title", "main-title-copy", "toolbar-ref", "dashboard-title-in-main"],
+	  );
   assert.deepEqual(
     apply_view_edit_main_after_duplicate_simple._result._view._children[1],
     {
@@ -13265,10 +25319,10 @@ try {
         _view_id: "main",
       },
     });
-  assert.deepEqual(
-    apply_view_edit_main_after_duplicate_xvm_view._result._view._children.map((child: any) => child._id),
-    ["main-title", "toolbar-ref-copy", "main-title-copy", "toolbar-ref"],
-  );
+	  assert.deepEqual(
+	    apply_view_edit_main_after_duplicate_xvm_view._result._view._children.map((child: any) => child._id),
+	    ["main-title", "toolbar-ref-copy", "main-title-copy", "toolbar-ref", "dashboard-title-in-main"],
+	  );
   assert.deepEqual(
     apply_view_edit_main_after_duplicate_xvm_view._result._view._children[1],
     {
@@ -13305,7 +25359,7 @@ try {
   assert.equal(apply_view_edit_duplicate_subtree_result._mutation_action, "duplicate-object");
   assert.equal(apply_view_edit_duplicate_subtree_result._original_target_id, "toolbar-group");
   assert.equal(apply_view_edit_duplicate_subtree_result._new_target_id, "toolbar-group-copy");
-  assert.equal(apply_view_edit_duplicate_subtree_result._insert_index, 2);
+  assert.equal(apply_view_edit_duplicate_subtree_result._insert_index, 3);
   assert.equal(apply_view_edit_duplicate_subtree_result._parent_id, "page-toolbar");
   const apply_view_edit_toolbar_after_duplicate_subtree =
     await (apply_view_edit_server_xvm as any)._get_view({
@@ -13317,22 +25371,32 @@ try {
     });
   assert.deepEqual(
     apply_view_edit_toolbar_after_duplicate_subtree._result._view._children.map((child: any) => child._id),
-    ["settings-button", "toolbar-group", "toolbar-group-copy", "toolbar-button"],
+    ["nested-action", "settings-button", "toolbar-group", "toolbar-group-copy", "toolbar-button"],
   );
   assert.deepEqual(
-    apply_view_edit_toolbar_after_duplicate_subtree._result._view._children[2],
+    apply_view_edit_toolbar_after_duplicate_subtree._result._view._children[3],
     {
       _id: "toolbar-group-copy",
       _type: "toolbar",
-      _children: [
-        {
-          _id: "nested-action-copy",
-          _type: "button",
-          _text: "Nested",
-        },
-      ],
+      _children: [],
     },
   );
+
+  const apply_view_edit_restore_nested_action_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "page-toolbar",
+        _edit_action: "move-object",
+        _target_id: "nested-action",
+        _target_type: "button",
+        _destination_id: "toolbar-group",
+        _destination_type: "toolbar",
+        _position: "append",
+      },
+    });
+  assert.equal(apply_view_edit_restore_nested_action_result._ok, true);
 
   const apply_view_edit_push_count_before_duplicate_different_parent =
     apply_view_edit_push_update_count;
@@ -13482,6 +25546,531 @@ try {
     path.join(apply_view_edit_ref_views_dir, "page-toolbar.json");
   const apply_view_edit_ref_main_before =
     await readFile(apply_view_edit_ref_main_file, "utf-8");
+
+  assert.equal(isStructuredViewEditAction("bind-flow"), true);
+  const bind_flow_processor =
+    new DeterministicIntentProcessor();
+  const bind_flow_prompt_res =
+    await bind_flow_processor.analyze({
+      _message: "Make the Save button run the save-project flow.",
+      _runtime_context: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _active_view_id: "bind-flow-main",
+      },
+    } as any);
+  assert.equal(bind_flow_prompt_res?._actions?.[0]?._executable, true);
+  assert.deepEqual(
+    bind_flow_prompt_res?._actions?.[0]?._execution_payload,
+    {
+      _module: "xvibe",
+      _op: "apply-view-edit",
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+        _target_id: "Save",
+        _target_text: "Save",
+        _target_type: "button",
+        _edit_action: "bind-flow",
+        _flow: {
+          _id: "save-project",
+          _payload: {},
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    },
+  );
+  const bind_flow_missing_prompt_res =
+    await bind_flow_processor.analyze({
+      _message: "Bind Save to missing-flow.",
+      _runtime_context: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _active_view_id: "bind-flow-main",
+      },
+    } as any);
+  assert.equal(bind_flow_missing_prompt_res?._reason, "flow_not_found");
+  assert.equal(bind_flow_missing_prompt_res?._actions?.[0]?._executable, false);
+  assert.equal(
+    bind_flow_missing_prompt_res?._actions?.[0]?._execution_payload,
+    undefined,
+  );
+
+  const apply_view_edit_bind_flow_id_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+        _edit_action: "bind-flow",
+        _target_id: "save-button",
+        _target_type: "button",
+        _flow: {
+          _id: "save-project",
+          _payload: {},
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    });
+  assert.equal(apply_view_edit_bind_flow_id_result._ok, true);
+  assert.equal(apply_view_edit_bind_flow_id_result._edit_action, "bind-flow");
+  assert.equal(apply_view_edit_bind_flow_id_result._target_id, "save-button");
+  assert.deepEqual(apply_view_edit_bind_flow_id_result._flow, {
+    _id: "save-project",
+    _payload: {},
+  });
+  assert.equal(apply_view_edit_bind_flow_id_result._flow_event, "click");
+  assert.equal(apply_view_edit_bind_flow_id_result._flow_auto, true);
+  const apply_view_edit_bind_flow_after_id =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+      },
+    });
+  const bind_flow_save_after_id =
+    find_xui_node_for_test(apply_view_edit_bind_flow_after_id._result._view, "save-button");
+  assert.deepEqual(bind_flow_save_after_id?._flow, {
+    _id: "save-project",
+    _payload: {},
+  });
+  assert.equal(bind_flow_save_after_id?._flow_event, "click");
+  assert.equal(bind_flow_save_after_id?._flow_auto, true);
+  assert.equal(bind_flow_save_after_id?._class, "primary");
+
+  const apply_view_edit_bind_flow_text_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+        _edit_action: "bind-flow",
+        _target_text: "Refresh",
+        _target_type: "button",
+        _flow: "refresh-data",
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    });
+  assert.equal(apply_view_edit_bind_flow_text_result._ok, true);
+  assert.equal(apply_view_edit_bind_flow_text_result._target_id, "refresh-bind-button");
+  const apply_view_edit_bind_flow_after_text =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+      },
+    });
+  const bind_flow_refresh_after_text =
+    find_xui_node_for_test(apply_view_edit_bind_flow_after_text._result._view, "refresh-bind-button");
+  assert.deepEqual(bind_flow_refresh_after_text?._flow, {
+    _id: "refresh-data",
+    _payload: {},
+  });
+
+  const apply_view_edit_bind_flow_anonymous_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-anonymous-main",
+        _edit_action: "bind-flow",
+        _target_text: "Save",
+        _target_type: "button",
+        _flow: {
+          _id: "save-project",
+          _payload: {
+            _source: "anonymous",
+          },
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    });
+  assert.equal(apply_view_edit_bind_flow_anonymous_result._ok, true);
+  assert.equal(apply_view_edit_bind_flow_anonymous_result._target_id, undefined);
+  assert.deepEqual(
+    apply_view_edit_bind_flow_anonymous_result._target_path,
+    ["bind-flow-anonymous-main", "0"],
+  );
+  const apply_view_edit_bind_flow_anonymous_after =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-anonymous-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_bind_flow_anonymous_after._result._view._children[0],
+    {
+      _type: "button",
+      _text: "Save",
+      _style: {
+        color: "green",
+      },
+      _flow: {
+        _id: "save-project",
+        _payload: {
+          _source: "anonymous",
+        },
+      },
+      _flow_event: "click",
+      _flow_auto: true,
+    },
+  );
+  const apply_view_edit_reloaded_bind_flow_xvm =
+    new ServerXVMModule({ _work_folder: apply_view_edit_work_folder });
+  await (apply_view_edit_reloaded_bind_flow_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+    },
+  });
+  const apply_view_edit_reloaded_bind_flow =
+    await (apply_view_edit_reloaded_bind_flow_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-anonymous-main",
+      },
+    });
+  assert.deepEqual(
+    apply_view_edit_reloaded_bind_flow._result._view,
+    apply_view_edit_bind_flow_anonymous_after._result._view,
+  );
+
+  const apply_view_edit_bind_flow_retry_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+        _edit_action: "bind-flow",
+        _target_id: "save-button",
+        _target_type: "button",
+        _flow: {
+          _id: "save-project",
+          _payload: {},
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    });
+  assert.equal(apply_view_edit_bind_flow_retry_result._ok, true);
+  const apply_view_edit_bind_flow_after_retry =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+      },
+    });
+  assert.deepEqual(
+    find_xui_node_for_test(apply_view_edit_bind_flow_after_retry._result._view, "save-button")?._flow,
+    {
+      _id: "save-project",
+      _payload: {},
+    },
+  );
+
+  const bind_flow_runtime_prompt_res =
+    await bind_flow_processor.analyze({
+      _message: "Bind Save to save-project.",
+      _runtime_context: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _active_view_id: "bind-flow-runtime-main",
+      },
+    } as any);
+  assert.equal(bind_flow_runtime_prompt_res?._actions?.[0]?._executable, true);
+  const bind_flow_runtime_apply_result =
+    await (_x as any).execute(
+      bind_flow_runtime_prompt_res?._actions?.[0]?._execution_payload,
+    );
+  assert.equal(bind_flow_runtime_apply_result._ok, true);
+  assert.equal(bind_flow_runtime_apply_result._edit_action, "bind-flow");
+  assert.equal(bind_flow_runtime_apply_result._target_id, "runtime-save-button");
+
+  const bind_flow_runtime_reloaded_xvm =
+    new ServerXVMModule({ _work_folder: apply_view_edit_work_folder });
+  await (bind_flow_runtime_reloaded_xvm as any)._load_app_from_disk({
+    _params: {
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+    },
+  });
+  const bind_flow_runtime_reloaded_view =
+    await (bind_flow_runtime_reloaded_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-runtime-main",
+      },
+    });
+  const bind_flow_runtime_save_button =
+    find_xui_node_for_test(
+      bind_flow_runtime_reloaded_view._result._view,
+      "runtime-save-button",
+    );
+  assert.deepEqual(bind_flow_runtime_save_button?._flow, {
+    _id: "save-project",
+    _payload: {},
+  });
+  assert.equal(bind_flow_runtime_save_button?._flow_event, "click");
+  assert.equal(bind_flow_runtime_save_button?._flow_auto, true);
+
+  const bind_flow_runtime_events = {
+    _ui_flow_trigger: 0,
+    _flow_start: 0,
+    _flow_step: 0,
+    _flow_end: 0,
+    _flow_completed: 0,
+  };
+  const bind_flow_runtime_listener_ids: string[] = [];
+  const bind_flow_runtime_start_counts = {
+    _flow_client_trigger: apply_view_edit_flow_client_trigger_count,
+    _flow_run: apply_view_edit_server_flow_run_count,
+    _server_xvm_get_flow: apply_view_edit_server_xvm_get_flow_count,
+    _project_save: apply_view_edit_project_save_count,
+    _output_writes: apply_view_edit_flow_client_output_write_count,
+  };
+  const bind_flow_runtime_output_key = "xvibe.bind_flow.runtime.saved";
+  _xd.set(bind_flow_runtime_output_key, null, { source: "test" });
+
+  const fire_bound_save_button_for_test = async (button: Record<string, unknown>) => {
+    const flow = button._flow as any;
+    const flow_id =
+      typeof flow === "string"
+        ? flow
+        : typeof flow?._id === "string"
+          ? flow._id
+          : undefined;
+    assert.equal(flow_id, "save-project");
+    await _xem.fire("ui:flow-trigger", {
+      _flow_id: flow_id,
+      _event_name:
+        typeof button._flow_event === "string" ? button._flow_event : "click",
+      _event_payload:
+        flow &&
+        typeof flow === "object" &&
+        flow._payload &&
+        typeof flow._payload === "object"
+          ? flow._payload
+          : { type: "click" },
+      _object_id:
+        typeof button._id === "string" ? button._id : undefined,
+      _app_id: apply_view_edit_app_id,
+      _env: apply_view_edit_env,
+      _source: "ui",
+    });
+  };
+  const flush_bind_flow_runtime_events = () =>
+    new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+  try {
+    bind_flow_runtime_listener_ids.push(
+      _xem.on("ui:flow-trigger", async (payload: any) => {
+        bind_flow_runtime_events._ui_flow_trigger += 1;
+        assert.equal(payload?._flow_id, "save-project");
+        assert.equal(payload?._event_name, "click");
+        assert.equal(payload?._object_id, "runtime-save-button");
+        await (_x as any).execute({
+          _module: "flow-client",
+          _op: "trigger",
+          _params: {
+            _flow_id: payload._flow_id,
+            _event_name:
+              typeof payload._event_name === "string"
+                ? payload._event_name
+                : undefined,
+            _event_payload:
+              payload?._event_payload &&
+              typeof payload._event_payload === "object"
+                ? payload._event_payload
+                : undefined,
+            _object_id:
+              typeof payload._object_id === "string"
+                ? payload._object_id
+                : undefined,
+            _app_id: payload._app_id ?? apply_view_edit_app_id,
+            _env: payload._env ?? apply_view_edit_env,
+            _source:
+              payload._source === "ui" || payload._source === "event"
+                ? payload._source
+                : "ui",
+          },
+        });
+      }),
+      _xem.on("flow:start", () => {
+        bind_flow_runtime_events._flow_start += 1;
+      }),
+      _xem.on("flow:step", (payload: any) => {
+        bind_flow_runtime_events._flow_step += 1;
+        assert.equal(payload?.flow_id, "save-project");
+        assert.equal(payload?.step_id, "save");
+      }),
+      _xem.on("flow:end", (payload: any) => {
+        bind_flow_runtime_events._flow_end += 1;
+        assert.equal(payload?._ok, true);
+      }),
+      _xem.on("flow:completed", (payload: any) => {
+        bind_flow_runtime_events._flow_completed += 1;
+        assert.equal(payload?._flow_id, "save-project");
+        assert.equal(payload?._result?._ok, true);
+      }),
+    );
+
+    await fire_bound_save_button_for_test(bind_flow_runtime_save_button!);
+    await flush_bind_flow_runtime_events();
+    assert.equal(bind_flow_runtime_events._ui_flow_trigger, 1);
+    assert.equal(
+      apply_view_edit_flow_client_trigger_count,
+      bind_flow_runtime_start_counts._flow_client_trigger + 1,
+    );
+    assert.equal(
+      apply_view_edit_server_flow_run_count,
+      bind_flow_runtime_start_counts._flow_run + 1,
+    );
+    assert.equal(
+      apply_view_edit_server_xvm_get_flow_count,
+      bind_flow_runtime_start_counts._server_xvm_get_flow + 1,
+    );
+    assert.equal(
+      apply_view_edit_project_save_count,
+      bind_flow_runtime_start_counts._project_save + 1,
+    );
+    assert.equal(bind_flow_runtime_events._flow_start, 1);
+    assert.equal(bind_flow_runtime_events._flow_step, 1);
+    assert.equal(bind_flow_runtime_events._flow_end, 1);
+    assert.equal(bind_flow_runtime_events._flow_completed, 1);
+    assert.equal(
+      apply_view_edit_flow_client_output_write_count,
+      bind_flow_runtime_start_counts._output_writes + 1,
+    );
+    assert.deepEqual(
+      apply_view_edit_flow_client_commands[
+        apply_view_edit_flow_client_commands.length - 1
+      ],
+      {
+        _module: "flow-client",
+        _op: "trigger",
+        _params: {
+          _flow_id: "save-project",
+          _event_name: "click",
+          _event_payload: {},
+          _object_id: "runtime-save-button",
+          _app_id: apply_view_edit_app_id,
+          _env: apply_view_edit_env,
+          _source: "ui",
+        },
+      },
+    );
+    assert.deepEqual(
+      apply_view_edit_flow_run_commands[
+        apply_view_edit_flow_run_commands.length - 1
+      ],
+      {
+        _module: "flow",
+        _op: "run",
+        _params: {
+          _flow_id: "save-project",
+          _app_id: apply_view_edit_app_id,
+          _env: apply_view_edit_env,
+          _event_payload: {},
+          _event_name: "click",
+        },
+      },
+    );
+    assert.deepEqual(_xd.get(bind_flow_runtime_output_key), {
+      _saved: true,
+      _attempt: bind_flow_runtime_start_counts._project_save + 1,
+      _event_title: undefined,
+    });
+
+    await fire_bound_save_button_for_test(bind_flow_runtime_save_button!);
+    await flush_bind_flow_runtime_events();
+    assert.equal(bind_flow_runtime_events._ui_flow_trigger, 2);
+    assert.equal(
+      apply_view_edit_flow_client_trigger_count,
+      bind_flow_runtime_start_counts._flow_client_trigger + 2,
+    );
+    assert.equal(
+      apply_view_edit_server_flow_run_count,
+      bind_flow_runtime_start_counts._flow_run + 2,
+    );
+    assert.equal(
+      apply_view_edit_project_save_count,
+      bind_flow_runtime_start_counts._project_save + 2,
+    );
+    assert.equal(bind_flow_runtime_events._flow_completed, 2);
+    assert.deepEqual(_xd.get(bind_flow_runtime_output_key), {
+      _saved: true,
+      _attempt: bind_flow_runtime_start_counts._project_save + 2,
+      _event_title: undefined,
+    });
+  } finally {
+    for (const listener_id of bind_flow_runtime_listener_ids) {
+      _xem.remove(listener_id);
+    }
+  }
+
+  const bind_flow_runtime_after_retry =
+    await (apply_view_edit_server_xvm as any)._get_view({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-runtime-main",
+      },
+    });
+  assert.deepEqual(
+    bind_flow_runtime_after_retry._result._view._children,
+    [
+      {
+        _id: "runtime-save-button",
+        _type: "button",
+        _text: "Save",
+        _class: "primary",
+        _flow: {
+          _id: "save-project",
+          _payload: {},
+        },
+        _flow_event: "click",
+        _flow_auto: true,
+      },
+    ],
+  );
+
+  const apply_view_edit_push_count_before_missing_flow =
+    apply_view_edit_push_update_count;
+  const apply_view_edit_missing_flow_result =
+    await (apply_view_edit_xvibe as any)._apply_view_edit({
+      _params: {
+        _app_id: apply_view_edit_app_id,
+        _env: apply_view_edit_env,
+        _view_id: "bind-flow-main",
+        _edit_action: "bind-flow",
+        _target_id: "save-button",
+        _target_type: "button",
+        _flow: {
+          _id: "missing-flow",
+          _payload: {},
+        },
+      },
+    });
+  assert.equal(apply_view_edit_missing_flow_result._ok, false);
+  assert.equal(apply_view_edit_missing_flow_result._reason, "flow_not_found");
+  assert.equal(
+    apply_view_edit_push_update_count,
+    apply_view_edit_push_count_before_missing_flow,
+  );
 
   const apply_view_edit_set_interaction_result =
     await (apply_view_edit_xvibe as any)._apply_view_edit({
@@ -14227,6 +26816,9 @@ try {
 
   await _x.loadModuleAsync(XDB);
   await _x.loadModuleAsync(new XEntityManager());
+  if (!((_x as any).getModule?.("xd"))) {
+    await _x.loadModuleAsync(new XDataModule());
+  }
 
   const hash_entity = XDB.create({
     _type: "xdb-entity",
@@ -14413,6 +27005,79 @@ try {
   assert.equal(persisted_contact_records.length, 1);
   assert.equal(persisted_contact_records[0]._name, "Ada");
 
+  const recent_meal_entity = {
+    _id: "recent-meal",
+    _schema: {
+      name: {
+        _type: "String",
+      },
+      calories: {
+        _type: "String",
+      },
+    },
+  };
+  const recent_meal_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: recent_meal_entity,
+    },
+  });
+  assert.equal(recent_meal_register._ok, true);
+  for (let index = 0; index < 12; index += 1) {
+    const meal_add_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "add",
+      _params: {
+        _app_id: "entity-sync-app",
+        _env: "test",
+        _entity: "recent-meal",
+        _data: {
+          name: `Meal ${index + 1}`,
+          calories: String(100 + index),
+          _created_at: new Date(Date.UTC(2026, 0, index + 1)).toISOString(),
+        },
+      },
+    });
+    assert.equal(meal_add_res._ok, true);
+  }
+  const recent_meal_records_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "recent-meal",
+      _filter: {},
+      _sort: {
+        _sort_by: "_created_at",
+        _sort_order: "desc",
+      },
+      _limit: 10,
+    },
+  });
+  assert.equal(recent_meal_records_res._ok, true);
+  const recent_meal_records =
+    recent_meal_records_res._result?._records?._data ?? [];
+  assert.equal(recent_meal_records.length, 10);
+  assert.deepEqual(
+    recent_meal_records.map((record: any) => record.name),
+    [
+      "Meal 12",
+      "Meal 11",
+      "Meal 10",
+      "Meal 9",
+      "Meal 8",
+      "Meal 7",
+      "Meal 6",
+      "Meal 5",
+      "Meal 4",
+      "Meal 3",
+    ],
+  );
+
   const server_xvm = new ServerXVMModule({ _work_folder: entity_sync_work_folder });
   await _x.loadModuleAsync(server_xvm);
 
@@ -14424,6 +27089,2447 @@ try {
       _env: "test",
     },
   });
+
+  const entity_list_runtime_app_id =
+    "entity-list-runtime-app";
+  const entity_list_runtime_ready_requirement =
+    `system.ready.server-xvm.test.${entity_list_runtime_app_id}.subscribed`;
+  await _x.execute({
+    _module: "server-xvm",
+    _op: "create_app",
+    _params: {
+      _app_id: entity_list_runtime_app_id,
+      _env: "test",
+    },
+  });
+
+  const entity_list_runtime_entity = {
+    _id: "meal",
+    _schema: {
+      name: {
+        _type: "String",
+      },
+      calories: {
+        _type: "String",
+      },
+      notes: {
+        _type: "String",
+      },
+    },
+  };
+  assert.equal(
+    (await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: entity_list_runtime_app_id,
+        _env: "test",
+        _entity: entity_list_runtime_entity,
+      },
+    }))?._ok,
+    true,
+  );
+  assert.equal(
+    (await _x.execute({
+      _module: "entity-manager",
+      _op: "register",
+      _params: {
+        _app_id: entity_list_runtime_app_id,
+        _env: "test",
+        _entity: entity_list_runtime_entity,
+      },
+    }))?._ok,
+    true,
+  );
+  for (let index = 0; index < 12; index += 1) {
+    const add_meal_record_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "add",
+      _params: {
+        _app_id: entity_list_runtime_app_id,
+        _env: "test",
+        _entity: "meal",
+        _data: {
+          name: `Meal ${index + 1}`,
+          calories: String(200 + index),
+          notes: `Note ${index + 1}`,
+          _created_at: new Date(Date.UTC(2026, 1, index + 1)).toISOString(),
+        },
+      },
+    });
+    assert.equal(add_meal_record_res._ok, true);
+  }
+  await _x.execute({
+    _module: "server-xvm",
+    _op: "push_update",
+    _params: {
+      _app_id: entity_list_runtime_app_id,
+      _env: "test",
+      _view: {
+        _id: "homepage",
+        _type: "view",
+        _children: [
+          {
+            _id: "homepage-title",
+            _type: "label",
+            _text: "Meals",
+          },
+        ],
+      },
+    },
+  });
+
+  const entity_list_runtime_xvibe = new XVibeModule();
+  const entity_list_runtime_skills = {
+    _modules: [
+      {
+        _objects: [
+          { _id: "view" },
+          { _id: "label" },
+          { _id: "table" },
+        ],
+      },
+    ],
+  };
+  (entity_list_runtime_xvibe as any).latest_runtime_skills =
+    entity_list_runtime_skills;
+  const original_entity_list_execute = (_x as any).execute;
+  const original_entity_list_get_skills = (_x as any).getSkills;
+  let entity_list_runtime_semantic_calls = 0;
+  try {
+    (_x as any).getSkills = () => entity_list_runtime_skills;
+    (_x as any).execute = async (command: any) => {
+      if (command?._module === "xvibe") {
+        const method_name = `_${String(command?._op ?? "").replace(/-/gu, "_")}`;
+        const method = (entity_list_runtime_xvibe as any)[method_name];
+        if (typeof method === "function") {
+          return method.call(entity_list_runtime_xvibe, command);
+        }
+      }
+
+      return original_entity_list_execute.call(_x, command);
+    };
+
+    const entity_list_runtime_engine =
+      xvibe_test_intent_engine({
+        _semantic_generate_json: async () => {
+          entity_list_runtime_semantic_calls += 1;
+          throw new Error("semantic AI must not run for entity-list prompt");
+        },
+      });
+    const entity_list_runtime_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: "Show recent Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_list_runtime_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    assert_xvibe_mutation_plan(
+      entity_list_runtime_plan_res,
+      {
+        _title: "Meal Entity List",
+        _min_steps: 3,
+        _executable_steps: 3,
+        _unsupported_steps: 0,
+        _can_apply: true,
+        _step_ids: [
+          "require-wormhole-for-meal-records",
+          "load-recent-meal-records",
+          "add-recent-meal-records-table",
+        ],
+      },
+    );
+    const entity_list_runtime_plan: any =
+      entity_list_runtime_plan_res._intent?._artifact_request;
+    const entity_list_runtime_apply_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _plan: entity_list_runtime_plan,
+        },
+    });
+    assert.equal(entity_list_runtime_apply_res._ok, true);
+    assert.equal(entity_list_runtime_apply_res._completed_steps, 3);
+
+    const entity_list_runtime_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const entity_list_runtime_view =
+      entity_list_runtime_home._result._view;
+    const entity_list_runtime_table =
+      entity_list_runtime_view._children.find(
+        (child: any) => child._id === "recent-meal-records",
+      );
+    assert.deepEqual(entity_list_runtime_view._requires, [entity_list_runtime_ready_requirement]);
+    assert.deepEqual(entity_list_runtime_view._on_mount, {
+      _mode: "chain",
+      _stop_on_error: true,
+      _commands: [
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "meal:records",
+            value: [],
+            source: "entity-list:on-mount",
+          },
+        },
+        test_entity_manager_call_server(
+          "find",
+          {
+            _app_id: entity_list_runtime_app_id,
+            _env: "test",
+            _entity: "meal",
+            _filter: {},
+            _sort: {
+              _sort_by: "_created_at",
+              _sort_order: "desc",
+            },
+            _limit: 10,
+          },
+          {
+            key: "meal:records",
+            path: "_records._data",
+          },
+        ),
+      ],
+    });
+    assert.equal(entity_list_runtime_table?._data_source, "meal:records");
+    assert.equal(entity_list_runtime_table?._query?._limit, 10);
+    assert.deepEqual(entity_list_runtime_table?._query?._sort, {
+      _sort_by: "_created_at",
+      _sort_order: "desc",
+    });
+
+    _xd.delete("meal:records", { source: "entity-list-runtime-test" });
+    const entity_list_runtime_server_calls =
+      await run_on_mount_in_client_runtime(
+        entity_list_runtime_view._on_mount,
+        { _id: "entity-list-runtime-home" },
+      );
+    assert.deepEqual(
+      entity_list_runtime_server_calls.map((command: any) => ({
+        _module: command?._module,
+        _op: command?._op,
+        _sort: command?._params?._sort,
+        _limit: command?._params?._limit,
+      })),
+      [
+        {
+          _module: "entity-manager",
+          _op: "find",
+          _sort: {
+            _sort_by: "_created_at",
+            _sort_order: "desc",
+          },
+          _limit: 10,
+        },
+      ],
+    );
+    const entity_list_runtime_xdata_rows =
+      _xd.get("meal:records");
+    assert.equal(Array.isArray(entity_list_runtime_xdata_rows), true);
+    assert.equal(entity_list_runtime_xdata_rows.length, 10);
+    assert.deepEqual(
+      entity_list_runtime_xdata_rows.map((record: any) => record.name),
+      [
+        "Meal 12",
+        "Meal 11",
+        "Meal 10",
+        "Meal 9",
+        "Meal 8",
+        "Meal 7",
+        "Meal 6",
+        "Meal 5",
+        "Meal 4",
+        "Meal 3",
+      ],
+    );
+    const entity_list_runtime_visible_rows =
+      _xd.get(entity_list_runtime_table._data_source);
+    assert.deepEqual(
+      entity_list_runtime_visible_rows.map((record: any) => record.name),
+      entity_list_runtime_xdata_rows.map((record: any) => record.name),
+    );
+
+    const entity_list_runtime_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (entity_list_runtime_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: entity_list_runtime_app_id,
+        _env: "test",
+      },
+    });
+    const entity_list_runtime_reloaded_home =
+      await (entity_list_runtime_reloaded_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_list_runtime_reloaded_home._result._view,
+      entity_list_runtime_view,
+    );
+    _xd.delete("meal:records", { source: "entity-list-runtime-test" });
+    await run_on_mount_in_client_runtime(
+      entity_list_runtime_reloaded_home._result._view._on_mount,
+      { _id: "entity-list-runtime-home-reload" },
+    );
+    const entity_list_runtime_reloaded_rows =
+      _xd.get("meal:records");
+    assert.equal(Array.isArray(entity_list_runtime_reloaded_rows), true);
+    assert.deepEqual(
+      entity_list_runtime_reloaded_rows.map((record: any) => record.name),
+      entity_list_runtime_xdata_rows.map((record: any) => record.name),
+    );
+
+    const entity_list_runtime_retry_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: "Show recent Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_list_runtime_retry_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    const entity_list_runtime_retry_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _plan: entity_list_runtime_retry_plan_res._intent?._artifact_request,
+        },
+      });
+    assert.equal(entity_list_runtime_retry_res._ok, true);
+    const entity_list_runtime_retry_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_list_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const entity_list_runtime_retry_view =
+      entity_list_runtime_retry_home._result._view;
+    assert.deepEqual(
+      entity_list_runtime_retry_view._on_mount,
+      entity_list_runtime_view._on_mount,
+    );
+    assert.equal(
+      entity_list_runtime_retry_view._children.filter(
+        (child: any) => child._id === "recent-meal-records",
+      ).length,
+      1,
+    );
+
+    const entity_aggregation_runtime_app_id =
+      "entity-aggregation-runtime-app";
+    const entity_aggregation_runtime_ready_requirement =
+      `system.ready.server-xvm.test.${entity_aggregation_runtime_app_id}.subscribed`;
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_aggregation_runtime_app_id,
+        _env: "test",
+      },
+    });
+    const entity_aggregation_runtime_entity = {
+      _id: "meal",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+        calories: {
+          _type: "Number",
+        },
+        protein: {
+          _type: "Number",
+        },
+      },
+    };
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _entity: entity_aggregation_runtime_entity,
+        },
+      }))?._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _entity: entity_aggregation_runtime_entity,
+        },
+      }))?._ok,
+      true,
+    );
+    for (const record of [
+      { name: "Breakfast", calories: 320, protein: 22 },
+      { name: "Lunch", calories: 540, protein: 41 },
+      { name: "Dinner", calories: 610, protein: 37 },
+    ]) {
+      const add_meal_record_res = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _entity: "meal",
+          _data: record,
+        },
+      });
+      assert.equal(add_meal_record_res._ok, true);
+    }
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_aggregation_runtime_app_id,
+        _env: "test",
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _children: [
+            {
+              _id: "homepage-title",
+              _type: "label",
+              _text: "Meals",
+            },
+          ],
+        },
+      },
+    });
+
+    const entity_aggregation_runtime_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message:
+          "Display the sum of calories and the sum of protein from Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_aggregation_runtime_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    assert_xvibe_mutation_plan(
+      entity_aggregation_runtime_plan_res,
+      {
+        _title: "Meal Entity Summary",
+        _min_steps: 5,
+        _executable_steps: 5,
+        _unsupported_steps: 0,
+        _can_apply: true,
+        _step_ids: [
+          "require-wormhole-for-meal-aggregation",
+          "load-meal-records-for-aggregation",
+          "compute-meal-sum-calories",
+          "compute-meal-sum-protein",
+          "display-meal-aggregation-summary",
+        ],
+      },
+    );
+
+    const entity_aggregation_missing_field_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message:
+          "Display the sum of fat from Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_aggregation_missing_field_plan_res._intent?._artifact_request?._steps
+        .map((step: any) => step._reason),
+      ["field_not_found", "field_not_found", "field_not_found"],
+    );
+    const entity_aggregation_non_numeric_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message:
+          "Display the sum of name from Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_aggregation_non_numeric_plan_res._intent?._artifact_request?._steps
+        .map((step: any) => step._reason),
+      [
+        "field_not_numeric: name is String",
+        "field_not_numeric: name is String",
+        "field_not_numeric: name is String",
+      ],
+    );
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+
+    const entity_aggregation_runtime_plan: any =
+      entity_aggregation_runtime_plan_res._intent?._artifact_request;
+    const entity_aggregation_runtime_apply_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _plan: entity_aggregation_runtime_plan,
+        },
+    });
+    assert.equal(entity_aggregation_runtime_apply_res._ok, true);
+    assert.equal(entity_aggregation_runtime_apply_res._completed_steps, 5);
+
+    const entity_aggregation_runtime_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const entity_aggregation_runtime_view =
+      entity_aggregation_runtime_home._result._view;
+    assert.deepEqual(entity_aggregation_runtime_view._requires, [entity_aggregation_runtime_ready_requirement]);
+    assert.deepEqual(entity_aggregation_runtime_view._on_mount, {
+      _mode: "chain",
+      _stop_on_error: true,
+      _commands: [
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "meal:records",
+            value: [],
+            source: "entity-aggregation:on-mount",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "meal:sum:calories",
+            value: 0,
+            source: "entity-aggregation:on-mount",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "meal:sum:protein",
+            value: 0,
+            source: "entity-aggregation:on-mount",
+          },
+        },
+        test_entity_manager_call_server(
+          "find",
+          {
+            _app_id: entity_aggregation_runtime_app_id,
+            _env: "test",
+            _entity: "meal",
+            _filter: {},
+            _sort: {
+              _sort_by: "_created_at",
+              _sort_order: "desc",
+            },
+            _limit: 10,
+          },
+          {
+            key: "meal:records",
+            path: "_records._data",
+          },
+        ),
+        test_entity_manager_call_server(
+          "aggregate",
+          {
+            _app_id: entity_aggregation_runtime_app_id,
+            _env: "test",
+            _entity: "meal",
+            _records: "$xdata:meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "calories",
+            },
+            _result_xdata_key: "meal:sum:calories",
+          },
+          {
+            key: "meal:sum:calories",
+            path: "_value",
+          },
+        ),
+        test_entity_manager_call_server(
+          "aggregate",
+          {
+            _app_id: entity_aggregation_runtime_app_id,
+            _env: "test",
+            _entity: "meal",
+            _records: "$xdata:meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "protein",
+            },
+            _result_xdata_key: "meal:sum:protein",
+          },
+          {
+            key: "meal:sum:protein",
+            path: "_value",
+          },
+        ),
+      ],
+    });
+    const entity_aggregation_summary =
+      entity_aggregation_runtime_view._children.find(
+        (child: any) => child._id === "meal-aggregation-summary",
+      );
+    assert.equal(entity_aggregation_summary?._type, "view");
+    assert.deepEqual(
+      entity_aggregation_summary?._aggregations,
+      [
+        {
+          _op: "sum",
+          _field: "calories",
+          _data_source: "meal:sum:calories",
+        },
+        {
+          _op: "sum",
+          _field: "protein",
+          _data_source: "meal:sum:protein",
+        },
+      ],
+    );
+
+    const entity_aggregation_actual_wrapper_res =
+      await _x.execute({
+        _module: "entity-manager",
+        _op: "aggregate",
+        _params: {
+          _entity: "meal",
+          _records: [],
+          _aggregation: {
+            _op: "sum",
+            _field: "calories",
+          },
+          _result_xdata_key: "meal:sum:calories",
+        },
+      });
+    assert.equal(entity_aggregation_actual_wrapper_res._ok, true);
+    assert.deepEqual(
+      Object.keys(entity_aggregation_actual_wrapper_res).filter((key) =>
+        ["_ok", "_ts", "_pt", "_result"].includes(key),
+      ),
+      ["_ok", "_ts", "_pt", "_result"],
+    );
+    assert.deepEqual(
+      Object.keys(entity_aggregation_actual_wrapper_res._result).sort(),
+      ["_aggregation", "_value"],
+    );
+    assert.equal(entity_aggregation_actual_wrapper_res._result._value, 0);
+
+    _xd.delete("meal:sum:calories", { source: "entity-aggregation-wrapper-shape-test" });
+    const entity_aggregation_actual_wrapper_mount =
+      new XObject({
+        _id: "entity-aggregation-actual-wrapper-shape",
+        _on_mount: {
+          _mode: "chain",
+          _stop_on_error: true,
+          _commands: [
+            {
+              _module: "entity-manager",
+              _op: "aggregate",
+              _params: {
+                _entity: "meal",
+                _records: [],
+                _aggregation: {
+                  _op: "sum",
+                  _field: "calories",
+                },
+                _result_xdata_key: "meal:sum:calories",
+              },
+            },
+            {
+              _module: "xd",
+              _op: "set",
+              _params: {
+                key: "meal:sum:calories",
+                value: "$prev._result._value",
+                source: "entity-aggregation:on-mount",
+              },
+            },
+          ],
+        } as any,
+      });
+    await entity_aggregation_actual_wrapper_mount.onMount();
+    assert.equal(_xd.get("meal:sum:calories"), 0);
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+
+    _xd.delete("meal:records", { source: "entity-aggregation-runtime-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-aggregation-runtime-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-aggregation-runtime-test" });
+    assert.equal(
+      entity_aggregation_runtime_view._on_mount._commands.some(
+        (command: any) => command._module === "entity-manager",
+      ),
+      false,
+    );
+    const entity_aggregation_runtime_server_calls =
+      await run_on_mount_in_client_runtime(
+        entity_aggregation_runtime_view._on_mount,
+        { _id: "entity-aggregation-runtime-home" },
+      );
+    assert.deepEqual(
+      entity_aggregation_runtime_server_calls.map((command: any) => ({
+        _module: command?._module,
+        _op: command?._op,
+      })),
+      [
+        { _module: "entity-manager", _op: "find" },
+        { _module: "entity-manager", _op: "aggregate" },
+        { _module: "entity-manager", _op: "aggregate" },
+      ],
+    );
+    assert.equal(
+      Array.isArray(entity_aggregation_runtime_server_calls[1]?._params?._records),
+      true,
+    );
+    assert.equal(
+      entity_aggregation_runtime_server_calls[1]?._params?._records.length,
+      10,
+    );
+    assert.equal(
+      entity_aggregation_runtime_server_calls[1]?._params?._result_xdata_key,
+      "meal:sum:calories",
+    );
+    const entity_aggregation_forwarded_aggregate_res =
+      await _x.execute(entity_aggregation_runtime_server_calls[1]);
+    assert.equal(
+      entity_aggregation_forwarded_aggregate_res?._result?._value,
+      2926,
+    );
+    assert.equal(
+      entity_aggregation_runtime_server_calls[1]?._test_written_value,
+      2926,
+    );
+    assert.equal(Array.isArray(_xd.get("meal:records")), true);
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("meal:sum:protein"), "number");
+
+    _xd.delete("meal:records", { source: "entity-aggregation-failure-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-aggregation-failure-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-aggregation-failure-test" });
+    let entity_aggregation_failure_threw = false;
+    try {
+      await run_on_mount_in_client_runtime(
+        entity_aggregation_runtime_view._on_mount,
+        {
+          _id: "entity-aggregation-runtime-failure",
+          _fail_server_call: (command: any) =>
+            command?._module === "entity-manager" &&
+            command?._op === "aggregate",
+        },
+      );
+    } catch {
+      entity_aggregation_failure_threw = true;
+    }
+    assert.equal(entity_aggregation_failure_threw, false);
+    assert.equal(Array.isArray(_xd.get("meal:records")), true);
+    assert.equal(_xd.get("meal:sum:calories"), 0);
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+    assert.equal(_xd.get("meal:sum:protein"), 0);
+    assert.equal(typeof _xd.get("meal:sum:protein"), "number");
+
+    const entity_aggregation_calories_value =
+      new XObject(
+        entity_aggregation_summary._children[0]._children[1],
+      );
+    const entity_aggregation_protein_value =
+      new XObject(
+        entity_aggregation_summary._children[1]._children[1],
+      );
+    await entity_aggregation_calories_value.onMount();
+    await entity_aggregation_protein_value.onMount();
+    assert.notEqual(
+      String((entity_aggregation_calories_value as any)._text),
+      "[object Object]",
+    );
+    assert.notEqual(
+      String((entity_aggregation_protein_value as any)._text),
+      "[object Object]",
+    );
+    assert.equal(typeof (entity_aggregation_calories_value as any)._text, "number");
+    assert.equal(typeof (entity_aggregation_protein_value as any)._text, "number");
+
+    const entity_aggregation_runtime_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (entity_aggregation_runtime_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: entity_aggregation_runtime_app_id,
+        _env: "test",
+      },
+    });
+    const entity_aggregation_runtime_reloaded_home =
+      await (entity_aggregation_runtime_reloaded_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_aggregation_runtime_reloaded_home._result._view,
+      entity_aggregation_runtime_view,
+    );
+    _xd.delete("meal:records", { source: "entity-aggregation-runtime-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-aggregation-runtime-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-aggregation-runtime-test" });
+    await run_on_mount_in_client_runtime(
+      entity_aggregation_runtime_reloaded_home._result._view._on_mount,
+      { _id: "entity-aggregation-runtime-home-reload" },
+    );
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("meal:sum:protein"), "number");
+
+    const entity_aggregation_runtime_retry_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message:
+          "Display the sum of calories and the sum of protein from Meal records on the homepage.",
+        _runtime_context: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_aggregation_runtime_retry_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    const entity_aggregation_runtime_retry_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _plan: entity_aggregation_runtime_retry_plan_res._intent?._artifact_request,
+        },
+      });
+    assert.equal(entity_aggregation_runtime_retry_res._ok, true);
+    const entity_aggregation_runtime_retry_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_aggregation_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_aggregation_runtime_retry_home._result._view._on_mount,
+      entity_aggregation_runtime_view._on_mount,
+    );
+    assert.equal(
+      entity_aggregation_runtime_retry_home._result._view._children.filter(
+        (child: any) => child._id === "meal-aggregation-summary",
+      ).length,
+      1,
+    );
+
+    const entity_combined_runtime_app_id =
+      "entity-list-aggregation-runtime-app";
+    const entity_combined_runtime_ready_requirement =
+      `system.ready.server-xvm.test.${entity_combined_runtime_app_id}.subscribed`;
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_combined_runtime_app_id,
+        _env: "test",
+      },
+    });
+    const entity_combined_runtime_entity = {
+      _id: "meal",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+        calories: {
+          _type: "Number",
+        },
+        protein: {
+          _type: "Number",
+        },
+        notes: {
+          _type: "String",
+        },
+      },
+    };
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _entity: entity_combined_runtime_entity,
+        },
+      }))?._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _entity: entity_combined_runtime_entity,
+        },
+      }))?._ok,
+      true,
+    );
+    for (const record of [
+      {
+        name: "Combined Breakfast",
+        calories: 300,
+        protein: 20,
+        notes: "Combined 1",
+        _created_at: "2027-03-01T00:00:00.000Z",
+      },
+      {
+        name: "Combined Lunch",
+        calories: 400,
+        protein: 30,
+        notes: "Combined 2",
+        _created_at: "2027-03-02T00:00:00.000Z",
+      },
+      {
+        name: "Combined Dinner",
+        calories: 500,
+        protein: 40,
+        notes: "Combined 3",
+        _created_at: "2027-03-03T00:00:00.000Z",
+      },
+    ]) {
+      const add_combined_record_res = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _entity: "meal",
+          _data: record,
+        },
+      });
+      assert.equal(add_combined_record_res._ok, true);
+    }
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_combined_runtime_app_id,
+        _env: "test",
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _children: [
+            {
+              _id: "homepage-title",
+              _type: "label",
+              _text: "Meals",
+            },
+          ],
+        },
+      },
+    });
+
+    const combined_prompt =
+      "Show recent Meal records on the homepage and display total calories and protein.";
+    const entity_combined_runtime_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: combined_prompt,
+        _runtime_context: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_combined_runtime_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    assert_xvibe_mutation_plan(
+      entity_combined_runtime_plan_res,
+      {
+        _title: "Meal Entity List Summary",
+        _min_steps: 6,
+        _executable_steps: 6,
+        _unsupported_steps: 0,
+        _can_apply: true,
+        _step_ids: [
+          "require-wormhole-for-meal-records",
+          "load-recent-meal-records",
+          "add-recent-meal-records-table",
+          "compute-meal-sum-calories",
+          "compute-meal-sum-protein",
+          "display-meal-aggregation-summary",
+        ],
+      },
+    );
+
+    for (const alias_fixture of [
+      {
+        _app_id: "entity-list-aggregation-integer-app",
+        _schema: {
+          calories: {
+            _type: "Integer",
+          },
+          protein: {
+            _type: "Integer",
+          },
+        },
+      },
+      {
+        _app_id: "entity-list-aggregation-float-double-app",
+        _schema: {
+          calories: {
+            _type: "Float",
+          },
+          protein: {
+            _type: "Double",
+          },
+        },
+      },
+    ]) {
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "create_app",
+        _params: {
+          _app_id: alias_fixture._app_id,
+          _env: "test",
+        },
+      });
+      assert.equal(
+        (await _x.execute({
+          _module: "server-xvm",
+          _op: "set_entity",
+          _params: {
+            _app_id: alias_fixture._app_id,
+            _env: "test",
+            _entity: {
+              _id: "meal",
+              _schema: {
+                name: {
+                  _type: "String",
+                },
+                ...alias_fixture._schema,
+              },
+            },
+          },
+        }))?._ok,
+        true,
+      );
+      await _x.execute({
+        _module: "server-xvm",
+        _op: "push_update",
+        _params: {
+          _app_id: alias_fixture._app_id,
+          _env: "test",
+          _view: {
+            _id: "homepage",
+            _type: "view",
+            _children: [],
+          },
+        },
+      });
+      const alias_plan_res =
+        await entity_list_runtime_engine.analyze({
+          _message: combined_prompt,
+          _runtime_context: {
+            _app_id: alias_fixture._app_id,
+            _env: "test",
+            _active_view_id: "homepage",
+          },
+        });
+      assert_xvibe_mutation_plan(
+        alias_plan_res,
+        {
+          _title: "Meal Entity List Summary",
+          _min_steps: 6,
+          _executable_steps: 6,
+          _unsupported_steps: 0,
+          _can_apply: true,
+        },
+      );
+    }
+
+    const entity_combined_string_schema_app_id =
+      "entity-list-aggregation-string-schema-app";
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_combined_string_schema_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_combined_string_schema_app_id,
+          _env: "test",
+          _entity: {
+            _id: "meal",
+            _schema: {
+              name: {
+                _type: "String",
+              },
+              calories: {
+                _type: "String",
+              },
+              protein: {
+                _type: "String",
+              },
+            },
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_combined_string_schema_app_id,
+        _env: "test",
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _children: [],
+        },
+      },
+    });
+    const entity_combined_string_schema_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: combined_prompt,
+        _runtime_context: {
+          _app_id: entity_combined_string_schema_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert_xvibe_mutation_plan(
+      entity_combined_string_schema_plan_res,
+      {
+        _title: "Meal Entity List Summary",
+        _min_steps: 6,
+        _executable_steps: 3,
+        _unsupported_steps: 3,
+        _can_apply: false,
+        _step_ids: [
+          "require-wormhole-for-meal-records",
+          "load-recent-meal-records",
+          "add-recent-meal-records-table",
+          "compute-meal-sum-calories",
+          "compute-meal-sum-protein",
+          "display-meal-aggregation-summary",
+        ],
+      },
+    );
+    assert.deepEqual(
+      entity_combined_string_schema_plan_res._intent?._artifact_request?._steps
+        .map((step: any) => ({
+          _id: step._id,
+          _status: step._status,
+          _reason: step._reason,
+          _has_primitive: Boolean(step._primitive),
+        })),
+      [
+        {
+          _id: "require-wormhole-for-meal-records",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "load-recent-meal-records",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "add-recent-meal-records-table",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "compute-meal-sum-calories",
+          _status: "unsupported",
+          _reason: "field_not_numeric: calories is String",
+          _has_primitive: false,
+        },
+        {
+          _id: "compute-meal-sum-protein",
+          _status: "unsupported",
+          _reason: "field_not_numeric: protein is String",
+          _has_primitive: false,
+        },
+        {
+          _id: "display-meal-aggregation-summary",
+          _status: "unsupported",
+          _reason: "field_not_numeric: calories is String",
+          _has_primitive: false,
+        },
+      ],
+    );
+
+    const create_combined_conversation_res =
+      await (entity_list_runtime_xvibe as any)._create_conversation({
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _conversation_id: "entity-list-aggregation-chat",
+        },
+      });
+    assert.equal(create_combined_conversation_res._ok, true);
+    const original_entity_list_runtime_intent_engine =
+      (entity_list_runtime_xvibe as any).intent_engine;
+    (entity_list_runtime_xvibe as any).intent_engine =
+      entity_list_runtime_engine;
+    const combined_analyze_message_res =
+      await (entity_list_runtime_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _conversation_id: "entity-list-aggregation-chat",
+          _message: combined_prompt,
+          _runtime_context: {
+            _app_id: entity_combined_runtime_app_id,
+            _env: "test",
+            _active_view_id: "homepage",
+          },
+        },
+      });
+    assert.equal(combined_analyze_message_res._ok, true);
+    assert.equal(
+      combined_analyze_message_res._result._message._metadata._intent_processor,
+      "MutationPlanningProcessor",
+    );
+    assert_json_compatible_for_test(
+      combined_analyze_message_res._intent,
+      "persisted combined mutation intent",
+    );
+    assert.deepEqual(
+      combined_analyze_message_res._result._message._intent._artifact_request._steps
+        .map((step: any) => step._id),
+      [
+        "require-wormhole-for-meal-records",
+        "load-recent-meal-records",
+        "add-recent-meal-records-table",
+        "compute-meal-sum-calories",
+        "compute-meal-sum-protein",
+        "display-meal-aggregation-summary",
+      ],
+    );
+
+    const create_unsupported_combined_conversation_res =
+      await (entity_list_runtime_xvibe as any)._create_conversation({
+        _params: {
+          _app_id: entity_combined_string_schema_app_id,
+          _env: "test",
+          _conversation_id: "entity-list-aggregation-unsupported-chat",
+        },
+      });
+    assert.equal(create_unsupported_combined_conversation_res._ok, true);
+    const unsupported_combined_analyze_message_res =
+      await (entity_list_runtime_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: entity_combined_string_schema_app_id,
+          _env: "test",
+          _conversation_id: "entity-list-aggregation-unsupported-chat",
+          _message: combined_prompt,
+          _runtime_context: {
+            _app_id: entity_combined_string_schema_app_id,
+            _env: "test",
+            _active_view_id: "homepage",
+          },
+        },
+      });
+    assert.equal(unsupported_combined_analyze_message_res._ok, true);
+    assert.equal(
+      unsupported_combined_analyze_message_res._intent._artifact_request._can_apply,
+      false,
+    );
+    assert_json_compatible_for_test(
+      unsupported_combined_analyze_message_res._intent,
+      "persisted unsupported combined mutation intent",
+    );
+    assert.deepEqual(
+      unsupported_combined_analyze_message_res._intent._artifact_request._steps
+        .map((step: any) => ({
+          _id: step._id,
+          _status: step._status,
+          _reason: step._reason,
+          _has_primitive: Boolean(step._primitive),
+        })),
+      [
+        {
+          _id: "require-wormhole-for-meal-records",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "load-recent-meal-records",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "add-recent-meal-records-table",
+          _status: "planned",
+          _reason: undefined,
+          _has_primitive: true,
+        },
+        {
+          _id: "compute-meal-sum-calories",
+          _status: "unsupported",
+          _reason: "field_not_numeric: calories is String",
+          _has_primitive: false,
+        },
+        {
+          _id: "compute-meal-sum-protein",
+          _status: "unsupported",
+          _reason: "field_not_numeric: protein is String",
+          _has_primitive: false,
+        },
+        {
+          _id: "display-meal-aggregation-summary",
+          _status: "unsupported",
+          _reason: "field_not_numeric: calories is String",
+          _has_primitive: false,
+        },
+      ],
+    );
+    (entity_list_runtime_xvibe as any).intent_engine =
+      original_entity_list_runtime_intent_engine;
+
+    const entity_combined_runtime_plan: any =
+      entity_combined_runtime_plan_res._intent?._artifact_request;
+    const entity_combined_runtime_apply_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _plan: entity_combined_runtime_plan,
+        },
+    });
+    assert.equal(entity_combined_runtime_apply_res._ok, true);
+    assert.equal(entity_combined_runtime_apply_res._completed_steps, 6);
+
+    const entity_combined_runtime_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const entity_combined_runtime_view =
+      entity_combined_runtime_home._result._view;
+    assert.deepEqual(entity_combined_runtime_view._requires, [entity_combined_runtime_ready_requirement]);
+    const entity_combined_runtime_commands =
+      entity_combined_runtime_view._on_mount._commands;
+    assert.equal(entity_combined_runtime_commands.length, 6);
+    assert.equal(
+      entity_combined_runtime_commands.filter(
+        (command: any) =>
+          command._module === "entity-manager",
+      ).length,
+      0,
+    );
+    assert.equal(
+      entity_combined_runtime_commands.filter(
+        (command: any) => {
+          const server_command = test_entity_manager_server_command(command);
+          return server_command?._module === "entity-manager" &&
+            server_command?._op === "find";
+        },
+      ).length,
+      1,
+    );
+    assert.equal(
+      entity_combined_runtime_commands.filter(
+        (command: any) => {
+          const server_command = test_entity_manager_server_command(command);
+          return server_command?._module === "entity-manager" &&
+            server_command?._op === "aggregate";
+        },
+      ).length,
+      2,
+    );
+    const entity_combined_runtime_table =
+      entity_combined_runtime_view._children.find(
+        (child: any) => child._id === "recent-meal-records",
+      );
+    const entity_combined_runtime_summary =
+      entity_combined_runtime_view._children.find(
+        (child: any) => child._id === "meal-aggregation-summary",
+      );
+    assert.equal(entity_combined_runtime_table?._data_source, "meal:records");
+    assert.equal(entity_combined_runtime_summary?._type, "view");
+
+    _xd.delete("meal:records", { source: "entity-combined-runtime-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-combined-runtime-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-combined-runtime-test" });
+    await run_on_mount_in_client_runtime(
+      entity_combined_runtime_view._on_mount,
+      { _id: "entity-combined-runtime-home" },
+    );
+    const entity_combined_runtime_rows =
+      _xd.get("meal:records");
+    assert.equal(Array.isArray(entity_combined_runtime_rows), true);
+    assert.equal(entity_combined_runtime_rows.length, 10);
+    assert.deepEqual(
+      entity_combined_runtime_rows.slice(0, 3).map((record: any) => record.name),
+      [
+        "Combined Dinner",
+        "Combined Lunch",
+        "Combined Breakfast",
+      ],
+    );
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("meal:sum:protein"), "number");
+    assert.equal(_xd.get("meal:sum:calories"), 3508);
+    assert.equal(_xd.get("meal:sum:protein"), 190);
+    const entity_combined_calories_value =
+      new XObject(
+        entity_combined_runtime_summary._children[0]._children[1],
+      );
+    const entity_combined_protein_value =
+      new XObject(
+        entity_combined_runtime_summary._children[1]._children[1],
+      );
+    await entity_combined_calories_value.onMount();
+    await entity_combined_protein_value.onMount();
+    assert.notEqual(
+      String((entity_combined_calories_value as any)._text),
+      "[object Object]",
+    );
+    assert.notEqual(
+      String((entity_combined_protein_value as any)._text),
+      "[object Object]",
+    );
+    assert.equal((entity_combined_calories_value as any)._text, 3508);
+    assert.equal((entity_combined_protein_value as any)._text, 190);
+
+    const entity_combined_runtime_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (entity_combined_runtime_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: entity_combined_runtime_app_id,
+        _env: "test",
+      },
+    });
+    const entity_combined_runtime_reloaded_home =
+      await (entity_combined_runtime_reloaded_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_combined_runtime_reloaded_home._result._view,
+      entity_combined_runtime_view,
+    );
+    _xd.delete("meal:records", { source: "entity-combined-runtime-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-combined-runtime-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-combined-runtime-test" });
+    await run_on_mount_in_client_runtime(
+      entity_combined_runtime_reloaded_home._result._view._on_mount,
+      { _id: "entity-combined-runtime-home-reload" },
+    );
+    assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("meal:sum:protein"), "number");
+    assert.equal(_xd.get("meal:sum:calories"), 3508);
+    assert.equal(_xd.get("meal:sum:protein"), 190);
+
+    _xd.set(entity_combined_runtime_ready_requirement, false, { source: "entity-combined-cold-load-test" });
+    _xd.delete("meal:records", { source: "entity-combined-cold-load-test" });
+    _xd.delete("meal:sum:calories", { source: "entity-combined-cold-load-test" });
+    _xd.delete("meal:sum:protein", { source: "entity-combined-cold-load-test" });
+    let entity_combined_cold_mount_completed = false;
+    const entity_combined_cold_runtime =
+      new XpellEngine();
+    const entity_combined_cold_xvm =
+      new TestClientXVMModule();
+    await entity_combined_cold_runtime.loadModuleAsync(new XDataModule());
+    await entity_combined_cold_runtime.loadModuleAsync(entity_combined_cold_xvm);
+    try {
+      const entity_combined_cold_mount =
+        new XObject({
+          _id: "entity-combined-runtime-home-cold-load",
+          _requires: entity_combined_runtime_view._requires,
+          _on_mount: entity_combined_runtime_view._on_mount,
+        });
+      assert.deepEqual(
+        (entity_combined_cold_mount as any)._requires,
+        [entity_combined_runtime_ready_requirement],
+      );
+      const entity_combined_cold_mount_promise =
+        entity_combined_cold_mount.onMount().then(() => {
+          entity_combined_cold_mount_completed = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (!entity_combined_cold_mount_completed) {
+        assert.equal(_xd.get("meal:records"), undefined);
+        assert.equal(_xd.get("meal:sum:calories"), undefined);
+        _xd.set(entity_combined_runtime_ready_requirement, true, { source: "entity-combined-cold-load-test" });
+      }
+      await entity_combined_cold_mount_promise;
+      assert.equal(entity_combined_cold_mount_completed, true);
+      assert.equal(Array.isArray(_xd.get("meal:records")), true);
+      assert.equal(typeof _xd.get("meal:sum:calories"), "number");
+      assert.equal(_xd.get("meal:sum:calories"), 3508);
+    } finally {
+      restore_server_runtime_for_xobject();
+    }
+    _xd.set(entity_combined_runtime_ready_requirement, true, { source: "entity-combined-cold-load-test" });
+
+    const entity_legacy_aggregation_app_id =
+      "entity-list-aggregation-legacy-wrapper-app";
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_legacy_aggregation_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _entity: {
+            ...entity_combined_runtime_entity,
+            _id: "legacy-meal",
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _entity: {
+            ...entity_combined_runtime_entity,
+            _id: "legacy-meal",
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    for (const record of [
+      {
+        name: "Legacy Breakfast",
+        calories: 100,
+        protein: 10,
+        notes: "Legacy 1",
+        _created_at: "2027-04-01T00:00:00.000Z",
+      },
+      {
+        name: "Legacy Lunch",
+        calories: 250,
+        protein: 25,
+        notes: "Legacy 2",
+        _created_at: "2027-04-02T00:00:00.000Z",
+      },
+    ]) {
+      const add_legacy_record_res = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _entity: "legacy-meal",
+          _data: record,
+        },
+      });
+      assert.equal(add_legacy_record_res._ok, true);
+    }
+    const legacy_wrapper_on_mount = {
+      _mode: "chain",
+      _stop_on_error: true,
+      _commands: [
+        {
+          _module: "entity-manager",
+          _op: "find",
+          _params: {
+            _app_id: entity_legacy_aggregation_app_id,
+            _env: "test",
+            _entity: "legacy-meal",
+            _filter: {},
+            _sort: {
+              _sort_by: "_created_at",
+              _sort_order: "desc",
+            },
+            _limit: 10,
+            _xdata_destination: "legacy-meal:records",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-meal:records",
+            value: "$prev._result._records._data",
+            source: "entity-list:on-mount",
+          },
+        },
+        {
+          _module: "entity-manager",
+          _op: "aggregate",
+          _params: {
+            _entity: "legacy-meal",
+            _records: "$xdata:legacy-meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "calories",
+            },
+            _xdata_destination: "legacy-meal:sum:calories",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-meal:sum:calories",
+            value: "$prev",
+            source: "entity-aggregation:on-mount",
+          },
+        },
+        {
+          _module: "entity-manager",
+          _op: "aggregate",
+          _params: {
+            _entity: "legacy-meal",
+            _records: "$xdata:legacy-meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "protein",
+            },
+            _xdata_destination: "legacy-meal:sum:protein",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-meal:sum:protein",
+            value: "$prev",
+            source: "entity-aggregation:on-mount",
+          },
+        },
+      ],
+    };
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_legacy_aggregation_app_id,
+        _env: "test",
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _on_mount: legacy_wrapper_on_mount,
+          _children: [
+            {
+              _id: "homepage-title",
+              _type: "label",
+              _text: "Meals",
+            },
+          ],
+        },
+      },
+    });
+    const legacy_wrapper_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message:
+          "Show recent Legacy Meal records on the homepage and display total calories and protein.",
+        _runtime_context: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(legacy_wrapper_plan_res._processor, "MutationPlanningProcessor");
+    const legacy_wrapper_plan: any =
+      legacy_wrapper_plan_res._intent?._artifact_request;
+    assert.equal(legacy_wrapper_plan._can_apply, true);
+    const legacy_wrapper_on_mount_update =
+      legacy_wrapper_plan._steps.find(
+        (step: any) => step._id === "load-recent-legacy-meal-records",
+      )?._primitive?._params?._property_value;
+    assert.notDeepEqual(legacy_wrapper_on_mount_update, legacy_wrapper_on_mount);
+    assert.equal(
+      legacy_wrapper_on_mount_update._commands
+        .filter((command: any) =>
+          test_entity_manager_server_command(command)?._module === "entity-manager" &&
+          test_entity_manager_server_command(command)?._op === "aggregate" &&
+          test_entity_manager_server_command(command)?._params?._xdata_destination
+        ).length,
+      0,
+    );
+    assert.equal(
+      legacy_wrapper_on_mount_update._commands
+        .filter((command: any) => command._module === "entity-manager")
+        .length,
+      0,
+    );
+    assert.deepEqual(
+      legacy_wrapper_on_mount_update._commands
+        .filter((command: any) =>
+          command._module === "xd" &&
+          command._op === "set" &&
+          String(command._params?.key ?? "").startsWith("legacy-meal:sum:")
+        )
+        .map((command: any) => command._params.value),
+      [0, 0],
+    );
+    const legacy_wrapper_apply_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _plan: legacy_wrapper_plan,
+        },
+      });
+    assert.equal(legacy_wrapper_apply_res._ok, true);
+    assert.equal(legacy_wrapper_apply_res._completed_steps, 6);
+    const legacy_wrapper_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_legacy_aggregation_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const legacy_wrapper_view =
+      legacy_wrapper_home._result._view;
+    assert.deepEqual(
+      legacy_wrapper_view._requires,
+      [`system.ready.server-xvm.test.${entity_legacy_aggregation_app_id}.subscribed`],
+    );
+    assert.deepEqual(legacy_wrapper_view._on_mount, legacy_wrapper_on_mount_update);
+    _xd.delete("legacy-meal:records", { source: "entity-legacy-wrapper-test" });
+    _xd.delete("legacy-meal:sum:calories", { source: "entity-legacy-wrapper-test" });
+    _xd.delete("legacy-meal:sum:protein", { source: "entity-legacy-wrapper-test" });
+    await run_on_mount_in_client_runtime(
+      legacy_wrapper_view._on_mount,
+      { _id: "entity-legacy-wrapper-home" },
+    );
+    assert.equal(Array.isArray(_xd.get("legacy-meal:records")), true);
+    assert.equal(typeof _xd.get("legacy-meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("legacy-meal:sum:protein"), "number");
+    assert.equal(_xd.get("legacy-meal:sum:calories"), 350);
+    assert.equal(_xd.get("legacy-meal:sum:protein"), 35);
+
+    const entity_legacy_main_app_id =
+      "entity-list-aggregation-legacy-main-app";
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_legacy_main_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_legacy_main_app_id,
+          _env: "test",
+          _entity: {
+            ...entity_combined_runtime_entity,
+            _id: "legacy-main-meal",
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: entity_legacy_main_app_id,
+          _env: "test",
+          _entity: {
+            ...entity_combined_runtime_entity,
+            _id: "legacy-main-meal",
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    for (const record of [
+      {
+        name: "Legacy Main Breakfast",
+        calories: 180,
+        protein: 18,
+        notes: "Main legacy 1",
+        _created_at: "2027-05-01T00:00:00.000Z",
+      },
+      {
+        name: "Legacy Main Dinner",
+        calories: 420,
+        protein: 44,
+        notes: "Main legacy 2",
+        _created_at: "2027-05-02T00:00:00.000Z",
+      },
+    ]) {
+      const add_legacy_main_record_res = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: entity_legacy_main_app_id,
+          _env: "test",
+          _entity: "legacy-main-meal",
+          _data: record,
+        },
+      });
+      assert.equal(add_legacy_main_record_res._ok, true);
+    }
+    const legacy_main_on_mount_before = {
+      _mode: "chain",
+      _stop_on_error: true,
+      _commands: [
+        {
+          _module: "entity-manager",
+          _op: "find",
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _entity: "legacy-main-meal",
+            _filter: {},
+            _sort: {
+              _sort_by: "_created_at",
+              _sort_order: "desc",
+            },
+            _limit: 10,
+            _xdata_destination: "legacy-main-meal:records",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-main-meal:records",
+            value: "$prev._result._records._data",
+            source: "entity-list:on-mount",
+          },
+        },
+        {
+          _module: "entity-manager",
+          _op: "aggregate",
+          _params: {
+            _entity: "legacy-main-meal",
+            _records: "$xdata:legacy-main-meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "calories",
+            },
+            _xdata_destination: "legacy-main-meal:sum:calories",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-main-meal:sum:calories",
+            value: "$prev",
+            source: "entity-aggregation:on-mount",
+          },
+        },
+        {
+          _module: "entity-manager",
+          _op: "aggregate",
+          _params: {
+            _entity: "legacy-main-meal",
+            _records: "$xdata:legacy-main-meal:records",
+            _aggregation: {
+              _op: "sum",
+              _field: "protein",
+            },
+            _xdata_destination: "legacy-main-meal:sum:protein",
+          },
+        },
+        {
+          _module: "xd",
+          _op: "set",
+          _params: {
+            key: "legacy-main-meal:sum:protein",
+            value: "$prev",
+            source: "entity-aggregation:on-mount",
+          },
+        },
+      ],
+    };
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_legacy_main_app_id,
+        _env: "test",
+        _view: {
+          _id: "main",
+          _type: "view",
+          _on_mount: legacy_main_on_mount_before,
+          _children: [
+            {
+              _id: "main-title",
+              _type: "label",
+              _text: "Meals",
+            },
+          ],
+        },
+      },
+    });
+    const legacy_main_before_res =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_legacy_main_app_id,
+          _env: "test",
+          _view_id: "main",
+        },
+      });
+    assert.deepEqual(
+      legacy_main_before_res._result._view._on_mount,
+      legacy_main_on_mount_before,
+    );
+
+    const legacy_main_logs: Array<{ _message: string; _data: any }> = [];
+    const legacy_main_original_log = _xlog.log;
+    try {
+      (_xlog as any).log = (message: string, data?: any) => {
+        if (
+          message === "[xvibe] entity on-mount loader identical" ||
+          message === "[xvibe] entity on-mount legacy loader detected" ||
+          message === "[xvibe] entity on-mount loader upgraded" ||
+          message === "[entity-manager] aggregate result" ||
+          message === "[entity-manager] aggregate value resolved"
+        ) {
+          legacy_main_logs.push({ _message: message, _data: data });
+        }
+        return legacy_main_original_log.call(_xlog, message, data);
+      };
+
+      const legacy_main_plan_res =
+        await entity_list_runtime_engine.analyze({
+          _message:
+            "Show recent Legacy Main Meal records on the homepage and display total calories and protein.",
+          _runtime_context: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _active_view_id: "main",
+          },
+        });
+      assert.equal(legacy_main_plan_res._processor, "MutationPlanningProcessor");
+      assert.equal(entity_list_runtime_semantic_calls, 0);
+      const legacy_main_plan: any =
+        legacy_main_plan_res._intent?._artifact_request;
+      assert.equal(legacy_main_plan._can_apply, true);
+      const legacy_main_on_mount_after_plan =
+        legacy_main_plan._steps.find(
+          (step: any) => step._id === "load-recent-legacy-main-meal-records",
+        )?._primitive?._params?._property_value;
+      assert.notDeepEqual(
+        legacy_main_on_mount_after_plan,
+        legacy_main_on_mount_before,
+      );
+      assert.deepEqual(
+        legacy_main_on_mount_after_plan._commands
+          .map((command: any) => test_entity_manager_server_command(command))
+          .filter((command: any) =>
+            command?._module === "entity-manager" &&
+            command?._op === "aggregate"
+          )
+          .map((command: any) => ({
+            _field: command._params?._aggregation?._field,
+            _result_xdata_key: command._params?._result_xdata_key,
+            _xdata_destination: command._params?._xdata_destination,
+          })),
+        [
+          {
+            _field: "calories",
+            _result_xdata_key: "legacy-main-meal:sum:calories",
+            _xdata_destination: undefined,
+          },
+          {
+            _field: "protein",
+            _result_xdata_key: "legacy-main-meal:sum:protein",
+            _xdata_destination: undefined,
+          },
+        ],
+      );
+      assert.equal(
+        legacy_main_on_mount_after_plan._commands
+          .filter((command: any) => command._module === "entity-manager")
+          .length,
+        0,
+      );
+      assert.deepEqual(
+        legacy_main_on_mount_after_plan._commands
+          .filter((command: any) =>
+            command._module === "xd" &&
+            command._op === "set" &&
+            String(command._params?.key ?? "").startsWith("legacy-main-meal:sum:")
+          )
+          .map((command: any) => command._params.value),
+        [0, 0],
+      );
+      assert.equal(
+        legacy_main_logs.some((entry) =>
+          entry._message === "[xvibe] entity on-mount legacy loader detected" &&
+          entry._data?._reasons?.includes("aggregate_xdata_destination") &&
+          entry._data?._reasons?.includes("aggregate_value_not_primitive") &&
+          entry._data?._reasons?.includes("server_module_loader")
+        ),
+        true,
+      );
+      assert.equal(
+        legacy_main_logs.some((entry) =>
+          entry._message === "[xvibe] entity on-mount loader upgraded"
+        ),
+        true,
+      );
+      assert.equal(
+        legacy_main_logs.some((entry) =>
+          entry._message === "[xvibe] entity on-mount loader identical"
+        ),
+        false,
+      );
+
+      const legacy_main_apply_res =
+        await _x.execute({
+          _module: "xvibe",
+          _op: "apply-mutation-plan",
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _plan: legacy_main_plan,
+          },
+      });
+      assert.equal(legacy_main_apply_res._ok, true);
+      assert.equal(legacy_main_apply_res._completed_steps, 6);
+      const legacy_main_after_res =
+        await (server_xvm as any)._get_view({
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _view_id: "main",
+          },
+        });
+      const legacy_main_view_after =
+        legacy_main_after_res._result._view;
+      assert.deepEqual(
+        legacy_main_view_after._requires,
+        [`system.ready.server-xvm.test.${entity_legacy_main_app_id}.subscribed`],
+      );
+      assert.deepEqual(
+        legacy_main_view_after._on_mount,
+        legacy_main_on_mount_after_plan,
+      );
+
+      const legacy_main_reloaded_xvm =
+        new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+      await (legacy_main_reloaded_xvm as any)._load_app_from_disk({
+        _params: {
+          _app_id: entity_legacy_main_app_id,
+          _env: "test",
+        },
+      });
+      const legacy_main_reloaded_res =
+        await (legacy_main_reloaded_xvm as any)._get_view({
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _view_id: "main",
+          },
+        });
+      assert.deepEqual(
+        legacy_main_reloaded_res._result._view._on_mount,
+        legacy_main_on_mount_after_plan,
+      );
+
+      _xd.delete("legacy-main-meal:records", { source: "entity-legacy-main-test" });
+      _xd.delete("legacy-main-meal:sum:calories", { source: "entity-legacy-main-test" });
+      _xd.delete("legacy-main-meal:sum:protein", { source: "entity-legacy-main-test" });
+      await run_on_mount_in_client_runtime(
+        legacy_main_reloaded_res._result._view._on_mount,
+        { _id: "entity-legacy-main" },
+      );
+      assert.equal(
+        legacy_main_logs.filter((entry) =>
+          entry._message === "[entity-manager] aggregate result"
+        ).length,
+        2,
+      );
+      assert.equal(
+        legacy_main_logs.filter((entry) =>
+          entry._message === "[entity-manager] aggregate value resolved"
+        ).length,
+        2,
+      );
+      assert.equal(Array.isArray(_xd.get("legacy-main-meal:records")), true);
+      assert.equal(typeof _xd.get("legacy-main-meal:sum:calories"), "number");
+      assert.equal(typeof _xd.get("legacy-main-meal:sum:protein"), "number");
+      assert.equal(_xd.get("legacy-main-meal:sum:calories"), 600);
+      assert.equal(_xd.get("legacy-main-meal:sum:protein"), 62);
+      const legacy_main_summary =
+        legacy_main_view_after._children.find(
+          (child: any) => child._id === "legacy-main-meal-aggregation-summary",
+        );
+      assert.ok(legacy_main_summary);
+      const legacy_main_calories_value =
+        new XObject(legacy_main_summary._children[0]._children[1]);
+      const legacy_main_protein_value =
+        new XObject(legacy_main_summary._children[1]._children[1]);
+      await legacy_main_calories_value.onMount();
+      await legacy_main_protein_value.onMount();
+      assert.equal((legacy_main_calories_value as any)._text, 600);
+      assert.equal((legacy_main_protein_value as any)._text, 62);
+      assert.notEqual(String((legacy_main_calories_value as any)._text), "[object Object]");
+      assert.notEqual(String((legacy_main_protein_value as any)._text), "[object Object]");
+
+      const legacy_main_retry_plan_res =
+        await entity_list_runtime_engine.analyze({
+          _message:
+            "Show recent Legacy Main Meal records on the homepage and display total calories and protein.",
+          _runtime_context: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _active_view_id: "main",
+          },
+        });
+      assert.equal(legacy_main_retry_plan_res._processor, "MutationPlanningProcessor");
+      assert.equal(
+        legacy_main_logs.some((entry) =>
+          entry._message === "[xvibe] entity on-mount loader identical"
+        ),
+        true,
+      );
+      const legacy_main_retry_res =
+        await _x.execute({
+          _module: "xvibe",
+          _op: "apply-mutation-plan",
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _plan: legacy_main_retry_plan_res._intent?._artifact_request,
+          },
+        });
+      assert.equal(legacy_main_retry_res._ok, true);
+      const legacy_main_retry_home =
+        await (server_xvm as any)._get_view({
+          _params: {
+            _app_id: entity_legacy_main_app_id,
+            _env: "test",
+            _view_id: "main",
+          },
+        });
+      assert.deepEqual(
+        legacy_main_retry_home._result._view._on_mount,
+        legacy_main_on_mount_after_plan,
+      );
+      assert.equal(
+        legacy_main_retry_home._result._view._children.filter(
+          (child: any) => child._id === "legacy-main-meal-aggregation-summary",
+        ).length,
+        1,
+      );
+    } finally {
+      (_xlog as any).log = legacy_main_original_log;
+    }
+
+    const entity_zero_combined_app_id =
+      "entity-list-aggregation-zero-records-app";
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: entity_zero_combined_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _entity: {
+            _id: "empty-meal",
+            _schema: {
+              name: {
+                _type: "String",
+              },
+              calories: {
+                _type: "Number",
+              },
+              protein: {
+                _type: "Number",
+              },
+            },
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _entity: {
+            _id: "empty-meal",
+            _schema: {
+              name: {
+                _type: "String",
+              },
+              calories: {
+                _type: "Number",
+              },
+              protein: {
+                _type: "Number",
+              },
+            },
+          },
+        },
+      }))?._ok,
+      true,
+    );
+    await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: entity_zero_combined_app_id,
+        _env: "test",
+        _view: {
+          _id: "homepage",
+          _type: "view",
+          _children: [
+            {
+              _id: "homepage-title",
+              _type: "label",
+              _text: "Empty Meals",
+            },
+          ],
+        },
+      },
+    });
+    const zero_combined_prompt =
+      "Show recent Empty Meal records on the homepage and display total calories and protein.";
+    const entity_zero_combined_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: zero_combined_prompt,
+        _runtime_context: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert_xvibe_mutation_plan(
+      entity_zero_combined_plan_res,
+      {
+        _title: "Empty Meal Entity List Summary",
+        _min_steps: 6,
+        _executable_steps: 6,
+        _unsupported_steps: 0,
+        _can_apply: true,
+      },
+    );
+    const entity_zero_combined_apply_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _plan: entity_zero_combined_plan_res._intent?._artifact_request,
+        },
+    });
+    assert.equal(entity_zero_combined_apply_res._ok, true);
+    assert.equal(entity_zero_combined_apply_res._completed_steps, 6);
+    const entity_zero_combined_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    const entity_zero_combined_view =
+      entity_zero_combined_home._result._view;
+    const entity_zero_combined_summary =
+      entity_zero_combined_view._children.find(
+        (child: any) => child._id === "empty-meal-aggregation-summary",
+      );
+    _xd.delete("empty-meal:records", { source: "entity-zero-combined-test" });
+    _xd.delete("empty-meal:sum:calories", { source: "entity-zero-combined-test" });
+    _xd.delete("empty-meal:sum:protein", { source: "entity-zero-combined-test" });
+    await run_on_mount_in_client_runtime(
+      entity_zero_combined_view._on_mount,
+      { _id: "entity-zero-combined-home" },
+    );
+    const entity_zero_combined_rows =
+      _xd.get("empty-meal:records");
+    assert.equal(Array.isArray(entity_zero_combined_rows), true);
+    assert.equal(entity_zero_combined_rows.length, 0);
+    assert.equal(typeof _xd.get("empty-meal:sum:calories"), "number");
+    assert.equal(typeof _xd.get("empty-meal:sum:protein"), "number");
+    assert.equal(_xd.get("empty-meal:sum:calories"), 0);
+    assert.equal(_xd.get("empty-meal:sum:protein"), 0);
+    const entity_zero_combined_calories_value =
+      new XObject(
+        entity_zero_combined_summary._children[0]._children[1],
+      );
+    const entity_zero_combined_protein_value =
+      new XObject(
+        entity_zero_combined_summary._children[1]._children[1],
+      );
+    await entity_zero_combined_calories_value.onMount();
+    await entity_zero_combined_protein_value.onMount();
+    assert.notEqual(
+      String((entity_zero_combined_calories_value as any)._text),
+      "[object Object]",
+    );
+    assert.notEqual(
+      String((entity_zero_combined_protein_value as any)._text),
+      "[object Object]",
+    );
+    assert.equal((entity_zero_combined_calories_value as any)._text, 0);
+    assert.equal((entity_zero_combined_protein_value as any)._text, 0);
+    const entity_zero_combined_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (entity_zero_combined_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: entity_zero_combined_app_id,
+        _env: "test",
+      },
+    });
+    const entity_zero_combined_reloaded_home =
+      await (entity_zero_combined_reloaded_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_zero_combined_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    _xd.delete("empty-meal:records", { source: "entity-zero-combined-test" });
+    _xd.delete("empty-meal:sum:calories", { source: "entity-zero-combined-test" });
+    _xd.delete("empty-meal:sum:protein", { source: "entity-zero-combined-test" });
+    await run_on_mount_in_client_runtime(
+      entity_zero_combined_reloaded_home._result._view._on_mount,
+      { _id: "entity-zero-combined-home-reload" },
+    );
+    assert.equal(Array.isArray(_xd.get("empty-meal:records")), true);
+    assert.equal(_xd.get("empty-meal:records").length, 0);
+    assert.equal(_xd.get("empty-meal:sum:calories"), 0);
+    assert.equal(_xd.get("empty-meal:sum:protein"), 0);
+
+    const entity_combined_runtime_retry_plan_res =
+      await entity_list_runtime_engine.analyze({
+        _message: combined_prompt,
+        _runtime_context: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _active_view_id: "homepage",
+        },
+      });
+    assert.equal(entity_combined_runtime_retry_plan_res._processor, "MutationPlanningProcessor");
+    assert.equal(entity_list_runtime_semantic_calls, 0);
+    const entity_combined_runtime_retry_res =
+      await _x.execute({
+        _module: "xvibe",
+        _op: "apply-mutation-plan",
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _plan: entity_combined_runtime_retry_plan_res._intent?._artifact_request,
+        },
+      });
+    assert.equal(entity_combined_runtime_retry_res._ok, true);
+    const entity_combined_runtime_retry_home =
+      await (server_xvm as any)._get_view({
+        _params: {
+          _app_id: entity_combined_runtime_app_id,
+          _env: "test",
+          _view_id: "homepage",
+        },
+      });
+    assert.deepEqual(
+      entity_combined_runtime_retry_home._result._view._on_mount,
+      entity_combined_runtime_view._on_mount,
+    );
+    assert.equal(
+      entity_combined_runtime_retry_home._result._view._children.filter(
+        (child: any) => child._id === "recent-meal-records",
+      ).length,
+      1,
+    );
+    assert.equal(
+      entity_combined_runtime_retry_home._result._view._children.filter(
+        (child: any) => child._id === "meal-aggregation-summary",
+      ).length,
+      1,
+    );
+  } finally {
+    (_x as any).execute = original_entity_list_execute;
+    (_x as any).getSkills = original_entity_list_get_skills;
+  }
 
   const artifact_request_app_id = "artifact-request-app";
   await _x.execute({
@@ -14495,6 +29601,25 @@ try {
     "create-product-record",
     "product",
   );
+  const artifact_request_xdata_flow_intent_res =
+    await artifact_request_intent_engine.analyze({
+      _message:
+        'Create a flow named save-project with one step that sets XData key save-status to "Project saved".',
+      _runtime_context: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+  assert_xvibe_xdata_set_flow_artifact_request(
+    artifact_request_xdata_flow_intent_res,
+    {
+      _app_id: artifact_request_app_id,
+      _env: "test",
+      _flow_id: "save-project",
+      _xdata_key: "save-status",
+      _xdata_value: "Project saved",
+    },
+  );
   const artifact_request_form_intent_res =
     await artifact_request_intent_engine.analyze({
       _message: "Create product form",
@@ -14531,6 +29656,11 @@ try {
   let artifact_request_ai_calls = 0;
   let artifact_request_studio_calls = 0;
   let graph_failure_set_entity_calls = 0;
+  let artifact_request_flow_run_calls = 0;
+  let artifact_request_xd_set_calls = 0;
+  let artifact_request_close_object_calls = 0;
+  const artifact_request_runtime_objects: Record<string, any> = {};
+  const artifact_request_flow_manager = new FlowManagerModule();
   const graph_execution_persist_ops: string[] = [];
   try {
     (_x as any).execute = async (command: any) => {
@@ -14545,6 +29675,51 @@ try {
       if (command?._module === "studio") {
         artifact_request_studio_calls += 1;
         throw new Error("XStudio should not be called for artifact request apply");
+      }
+
+      if (
+        command?._module === "xvibe" &&
+        command?._op === "apply-artifact-request"
+      ) {
+        return (artifact_request_xvibe as any)._apply_artifact_request(command);
+      }
+
+      if (
+        command?._module === "xvibe" &&
+        command?._op === "append-flow-success-command"
+      ) {
+        return (artifact_request_xvibe as any)._append_flow_success_command(command);
+      }
+
+      if (command?._module === "flow" && command?._op === "run") {
+        artifact_request_flow_run_calls += 1;
+        return (artifact_request_flow_manager as any)._run(command);
+      }
+
+      if (command?._op === "close-object") {
+        artifact_request_close_object_calls += 1;
+        artifact_request_runtime_objects[
+          command?._params?._id
+        ]?.close?.();
+        return {
+          _ok: true,
+          _result: {
+            _id: command?._params?._id,
+          },
+        };
+      }
+
+      if (command?._module === "xd" && command?._op === "set") {
+        artifact_request_xd_set_calls += 1;
+        _xd.set(command?._params?.key, command?._params?.value, {
+          source: command?._params?.source ?? "test:xd-set",
+        });
+        return {
+          _ok: true,
+          _result: {
+            key: command?._params?.key,
+          },
+        };
       }
 
       if (
@@ -14728,6 +29903,48 @@ try {
     );
     assert.equal(created_form_artifact._id, "create-product");
     assert.equal(created_form_artifact._type, "view");
+    assert.deepEqual(created_form_artifact._on_mount, [
+      {
+        _module: "xd",
+        _op: "delete",
+        _params: {
+          key: "form.create-product.name",
+          source: "xvibe:form-reset:create-product",
+        },
+      },
+      {
+        _module: "xd",
+        _op: "delete",
+        _params: {
+          key: "form.create-product.price",
+          source: "xvibe:form-reset:create-product",
+        },
+      },
+      {
+        _module: "xd",
+        _op: "delete",
+        _params: {
+          key: "form.create-product.description",
+          source: "xvibe:form-reset:create-product",
+        },
+      },
+    ]);
+    assert.deepEqual(
+      created_form_artifact._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      [
+        "form.create-product.name",
+        "form.create-product.price",
+        "form.create-product.description",
+      ],
+    );
+    assert.equal(
+      created_form_artifact._on_mount.some((command: any) =>
+        String(command._params?.key ?? "").startsWith("product.records"),
+      ),
+      false,
+    );
     assert.equal(
       find_xui_node_for_test(created_form_artifact, "create-product-title")
         ?._text,
@@ -14854,7 +30071,7 @@ try {
             name: {
               _type: "String",
             },
-            price: {
+            invoice_number: {
               _type: "String",
             },
             _created_at: {
@@ -14909,12 +30126,34 @@ try {
         ?._text,
       "Product List",
     );
+    const created_table_toolbar = find_xui_node_for_test(
+      created_table_artifact,
+      "product-list-toolbar",
+    ) as any;
+    assert.equal(created_table_toolbar?._type, "toolbar");
+    const created_table_new_button = find_xui_node_for_test(
+      created_table_artifact,
+      "product-list-new",
+    ) as any;
+    assert.equal(created_table_new_button?._type, "button");
+    assert.equal(created_table_new_button?._text, "New");
+    assert.equal(created_table_new_button?.type, "button");
+    assert.deepEqual(created_table_new_button?._on, {
+      click: {
+        _module: "xvm",
+        _op: "navigate",
+        _params: {
+          _to: "create-product",
+        },
+      },
+    });
     const created_table = find_xui_node_for_test(
       created_table_artifact,
       "product-list-table",
     ) as any;
     assert.equal(created_table?._type, "table");
     assert.equal(created_table?._data_source, "product.records");
+    assert.equal(created_table?._empty_text, "No product records yet.");
     assert.deepEqual(created_table_artifact._on_mount, {
       _module: "entity-client",
       _op: "find",
@@ -14930,8 +30169,8 @@ try {
         _label: "Name",
       },
       {
-        _key: "price",
-        _label: "Price",
+        _key: "invoice_number",
+        _label: "Invoice Number",
       },
       {
         _key: "description",
@@ -14956,7 +30195,7 @@ try {
     );
     assert.deepEqual(
       created_table?._columns.map((column: any) => column._key),
-      ["name", "price", "description"],
+      ["name", "invoice_number", "description"],
     );
     const resolved_product_table = await artifact_resolver.getView(
       table_artifact_app_id,
@@ -15096,6 +30335,178 @@ try {
     assert.equal(created_flow_data._created_at, undefined);
     assert.equal(created_flow_data._updated_at, undefined);
 
+    const artifact_request_flow_chat_res =
+      await (artifact_request_xvibe as any)._create_conversation({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _conversation_id: "flow-create-chat",
+        },
+      });
+    assert.equal(artifact_request_flow_chat_res._ok, true);
+    const artifact_request_original_intent_engine =
+      (artifact_request_xvibe as any).intent_engine;
+    let artifact_request_xdata_flow_semantic_calls = 0;
+    try {
+      set_xvibe_semantic_intent_env(
+        "true",
+        "artifact-request-xdata-flow-semantic",
+      );
+      (artifact_request_xvibe as any).intent_engine =
+        xvibe_test_intent_engine({
+          _semantic_generate_json: async () => {
+            artifact_request_xdata_flow_semantic_calls += 1;
+            return XVIBE_SEMANTIC_VALID_INTENT;
+          },
+        });
+      const artifact_request_flow_analyze_res =
+        await (artifact_request_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: artifact_request_app_id,
+            _env: "test",
+            _conversation_id: "flow-create-chat",
+            _message:
+              'Create a flow named save-project with one step that sets XData key save-status to "Project saved".',
+            _runtime_context: {
+              _app_id: artifact_request_app_id,
+              _env: "test",
+            },
+          },
+        });
+      assert.equal(artifact_request_flow_analyze_res._ok, true);
+      assert.equal(
+        artifact_request_flow_analyze_res._result._message._metadata._intent_processor,
+        "FlowProcessor",
+      );
+      assert.equal(artifact_request_xdata_flow_semantic_calls, 0);
+      assert.deepEqual(
+        artifact_request_flow_analyze_res._intent._artifact_request,
+        artifact_request_xdata_flow_intent_res._intent?._artifact_request,
+      );
+      assert.deepEqual(
+        artifact_request_flow_analyze_res._intent._actions[0]._execution_payload,
+        artifact_request_xdata_flow_intent_res._intent?._actions[0]._execution_payload,
+      );
+    } finally {
+      (artifact_request_xvibe as any).intent_engine =
+        artifact_request_original_intent_engine;
+      set_xvibe_semantic_intent_env(undefined);
+    }
+
+    const apply_xdata_flow_action =
+      artifact_request_xdata_flow_intent_res._intent?._actions[0];
+    assert.equal(apply_xdata_flow_action?._executable, true);
+    const apply_xdata_flow_request_res =
+      await (_x as any).execute(apply_xdata_flow_action?._execution_payload);
+    const expected_xdata_flow_artifact_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      artifact_request_app_id,
+      "flows",
+      "save-project.json",
+    );
+    assert.deepEqual(apply_xdata_flow_request_res, {
+      _ok: true,
+      _artifact_type: "flow",
+      _operation: "create",
+      _flow_id: "save-project",
+      _xdata_key: "save-status",
+      _path: expected_xdata_flow_artifact_path,
+    });
+    const created_xdata_flow_artifact = JSON.parse(
+      await readFile(expected_xdata_flow_artifact_path, "utf-8"),
+    );
+    assert.deepEqual(created_xdata_flow_artifact, {
+      _id: "save-project",
+      _steps: [
+        {
+          _id: "set-save-status",
+          _command: {
+            _module: "xd",
+            _op: "set",
+            _params: {
+              key: "save-status",
+              value: "Project saved",
+              source: "flow:save-project",
+            },
+          },
+        },
+      ],
+    });
+
+    const xdata_flow_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (xdata_flow_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+    const xdata_flow_reloaded_res =
+      await (xdata_flow_reloaded_xvm as any)._get_flow({
+        _params: {
+          _app_id: artifact_request_app_id,
+          _env: "test",
+          _flow_id: "save-project",
+        },
+      });
+    assert.deepEqual(
+      xdata_flow_reloaded_res._result._flow,
+      created_xdata_flow_artifact,
+    );
+
+    _xd.delete("save-status", { source: "test:xdata-flow-reset" });
+    const xdata_flow_run_start = artifact_request_flow_run_calls;
+    const xdata_flow_xd_set_start = artifact_request_xd_set_calls;
+    const xdata_flow_run_res = await (_x as any).execute({
+      _module: "flow",
+      _op: "run",
+      _params: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+        _flow_id: "save-project",
+        _event_payload: {},
+      },
+    });
+    assert.equal(xdata_flow_run_res._ok, true);
+    assert.equal(artifact_request_flow_run_calls, xdata_flow_run_start + 1);
+    assert.equal(artifact_request_xd_set_calls, xdata_flow_xd_set_start + 1);
+    assert.equal(_xd.get("save-status"), "Project saved");
+
+    const xdata_flow_before_retry =
+      await readFile(expected_xdata_flow_artifact_path, "utf-8");
+    const apply_xdata_flow_retry_res =
+      await (_x as any).execute(apply_xdata_flow_action?._execution_payload);
+    assert.deepEqual(apply_xdata_flow_retry_res, {
+      _ok: true,
+      _artifact_type: "flow",
+      _operation: "create",
+      _flow_id: "save-project",
+      _xdata_key: "save-status",
+      _already_exists: true,
+      _path: expected_xdata_flow_artifact_path,
+    });
+    assert.equal(
+      await readFile(expected_xdata_flow_artifact_path, "utf-8"),
+      xdata_flow_before_retry,
+    );
+    const xdata_flow_list_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "list_flows",
+      _params: {
+        _app_id: artifact_request_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(
+      xdata_flow_list_res._result._flows
+        .filter((flow: any) => flow._id === "save-project")
+        .length,
+      1,
+    );
+
     const crud_flow_fixture_res = await _x.execute({
       _module: "server-xvm",
       _op: "set_flow",
@@ -15233,6 +30644,26 @@ try {
     });
     const form_wiring_artifact = JSON.parse(
       await readFile(expected_form_wiring_path, "utf-8"),
+    );
+    assert.deepEqual(
+      form_wiring_artifact._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      [
+        "form.create-administrators.display_name",
+        "form.create-administrators.email",
+        "form.create-administrators.role",
+      ],
+    );
+    assert.equal(
+      form_wiring_artifact._on_mount.every(
+        (command: any) =>
+          command._module === "xd" &&
+          command._op === "delete" &&
+          command._params?.source ===
+            "xvibe:form-reset:create-administrators",
+      ),
+      true,
     );
     const form_wiring_container = find_xui_node_for_test(
       form_wiring_artifact,
@@ -15387,6 +30818,24 @@ try {
       form_success_artifact,
       "create-vendors-form",
     ) as any;
+    assert.deepEqual(form_success_artifact._on_mount, [
+      {
+        _module: "xd",
+        _op: "delete",
+        _params: {
+          key: "form.create-vendors.name",
+          source: "xvibe:form-reset:create-vendors",
+        },
+      },
+      {
+        _module: "xd",
+        _op: "delete",
+        _params: {
+          key: "form.create-vendors.email",
+          source: "xvibe:form-reset:create-vendors",
+        },
+      },
+    ]);
     assert.deepEqual(form_success_container?._submit, {
       _flow: "create-vendors",
       _running: true,
@@ -15403,6 +30852,1530 @@ try {
         name: "$xdata.form.create-vendors.name",
         email: "$xdata.form.create-vendors.email",
       },
+    });
+
+    const meal_success_app_id = "meal-success-modal-app";
+    const meal_success_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(meal_success_create_app_res._ok, true);
+    const meal_success_entity = {
+      _id: "meal",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+        calories: {
+          _type: "String",
+        },
+      },
+    };
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _entity: meal_success_entity,
+        },
+      }))._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "entity-manager",
+        _op: "register",
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _entity: meal_success_entity,
+        },
+      }))._ok,
+      true,
+    );
+    const meal_success_existing_command = {
+      _module: "xd",
+      _op: "set",
+      _params: {
+        key: "meal.last-success",
+        value: "preserved",
+        source: "meal-success-test",
+      },
+    };
+    const meal_success_flow_steps = [
+      {
+        _id: "add-meal",
+        _command: {
+          _module: "entity-manager",
+          _op: "add",
+          _params: {
+            _app_id: meal_success_app_id,
+            _env: "test",
+            _entity: "meal",
+            _data: {
+              name: "$event.name",
+              calories: "$event.calories",
+            },
+          },
+        },
+      },
+    ];
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_flow",
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _flow: {
+            _id: "create-meal",
+            _steps: meal_success_flow_steps,
+            _on_success: meal_success_existing_command,
+          },
+        },
+      }))._ok,
+      true,
+    );
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "push_update",
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _view: {
+            _id: "home",
+            _type: "view",
+            _children: [
+              {
+                _id: "add-meal-button",
+                _type: "button",
+                _text: "Add Meal",
+              },
+              {
+                _type: "modal",
+                _id: "create-meal-modal",
+                _open: false,
+                _title: "Add Meal",
+                _size: "lg",
+                _closable: true,
+                _close_on_backdrop: true,
+                _children: [
+                  {
+                    _id: "xvm-view",
+                    _type: "xvm-view",
+                    _view_id: "create-meal",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      }))._ok,
+      true,
+    );
+    const meal_success_form_apply_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _artifact_type: "form",
+          _artifact_request: {
+            _operation: "create",
+            _entity_name: "meal",
+            _view_id: "create-meal",
+          },
+        },
+      });
+    assert.equal(meal_success_form_apply_res._ok, true);
+    const meal_success_form_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      meal_success_app_id,
+      "views",
+      "create-meal.json",
+    );
+    const meal_success_form = JSON.parse(
+      await readFile(meal_success_form_path, "utf-8"),
+    );
+    const meal_success_submit = find_xui_node_for_test(
+      meal_success_form,
+      "create-meal-submit",
+    ) as any;
+    assert.deepEqual(meal_success_submit?._flow, {
+      _id: "create-meal",
+      _payload: {
+        name: "$xdata.form.create-meal.name",
+        calories: "$xdata.form.create-meal.calories",
+      },
+    });
+
+    set_xvibe_semantic_intent_env("true", "meal-success-modal-close");
+    let meal_success_semantic_calls = 0;
+    const meal_success_engine = xvibe_test_intent_engine({
+      _semantic_generate_json: async () => {
+        meal_success_semantic_calls += 1;
+        return XVIBE_SEMANTIC_VALID_INTENT;
+      },
+    });
+    const meal_success_prompt_res = await meal_success_engine.analyze({
+      _message: "After the Meal form saves successfully, close create-meal-modal.",
+      _runtime_context: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _active_view_id: "create-meal",
+      },
+    });
+    set_xvibe_semantic_intent_env(undefined);
+    assert.equal(meal_success_prompt_res._ok, true);
+    assert.equal(meal_success_prompt_res._processor, "DeterministicIntentProcessor");
+    assert.equal(
+      meal_success_prompt_res._intent?._reason,
+      "deterministic_meal_form_success_modal_close",
+    );
+    assert.equal(meal_success_semantic_calls, 0);
+    assert.deepEqual(meal_success_prompt_res._intent?._artifact_request, {
+      _operation: "append-on-success-command",
+      _flow_id: "create-meal",
+      _command: {
+        _op: "close-object",
+        _params: {
+          _id: "create-meal-modal",
+        },
+      },
+    });
+    const meal_success_action =
+      meal_success_prompt_res._intent?._actions?.[0];
+    assert.equal(meal_success_action?._executable, true);
+    assert.deepEqual(meal_success_action?._execution_payload, {
+      _module: "xvibe",
+      _op: "append-flow-success-command",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _flow_id: "create-meal",
+        _command: {
+          _op: "close-object",
+          _params: {
+            _id: "create-meal-modal",
+          },
+        },
+      },
+    });
+    const meal_success_append_res =
+      await (_x as any).execute(meal_success_action?._execution_payload);
+    assert.deepEqual(meal_success_append_res, {
+      _ok: true,
+      _artifact_type: "flow",
+      _operation: "append-on-success-command",
+      _flow_id: "create-meal",
+      _changed: true,
+    });
+    const meal_success_flow_after_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "get_flow",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _flow_id: "create-meal",
+      },
+    });
+    const meal_success_flow_after =
+      meal_success_flow_after_res._result._flow;
+    assert.deepEqual(meal_success_flow_after._steps, meal_success_flow_steps);
+    assert.deepEqual(meal_success_flow_after._on_success, [
+      meal_success_existing_command,
+      {
+        _op: "close-object",
+        _params: {
+          _id: "create-meal-modal",
+        },
+      },
+    ]);
+
+    const meal_success_reloaded_xvm =
+      new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+    await (meal_success_reloaded_xvm as any)._load_app_from_disk({
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+      },
+    });
+    const meal_success_reloaded_flow =
+      await (meal_success_reloaded_xvm as any)._get_flow({
+        _params: {
+          _app_id: meal_success_app_id,
+          _env: "test",
+          _flow_id: "create-meal",
+        },
+      });
+    assert.deepEqual(
+      meal_success_reloaded_flow._result._flow,
+      meal_success_flow_after,
+    );
+
+    const meal_success_retry_res =
+      await (_x as any).execute(meal_success_action?._execution_payload);
+    assert.deepEqual(meal_success_retry_res, {
+      _ok: true,
+      _artifact_type: "flow",
+      _operation: "append-on-success-command",
+      _flow_id: "create-meal",
+      _changed: false,
+      _already_exists: true,
+    });
+    const meal_success_flow_after_retry = await _x.execute({
+      _module: "server-xvm",
+      _op: "get_flow",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _flow_id: "create-meal",
+      },
+    });
+    assert.deepEqual(
+      meal_success_flow_after_retry._result._flow._on_success,
+      meal_success_flow_after._on_success,
+    );
+
+    _xd.delete("meal.last-success", { source: "meal-success-reset" });
+    const meal_success_modal = {
+      _id: "create-meal-modal",
+      _open: true,
+      close() {
+        this._open = false;
+      },
+    };
+    artifact_request_runtime_objects["create-meal-modal"] =
+      meal_success_modal;
+    const meal_success_close_start =
+      artifact_request_close_object_calls;
+    const meal_success_run_start =
+      artifact_request_flow_run_calls;
+    const meal_success_run_res = await (_x as any).execute({
+      _module: "flow",
+      _op: "run",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _flow_id: "create-meal",
+        _event_payload: {
+          name: "Breakfast",
+          calories: "420",
+        },
+        _event_name: "click",
+      },
+    });
+    assert.equal(meal_success_run_res._ok, true);
+    await run_flow_success_commands_for_test(
+      meal_success_flow_after_retry._result._flow,
+      meal_success_run_res,
+    );
+    assert.equal(artifact_request_flow_run_calls, meal_success_run_start + 1);
+    assert.equal(_xd.get("meal.last-success"), "preserved");
+    assert.equal(
+      artifact_request_close_object_calls,
+      meal_success_close_start + 1,
+    );
+    assert.equal(meal_success_modal._open, false);
+    const meal_success_records_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: meal_success_app_id,
+        _env: "test",
+        _entity: "meal",
+        _filter: {},
+      },
+    });
+    const meal_success_records =
+      meal_success_records_res._result?._records?._data ?? [];
+    assert.equal(
+      meal_success_records.some((record: any) =>
+        record.name === "Breakfast" && record.calories === "420"
+      ),
+      true,
+    );
+
+    const meal_failure_modal = {
+      _id: "create-meal-modal",
+      _open: true,
+      close() {
+        this._open = false;
+      },
+    };
+    artifact_request_runtime_objects["create-meal-modal"] =
+      meal_failure_modal;
+    const meal_failure_close_start =
+      artifact_request_close_object_calls;
+    _xd.delete("meal.last-success", { source: "meal-failure-reset" });
+    await run_flow_success_commands_for_test(
+      meal_success_flow_after_retry._result._flow,
+      {
+        _ok: false,
+        _error: {
+          _code: "E_TEST_MEAL_CREATE_FAILED",
+        },
+      },
+    );
+    assert.equal(
+      artifact_request_close_object_calls,
+      meal_failure_close_start,
+    );
+    assert.equal(meal_failure_modal._open, true);
+    assert.equal(_xd.get("meal.last-success"), undefined);
+
+    const crud_evolution_app_id = "crud-evolution-app";
+    const crud_evolution_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(crud_evolution_create_app_res._ok, true);
+    const crud_evolution_entity_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: {
+          _id: "project",
+          _schema: {
+            name: {
+              _type: "String",
+              _required: true,
+            },
+          },
+        },
+      },
+    });
+    assert.equal(crud_evolution_entity_res._ok, true);
+    const crud_evolution_flow_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_flow",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _flow: {
+          _id: "create-project",
+          _steps: [
+            {
+              _id: "add-project",
+              _command: {
+                _module: "entity-manager",
+                _op: "add",
+                _params: {
+                  _app_id: crud_evolution_app_id,
+                  _env: "test",
+                  _entity: "project",
+                  _data: {
+                    name: "$event.name",
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(crud_evolution_flow_res._ok, true);
+    const crud_evolution_form_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _view: {
+          _id: "create-project",
+          _type: "view",
+          _on_mount: [
+            {
+              _module: "xd",
+              _op: "delete",
+              _params: {
+                key: "form.create-project.name",
+                source: "xvibe:form-reset:create-project",
+              },
+            },
+          ],
+          _children: [
+            {
+              _id: "create-project-form",
+              _type: "form",
+              _class: "xvibe-generated-form",
+              _submit: {
+                _flow: "create-project",
+                _running: true,
+                _success_view: "project-list",
+              },
+              _children: [
+                {
+                  _id: "create-project-field-name",
+                  _type: "field",
+                  _class: "xvibe-generated-form-field",
+                  _label: "Name",
+                  _field: "name",
+                  _control: {
+                    _type: "input",
+                    _input_type: "text",
+                    _name: "name",
+                    _placeholder: "Name",
+                    _data_output: "form.create-project.name",
+                    _update_data_source_event: "input",
+                  },
+                },
+                {
+                  _id: "create-project-submit",
+                  _type: "button",
+                  _text: "Submit",
+                  type: "button",
+                  _flow: {
+                    _id: "create-project",
+                    _payload: {
+                      name: "$xdata.form.create-project.name",
+                    },
+                  },
+                  _flow_event: "click",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(crud_evolution_form_res._ok, true);
+    const crud_evolution_table_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "push_update",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _view: {
+          _id: "project-list",
+          _type: "view",
+          _children: [
+            {
+              _id: "project-list-table",
+              _type: "table",
+              _data_source: "project.records",
+              _empty_text: "No project records yet.",
+              _columns: [
+                {
+                  _key: "name",
+                  _label: "Name",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+    assert.equal(crud_evolution_table_res._ok, true);
+
+    const crud_evolution_add_field_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "add-field",
+            _entity_name: "project",
+            _field_name: "priority",
+          },
+        },
+      });
+    assert.deepEqual(crud_evolution_add_field_res, {
+      _ok: true,
+      _operation: "add-field",
+      _entity_name: "project",
+      _field_name: "priority",
+      _updated: {
+        _entity: true,
+        _flow: true,
+        _form: true,
+        _table: true,
+      },
+    });
+    const crud_evolution_app_path = path.resolve(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      crud_evolution_app_id,
+    );
+    const crud_evolution_entity_path = path.join(
+      crud_evolution_app_path,
+      "entities",
+      "project.json",
+    );
+    const crud_evolution_flow_path = path.join(
+      crud_evolution_app_path,
+      "flows",
+      "create-project.json",
+    );
+    const crud_evolution_form_path = path.join(
+      crud_evolution_app_path,
+      "views",
+      "create-project.json",
+    );
+    const crud_evolution_table_path = path.join(
+      crud_evolution_app_path,
+      "views",
+      "project-list.json",
+    );
+    const crud_evolution_entity = JSON.parse(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+    );
+    assert.deepEqual(crud_evolution_entity._schema.name, {
+      _type: "String",
+      _required: true,
+    });
+    assert.deepEqual(crud_evolution_entity._schema.priority, {
+      _type: "String",
+    });
+    assert.equal(crud_evolution_entity._schema._id, undefined);
+    assert.equal(crud_evolution_entity._schema._created_at, undefined);
+    assert.equal(crud_evolution_entity._schema._updated_at, undefined);
+
+    const crud_evolution_flow = JSON.parse(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_evolution_flow._steps[0]._command._params._data,
+      {
+        name: "$event.name",
+        priority: "$event.priority",
+      },
+    );
+
+    const crud_evolution_form = JSON.parse(
+      await readFile(crud_evolution_form_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_evolution_form._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      ["form.create-project.name", "form.create-project.priority"],
+    );
+    const crud_evolution_form_container = find_xui_node_for_test(
+      crud_evolution_form,
+      "create-project-form",
+    ) as any;
+    assert.deepEqual(
+      (crud_evolution_form_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id),
+      ["create-project-field-name", "create-project-field-priority"],
+    );
+    const crud_evolution_priority_field = find_xui_node_for_test(
+      crud_evolution_form,
+      "create-project-field-priority",
+    ) as any;
+    assert.equal(crud_evolution_priority_field?._label, "Priority");
+    assert.equal(crud_evolution_priority_field?._field, "priority");
+    assert.equal(
+      crud_evolution_priority_field?._control?._data_output,
+      "form.create-project.priority",
+    );
+    assert.deepEqual(crud_evolution_form_container?._submit, {
+      _flow: "create-project",
+      _running: true,
+      _success_view: "project-list",
+    });
+    const crud_evolution_submit = find_xui_node_for_test(
+      crud_evolution_form,
+      "create-project-submit",
+    ) as any;
+    assert.deepEqual(crud_evolution_submit?._flow, {
+      _id: "create-project",
+      _payload: {
+        name: "$xdata.form.create-project.name",
+        priority: "$xdata.form.create-project.priority",
+      },
+    });
+
+    const crud_evolution_table = JSON.parse(
+      await readFile(crud_evolution_table_path, "utf-8"),
+    );
+    assert.deepEqual(
+      (
+        find_xui_node_for_test(
+          crud_evolution_table,
+          "project-list-table",
+        ) as any
+      )?._columns,
+      [
+        {
+          _key: "name",
+          _label: "Name",
+        },
+        {
+          _key: "priority",
+          _label: "Priority",
+        },
+      ],
+    );
+
+    const crud_evolution_entity_before_duplicate =
+      await readFile(crud_evolution_entity_path, "utf-8");
+    const crud_evolution_flow_before_duplicate =
+      await readFile(crud_evolution_flow_path, "utf-8");
+    const crud_evolution_form_before_duplicate =
+      await readFile(crud_evolution_form_path, "utf-8");
+    const crud_evolution_table_before_duplicate =
+      await readFile(crud_evolution_table_path, "utf-8");
+    const duplicate_crud_evolution_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "add-field",
+            _entity_name: "project",
+            _field_name: "priority",
+          },
+        },
+      });
+    assert.deepEqual(duplicate_crud_evolution_res, {
+      _ok: true,
+      _operation: "add-field",
+      _entity_name: "project",
+      _field_name: "priority",
+      _updated: {
+        _entity: false,
+        _flow: false,
+        _form: false,
+        _table: false,
+      },
+    });
+    assert.equal(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+      crud_evolution_entity_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+      crud_evolution_flow_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_form_path, "utf-8"),
+      crud_evolution_form_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_table_path, "utf-8"),
+      crud_evolution_table_before_duplicate,
+    );
+
+    const managed_crud_evolution_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "add-field",
+            _entity_name: "project",
+            _field_name: "_id",
+          },
+        },
+      });
+    assert.equal(managed_crud_evolution_res._ok, false);
+    assert.equal(
+      managed_crud_evolution_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+
+    const missing_crud_evolution_app_id = "crud-evolution-missing-app";
+    const missing_crud_evolution_create_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: missing_crud_evolution_app_id,
+        _env: "test",
+      },
+    });
+    assert.equal(missing_crud_evolution_create_app_res._ok, true);
+    const missing_crud_evolution_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: missing_crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "add-field",
+            _entity_name: "project",
+            _field_name: "priority",
+          },
+        },
+      });
+    assert.equal(missing_crud_evolution_res._ok, false);
+    assert.equal(
+      missing_crud_evolution_res._error._code,
+      "E_XVIBE_ENTITY_SCHEMA_UNAVAILABLE",
+    );
+    assert.deepEqual(missing_crud_evolution_res._error._details, {
+      _entity: "project",
+    });
+
+    const crud_rename_schema_fixture_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "set_entity",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: {
+          _id: "project",
+          _schema: {
+            name: {
+              _type: "String",
+              _required: true,
+            },
+            priority: {
+              _type: "String",
+              _required: true,
+              _default: "Medium",
+              _index: {
+                _unique: false,
+              },
+              _enum: ["Low", "Medium", "High"],
+            },
+          },
+        },
+      },
+    });
+    assert.equal(crud_rename_schema_fixture_res._ok, true);
+    const crud_rename_record_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "add",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: "project",
+        _data: {
+          name: "Alpha",
+          priority: "High",
+        },
+      },
+    });
+    assert.equal(crud_rename_record_res._ok, true);
+    assert.equal(crud_rename_record_res._result._record.priority, "High");
+
+    const crud_evolution_rename_field_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "rename-field",
+            _entity_name: "project",
+            _old_field: "priority",
+            _new_field: "severity",
+          },
+        },
+      });
+    assert.deepEqual(crud_evolution_rename_field_res, {
+      _ok: true,
+      _operation: "rename-field",
+      _entity_name: "project",
+      _old_field: "priority",
+      _new_field: "severity",
+      _updated: {
+        _entity: true,
+        _records: true,
+        _flow: true,
+        _form: true,
+        _table: true,
+      },
+    });
+    const crud_rename_entity = JSON.parse(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+    );
+    assert.deepEqual(Object.keys(crud_rename_entity._schema), [
+      "name",
+      "severity",
+    ]);
+    assert.deepEqual(crud_rename_entity._schema.severity, {
+      _type: "String",
+      _required: true,
+      _default: "Medium",
+      _index: {
+        _unique: false,
+      },
+      _enum: ["Low", "Medium", "High"],
+    });
+    assert.equal(crud_rename_entity._schema.priority, undefined);
+    assert.equal(crud_rename_entity._schema._id, undefined);
+    assert.equal(crud_rename_entity._schema._created_at, undefined);
+    assert.equal(crud_rename_entity._schema._updated_at, undefined);
+
+    const crud_rename_records_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: "project",
+        _filter: {},
+      },
+    });
+    assert.equal(crud_rename_records_res._ok, true);
+    const crud_rename_records =
+      crud_rename_records_res._result?._records?._data ?? [];
+    const crud_rename_alpha_record = crud_rename_records.find(
+      (record: any) => record.name === "Alpha",
+    );
+    assert.equal(crud_rename_alpha_record?.severity, "High");
+    assert.equal(crud_rename_alpha_record?.priority, undefined);
+
+    const crud_rename_flow = JSON.parse(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_rename_flow._steps[0]._command._params._data,
+      {
+        name: "$event.name",
+        severity: "$event.severity",
+      },
+    );
+
+    const crud_rename_form = JSON.parse(
+      await readFile(crud_evolution_form_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_rename_form._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      ["form.create-project.name", "form.create-project.severity"],
+    );
+    const crud_rename_form_container = find_xui_node_for_test(
+      crud_rename_form,
+      "create-project-form",
+    ) as any;
+    assert.deepEqual(
+      (crud_rename_form_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id),
+      ["create-project-field-name", "create-project-field-severity"],
+    );
+    const crud_rename_severity_field = find_xui_node_for_test(
+      crud_rename_form,
+      "create-project-field-severity",
+    ) as any;
+    assert.equal(crud_rename_severity_field?._label, "Severity");
+    assert.equal(crud_rename_severity_field?._field, "severity");
+    assert.equal(
+      crud_rename_severity_field?._control?._name,
+      "severity",
+    );
+    assert.equal(
+      crud_rename_severity_field?._control?._data_output,
+      "form.create-project.severity",
+    );
+    assert.equal(
+      find_xui_node_for_test(
+        crud_rename_form,
+        "create-project-field-priority",
+      ),
+      undefined,
+    );
+    const crud_rename_submit = find_xui_node_for_test(
+      crud_rename_form,
+      "create-project-submit",
+    ) as any;
+    assert.deepEqual(crud_rename_submit?._flow, {
+      _id: "create-project",
+      _payload: {
+        name: "$xdata.form.create-project.name",
+        severity: "$xdata.form.create-project.severity",
+      },
+    });
+
+    const crud_rename_table = JSON.parse(
+      await readFile(crud_evolution_table_path, "utf-8"),
+    );
+    assert.deepEqual(
+      (
+        find_xui_node_for_test(
+          crud_rename_table,
+          "project-list-table",
+        ) as any
+      )?._columns,
+      [
+        {
+          _key: "name",
+          _label: "Name",
+        },
+        {
+          _key: "severity",
+          _label: "Severity",
+        },
+      ],
+    );
+
+    const crud_rename_entity_before_duplicate =
+      await readFile(crud_evolution_entity_path, "utf-8");
+    const crud_rename_flow_before_duplicate =
+      await readFile(crud_evolution_flow_path, "utf-8");
+    const crud_rename_form_before_duplicate =
+      await readFile(crud_evolution_form_path, "utf-8");
+    const crud_rename_table_before_duplicate =
+      await readFile(crud_evolution_table_path, "utf-8");
+    const duplicate_crud_rename_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "rename-field",
+            _entity_name: "project",
+            _old_field: "priority",
+            _new_field: "severity",
+          },
+        },
+      });
+    assert.deepEqual(duplicate_crud_rename_res, {
+      _ok: true,
+      _operation: "rename-field",
+      _entity_name: "project",
+      _old_field: "priority",
+      _new_field: "severity",
+      _updated: {
+        _entity: false,
+        _records: false,
+        _flow: false,
+        _form: false,
+        _table: false,
+      },
+    });
+    assert.equal(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+      crud_rename_entity_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+      crud_rename_flow_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_form_path, "utf-8"),
+      crud_rename_form_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_table_path, "utf-8"),
+      crud_rename_table_before_duplicate,
+    );
+
+    const crud_evolution_deprecate_field_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "deprecate-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.deepEqual(crud_evolution_deprecate_field_res, {
+      _ok: true,
+      _operation: "deprecate-field",
+      _entity_name: "project",
+      _field_name: "severity",
+      _updated: {
+        _entity: true,
+        _flow: true,
+        _form: true,
+        _table: true,
+      },
+    });
+
+    const crud_deprecate_entity = JSON.parse(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+    );
+    assert.deepEqual(Object.keys(crud_deprecate_entity._schema), [
+      "name",
+      "severity",
+    ]);
+    assert.deepEqual(crud_deprecate_entity._schema.severity, {
+      _type: "String",
+      _required: true,
+      _default: "Medium",
+      _index: {
+        _unique: false,
+      },
+      _enum: ["Low", "Medium", "High"],
+      _deprecated: true,
+    });
+
+    const crud_deprecate_records_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: "project",
+        _filter: {},
+      },
+    });
+    assert.equal(crud_deprecate_records_res._ok, true);
+    const crud_deprecate_records =
+      crud_deprecate_records_res._result?._records?._data ?? [];
+    const crud_deprecate_alpha_record = crud_deprecate_records.find(
+      (record: any) => record.name === "Alpha",
+    );
+    assert.equal(crud_deprecate_alpha_record?.severity, "High");
+    assert.equal(crud_deprecate_alpha_record?.priority, undefined);
+
+    const crud_deprecate_flow = JSON.parse(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_deprecate_flow._steps[0]._command._params._data,
+      {
+        name: "$event.name",
+      },
+    );
+
+    const crud_deprecate_form = JSON.parse(
+      await readFile(crud_evolution_form_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_deprecate_form._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      ["form.create-project.name"],
+    );
+    const crud_deprecate_form_container = find_xui_node_for_test(
+      crud_deprecate_form,
+      "create-project-form",
+    ) as any;
+    assert.deepEqual(
+      (crud_deprecate_form_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id),
+      ["create-project-field-name"],
+    );
+    assert.equal(
+      find_xui_node_for_test(
+        crud_deprecate_form,
+        "create-project-field-severity",
+      ),
+      undefined,
+    );
+    const crud_deprecate_submit = find_xui_node_for_test(
+      crud_deprecate_form,
+      "create-project-submit",
+    ) as any;
+    assert.deepEqual(crud_deprecate_submit?._flow, {
+      _id: "create-project",
+      _payload: {
+        name: "$xdata.form.create-project.name",
+      },
+    });
+
+    const crud_deprecate_table = JSON.parse(
+      await readFile(crud_evolution_table_path, "utf-8"),
+    );
+    assert.deepEqual(
+      (
+        find_xui_node_for_test(
+          crud_deprecate_table,
+          "project-list-table",
+        ) as any
+      )?._columns,
+      [
+        {
+          _key: "name",
+          _label: "Name",
+        },
+      ],
+    );
+
+    const crud_deprecate_entity_before_duplicate =
+      await readFile(crud_evolution_entity_path, "utf-8");
+    const crud_deprecate_flow_before_duplicate =
+      await readFile(crud_evolution_flow_path, "utf-8");
+    const crud_deprecate_form_before_duplicate =
+      await readFile(crud_evolution_form_path, "utf-8");
+    const crud_deprecate_table_before_duplicate =
+      await readFile(crud_evolution_table_path, "utf-8");
+    const duplicate_crud_deprecate_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "deprecate-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.deepEqual(duplicate_crud_deprecate_res, {
+      _ok: true,
+      _operation: "deprecate-field",
+      _entity_name: "project",
+      _field_name: "severity",
+      _updated: {
+        _entity: false,
+        _flow: false,
+        _form: false,
+        _table: false,
+      },
+    });
+    assert.equal(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+      crud_deprecate_entity_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+      crud_deprecate_flow_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_form_path, "utf-8"),
+      crud_deprecate_form_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_table_path, "utf-8"),
+      crud_deprecate_table_before_duplicate,
+    );
+
+    const crud_evolution_restore_field_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "restore-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.deepEqual(crud_evolution_restore_field_res, {
+      _ok: true,
+      _operation: "restore-field",
+      _entity_name: "project",
+      _field_name: "severity",
+      _updated: {
+        _entity: true,
+        _flow: true,
+        _form: true,
+        _table: true,
+      },
+    });
+
+    const crud_restore_entity = JSON.parse(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+    );
+    assert.deepEqual(crud_restore_entity._schema.severity, {
+      _type: "String",
+      _required: true,
+      _default: "Medium",
+      _index: {
+        _unique: false,
+      },
+      _enum: ["Low", "Medium", "High"],
+    });
+
+    const crud_restore_records_res = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: crud_evolution_app_id,
+        _env: "test",
+        _entity: "project",
+        _filter: {},
+      },
+    });
+    assert.equal(crud_restore_records_res._ok, true);
+    const crud_restore_records =
+      crud_restore_records_res._result?._records?._data ?? [];
+    const crud_restore_alpha_record = crud_restore_records.find(
+      (record: any) => record.name === "Alpha",
+    );
+    assert.equal(crud_restore_alpha_record?.severity, "High");
+    assert.equal(crud_restore_alpha_record?.priority, undefined);
+
+    const crud_restore_flow = JSON.parse(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_restore_flow._steps[0]._command._params._data,
+      {
+        name: "$event.name",
+        severity: "$event.severity",
+      },
+    );
+
+    const crud_restore_form = JSON.parse(
+      await readFile(crud_evolution_form_path, "utf-8"),
+    );
+    assert.deepEqual(
+      crud_restore_form._on_mount.map(
+        (command: any) => command._params?.key,
+      ),
+      ["form.create-project.name", "form.create-project.severity"],
+    );
+    const crud_restore_form_container = find_xui_node_for_test(
+      crud_restore_form,
+      "create-project-form",
+    ) as any;
+    assert.deepEqual(
+      (crud_restore_form_container?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => child._id),
+      ["create-project-field-name", "create-project-field-severity"],
+    );
+    const crud_restore_submit = find_xui_node_for_test(
+      crud_restore_form,
+      "create-project-submit",
+    ) as any;
+    assert.deepEqual(crud_restore_submit?._flow, {
+      _id: "create-project",
+      _payload: {
+        name: "$xdata.form.create-project.name",
+        severity: "$xdata.form.create-project.severity",
+      },
+    });
+
+    const crud_restore_table = JSON.parse(
+      await readFile(crud_evolution_table_path, "utf-8"),
+    );
+    assert.deepEqual(
+      (
+        find_xui_node_for_test(
+          crud_restore_table,
+          "project-list-table",
+        ) as any
+      )?._columns,
+      [
+        {
+          _key: "name",
+          _label: "Name",
+        },
+        {
+          _key: "severity",
+          _label: "Severity",
+        },
+      ],
+    );
+
+    const crud_restore_entity_before_duplicate =
+      await readFile(crud_evolution_entity_path, "utf-8");
+    const crud_restore_flow_before_duplicate =
+      await readFile(crud_evolution_flow_path, "utf-8");
+    const crud_restore_form_before_duplicate =
+      await readFile(crud_evolution_form_path, "utf-8");
+    const crud_restore_table_before_duplicate =
+      await readFile(crud_evolution_table_path, "utf-8");
+    const duplicate_crud_restore_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "restore-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.deepEqual(duplicate_crud_restore_res, {
+      _ok: true,
+      _operation: "restore-field",
+      _entity_name: "project",
+      _field_name: "severity",
+      _updated: {
+        _entity: false,
+        _flow: false,
+        _form: false,
+        _table: false,
+      },
+    });
+    assert.equal(
+      await readFile(crud_evolution_entity_path, "utf-8"),
+      crud_restore_entity_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_flow_path, "utf-8"),
+      crud_restore_flow_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_form_path, "utf-8"),
+      crud_restore_form_before_duplicate,
+    );
+    assert.equal(
+      await readFile(crud_evolution_table_path, "utf-8"),
+      crud_restore_table_before_duplicate,
+    );
+
+    const managed_crud_restore_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "restore-field",
+            _entity_name: "project",
+            _field_name: "_id",
+          },
+        },
+      });
+    assert.equal(managed_crud_restore_res._ok, false);
+    assert.equal(
+      managed_crud_restore_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+
+    const missing_crud_restore_field_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "restore-field",
+            _entity_name: "project",
+            _field_name: "missing-field",
+          },
+        },
+      });
+    assert.equal(missing_crud_restore_field_res._ok, false);
+    assert.equal(
+      missing_crud_restore_field_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+    assert.deepEqual(missing_crud_restore_field_res._error._details, {
+      _entity_name: "project",
+      _field_name: "missing-field",
+    });
+
+    const missing_crud_restore_entity_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: missing_crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "restore-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.equal(missing_crud_restore_entity_res._ok, false);
+    assert.equal(
+      missing_crud_restore_entity_res._error._code,
+      "E_XVIBE_ENTITY_SCHEMA_UNAVAILABLE",
+    );
+    assert.deepEqual(missing_crud_restore_entity_res._error._details, {
+      _entity: "project",
+    });
+
+    const managed_crud_deprecate_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "deprecate-field",
+            _entity_name: "project",
+            _field_name: "_id",
+          },
+        },
+      });
+    assert.equal(managed_crud_deprecate_res._ok, false);
+    assert.equal(
+      managed_crud_deprecate_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+
+    const missing_crud_deprecate_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: missing_crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "deprecate-field",
+            _entity_name: "project",
+            _field_name: "severity",
+          },
+        },
+      });
+    assert.equal(missing_crud_deprecate_res._ok, false);
+    assert.equal(
+      missing_crud_deprecate_res._error._code,
+      "E_XVIBE_ENTITY_SCHEMA_UNAVAILABLE",
+    );
+    assert.deepEqual(missing_crud_deprecate_res._error._details, {
+      _entity: "project",
+    });
+
+    const managed_crud_rename_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "rename-field",
+            _entity_name: "project",
+            _old_field: "_id",
+            _new_field: "external-id",
+          },
+        },
+      });
+    assert.equal(managed_crud_rename_res._ok, false);
+    assert.equal(
+      managed_crud_rename_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+
+    const missing_crud_rename_res =
+      await (artifact_request_xvibe as any)._apply_artifact_request({
+        _params: {
+          _app_id: crud_evolution_app_id,
+          _env: "test",
+          _artifact_type: "crud-evolution",
+          _artifact_request: {
+            _operation: "rename-field",
+            _entity_name: "project",
+            _old_field: "missing-field",
+            _new_field: "impact",
+          },
+        },
+      });
+    assert.equal(missing_crud_rename_res._ok, false);
+    assert.equal(
+      missing_crud_rename_res._error._code,
+      "E_XVIBE_ARTIFACT_REQUEST_INVALID",
+    );
+    assert.deepEqual(missing_crud_rename_res._error._details, {
+      _entity_name: "project",
+      _old_field: "missing-field",
+      _new_field: "impact",
     });
 
     const artifact_request_app_dir = path.join(
@@ -15696,6 +32669,35 @@ try {
       },
     });
     assert.equal(graph_execution_create_app_res._ok, true);
+    const graph_execution_project_memory_path = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      graph_execution_app_id,
+      "project-memory.json",
+    );
+    await writeFile(
+      graph_execution_project_memory_path,
+      JSON.stringify(
+        {
+          _version: 1,
+          _vision: "",
+          _goal: "",
+          _current_focus: "Product Management",
+          _completed: [],
+          _achievements: [],
+          _milestones: [],
+          _parking_lot: [],
+          _decisions: [],
+          _notes: [],
+          _updated_at: "",
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
 
     const graph_execute_res =
       await (artifact_request_xvibe as any)._execute_execution_graph({
@@ -15748,6 +32750,63 @@ try {
       _skipped: 1,
       _failed: 0,
     });
+    const graph_execution_memory_after_success = JSON.parse(
+      await readFile(graph_execution_project_memory_path, "utf-8"),
+    );
+    assert.deepEqual(graph_execution_memory_after_success._milestones, [
+      {
+        _id: "product-management",
+        _title: "Product Management",
+        _items: [
+          {
+            _id: "product-crud",
+            _title: "Product CRUD",
+            _completed: true,
+          },
+          {
+            _id: "product-search",
+            _title: "Product Search",
+            _completed: false,
+          },
+          {
+            _id: "product-filters",
+            _title: "Product Filters",
+            _completed: false,
+          },
+          {
+            _id: "product-edit",
+            _title: "Product Edit",
+            _completed: false,
+          },
+          {
+            _id: "product-delete",
+            _title: "Product Delete",
+            _completed: false,
+          },
+        ],
+      },
+    ]);
+    const graph_execution_guide_after_success =
+      await artifact_request_xvibe.getGuideRecommendation({
+        _app_id: graph_execution_app_id,
+        _env: "test",
+        _project_memory: graph_execution_memory_after_success,
+        _runtime_assets: {
+          _views: [],
+          _flows: [],
+          _entities: [{ _id: "product" }],
+          _modules: [],
+        },
+      });
+    assert.deepEqual(graph_execution_guide_after_success, {
+      _title: "Product Search",
+      _reason: "Current focus is Product Management.",
+      _type: "flow",
+      _priority: 100,
+      _action: {
+        _prompt: "Create flow product-search.",
+      },
+    });
     assert.deepEqual(graph_execution_persist_ops, [
       "set_entity",
       "set_flow",
@@ -15784,6 +32843,7 @@ try {
       "app.json",
       "entities/product.json",
       "flows/create-product.json",
+      "project-memory.json",
       "views/create-product.json",
       "views/product-list.json",
     ]);
@@ -15905,6 +32965,10 @@ try {
       "partner-list-table",
     ) as any;
     assert.equal(graph_fields_table_object?._data_source, "partner.records");
+    assert.equal(
+      graph_fields_table_object?._empty_text,
+      "No partner records yet.",
+    );
     assert.deepEqual(graph_fields_table_object?._columns, [
       {
         _key: "name",
@@ -15960,6 +33024,32 @@ try {
         },
       });
     assert.equal(employee_crud_execute_res._ok, true);
+    const employee_form_path = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      employee_crud_app_id,
+      "views",
+      "create-employee.json",
+    );
+    const employee_form_view = JSON.parse(
+      await readFile(employee_form_path, "utf-8"),
+    );
+    const employee_form = find_xui_node_for_test(
+      employee_form_view,
+      "create-employee-form",
+    ) as any;
+    assert.deepEqual(
+      (employee_form?._children as any[])
+        .filter((child) => child._type === "field")
+        .map((child) => [child._field, child._label]),
+      [
+        ["name", "Name"],
+        ["email", "Email"],
+        ["phone", "Phone"],
+      ],
+    );
     const employee_add_res = await _x.execute({
       _module: "entity-manager",
       _op: "add",
@@ -15998,9 +33088,28 @@ try {
     assert.deepEqual(employee_table_view._on_mount._params?._filter, {});
     assert.equal(employee_table_view._on_mount._params?._output, employee_table?._data_source);
     assert.equal(employee_table?._data_source, "employee.records");
+    const employee_new_button = find_xui_node_for_test(
+      employee_table_view,
+      "employee-list-new",
+    ) as any;
+    assert.equal(employee_new_button?._text, "New");
+    assert.deepEqual(employee_new_button?._on, {
+      click: {
+        _module: "xvm",
+        _op: "navigate",
+        _params: {
+          _to: "create-employee",
+        },
+      },
+    });
+    assert.equal(employee_table?._empty_text, "No employee records yet.");
     assert.deepEqual(
       employee_table?._columns.map((column: any) => column._key),
       ["name", "email", "phone"],
+    );
+    assert.deepEqual(
+      employee_table?._columns.map((column: any) => column._label),
+      ["Name", "Email", "Phone"],
     );
     const employee_source_entity = String(employee_table?._data_source ?? "")
       .replace(/\.records$/u, "");
@@ -16069,6 +33178,13 @@ try {
       _skipped: 0,
       _failed: 0,
     });
+    const graph_execution_memory_after_duplicate = JSON.parse(
+      await readFile(graph_execution_project_memory_path, "utf-8"),
+    );
+    assert.deepEqual(
+      graph_execution_memory_after_duplicate._milestones,
+      graph_execution_memory_after_success._milestones,
+    );
     assert.deepEqual(graph_execution_persist_ops, [
       "set_entity",
       "set_flow",
@@ -16085,6 +33201,35 @@ try {
       },
     });
     assert.equal(graph_failure_create_app_res._ok, true);
+    const graph_failure_project_memory_path = path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      "graph-failure-app",
+      "project-memory.json",
+    );
+    await writeFile(
+      graph_failure_project_memory_path,
+      JSON.stringify(
+        {
+          _version: 1,
+          _vision: "",
+          _goal: "",
+          _current_focus: "Product Management",
+          _completed: [],
+          _achievements: [],
+          _milestones: [],
+          _parking_lot: [],
+          _decisions: [],
+          _notes: [],
+          _updated_at: "",
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
     const graph_failure_res =
       await (artifact_request_xvibe as any)._execute_execution_graph({
         _params: {
@@ -16112,6 +33257,10 @@ try {
       _skipped: 0,
       _failed: 1,
     });
+    const graph_failure_memory_after_failure = JSON.parse(
+      await readFile(graph_failure_project_memory_path, "utf-8"),
+    );
+    assert.deepEqual(graph_failure_memory_after_failure._milestones, []);
     assert.equal(graph_failure_set_entity_calls, 1);
 
     const parent_failure_executor = new ExecutionGraphExecutor(
@@ -16555,6 +33704,10 @@ try {
   const configured_dashboard_path =
     path.join(configured_system_xapps_path, "app-starters", "dashboard");
   await mkdir(path.join(configured_dashboard_path, "views"), { recursive: true });
+  await mkdir(path.join(configured_dashboard_path, "entities"), { recursive: true });
+  await mkdir(path.join(configured_dashboard_path, "flows"), { recursive: true });
+  await mkdir(path.join(configured_dashboard_path, "style", "nested"), { recursive: true });
+  await mkdir(path.join(configured_dashboard_path, "assets", "icons"), { recursive: true });
   await writeFile(
     path.join(configured_dashboard_path, "app.json"),
     JSON.stringify({
@@ -16579,14 +33732,101 @@ try {
     JSON.stringify({
       _id: "main",
       _type: "view",
+      _external: "https://example.com/assets/logo.svg",
+      _absolute: "/assets/logo.svg",
+      _already_public: "/public/other-app/assets/logo.svg",
+      _data_url: "data:image/svg+xml;base64,PHN2Zy8+",
       _children: [
+        {
+          _id: "configured-dashboard-style",
+          _type: "style-sheet",
+          _href: "style/custom.css",
+        },
         {
           _id: "configured-dashboard-title",
           _type: "label",
           _text: "Configured Dashboard",
         },
+        {
+          _id: "configured-dashboard-sidebar",
+          _type: "sidebar",
+          _logo: "assets/logo.svg",
+          _children: [
+            {
+              _id: "configured-dashboard-card",
+              _type: "card",
+              _image: "assets/placeholder-record.svg",
+              _nested: {
+                _icons: [
+                  "assets/icons/spark.svg",
+                  "style/nested/theme.css",
+                  "http://example.com/style/custom.css",
+                ],
+              },
+            },
+          ],
+        },
       ],
     }, null, 2),
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "entities", "records.json"),
+    JSON.stringify({
+      _id: "records",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+      },
+      _preview_image: "assets/placeholder-record.svg",
+    }, null, 2),
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "flows", "refresh.json"),
+    JSON.stringify({
+      _id: "refresh",
+      _steps: [
+        {
+          _id: "set-css",
+          _command: {
+            _module: "xd",
+            _op: "set",
+            _params: {
+              key: "dashboard.css",
+              value: "style/custom.css",
+              source: "test",
+            },
+          },
+        },
+      ],
+    }, null, 2),
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "style", "custom.css"),
+    ".configured-dashboard { color: #123456; }\n",
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "style", "nested", "theme.css"),
+    ".configured-dashboard-nested { color: #654321; }\n",
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "assets", "logo.svg"),
+    "<svg><title>logo</title></svg>\n",
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "assets", "placeholder-record.svg"),
+    "<svg><title>placeholder</title></svg>\n",
+    "utf-8",
+  );
+  await writeFile(
+    path.join(configured_dashboard_path, "assets", "icons", "spark.svg"),
+    "<svg><title>spark</title></svg>\n",
     "utf-8",
   );
   (server_xvm as any)._system_xapps_path = configured_system_xapps_path;
@@ -16647,8 +33887,151 @@ try {
   );
   assert.equal(starter_view_file._id, "main");
   assert.equal(starter_view_file._type, "view");
-  assert.equal(starter_view_file._children[0]._id, "configured-dashboard-title");
-  assert.equal(starter_view_file._children[0]._text, "Configured Dashboard");
+  assert.equal(starter_view_file._children[1]._id, "configured-dashboard-title");
+  assert.equal(starter_view_file._children[1]._text, "Configured Dashboard");
+  assert.equal(starter_view_file._children[0]._href, "/public/starter-dashboard/style/custom.css");
+  assert.equal(starter_view_file._children[2]._logo, "/public/starter-dashboard/assets/logo.svg");
+  assert.equal(
+    starter_view_file._children[2]._children[0]._image,
+    "/public/starter-dashboard/assets/placeholder-record.svg",
+  );
+  assert.deepEqual(
+    starter_view_file._children[2]._children[0]._nested._icons,
+    [
+      "/public/starter-dashboard/assets/icons/spark.svg",
+      "/public/starter-dashboard/style/nested/theme.css",
+      "http://example.com/style/custom.css",
+    ],
+  );
+  assert.equal(starter_view_file._external, "https://example.com/assets/logo.svg");
+  assert.equal(starter_view_file._absolute, "/assets/logo.svg");
+  assert.equal(starter_view_file._already_public, "/public/other-app/assets/logo.svg");
+  assert.equal(starter_view_file._data_url, "data:image/svg+xml;base64,PHN2Zy8+");
+
+  const starter_app_runtime_dir = path.join(
+    entity_sync_work_folder,
+    "xvm",
+    "apps",
+    "starter-test",
+    "starter-dashboard",
+  );
+  await assert.rejects(access(path.join(starter_app_runtime_dir, "style")));
+  await assert.rejects(access(path.join(starter_app_runtime_dir, "assets")));
+  await access(path.join(starter_app_runtime_dir, "app.json"));
+  await access(path.join(starter_app_runtime_dir, "views", "main.json"));
+  await access(path.join(starter_app_runtime_dir, "entities", "records.json"));
+  await access(path.join(starter_app_runtime_dir, "flows", "refresh.json"));
+
+  const starter_public_dir = path.join(entity_sync_work_folder, "public", "starter-dashboard");
+  await access(path.join(starter_public_dir, "style", "custom.css"));
+  await access(path.join(starter_public_dir, "style", "nested", "theme.css"));
+  await access(path.join(starter_public_dir, "assets", "logo.svg"));
+  await access(path.join(starter_public_dir, "assets", "placeholder-record.svg"));
+  await access(path.join(starter_public_dir, "assets", "icons", "spark.svg"));
+
+  const starter_entity_file = JSON.parse(
+    await readFile(
+      path.join(starter_app_runtime_dir, "entities", "records.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(
+    starter_entity_file._preview_image,
+    "/public/starter-dashboard/assets/placeholder-record.svg",
+  );
+
+  const starter_flow_file = JSON.parse(
+    await readFile(
+      path.join(starter_app_runtime_dir, "flows", "refresh.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(
+    starter_flow_file._steps[0]._command._params.value,
+    "/public/starter-dashboard/style/custom.css",
+  );
+
+  const second_starter_create_res = await starter_xvibe._create_app_from_starter({
+    _params: {
+      _starter_id: "dashboard",
+      _app_id: "Starter Dashboard Two",
+      _env: "starter-test",
+    },
+  } as any);
+  assert.equal(second_starter_create_res._ok, true);
+  const second_starter_view_file = JSON.parse(
+    await readFile(
+      path.join(
+        entity_sync_work_folder,
+        "xvm",
+        "apps",
+        "starter-test",
+        "starter-dashboard-two",
+        "views",
+        "main.json",
+      ),
+      "utf-8",
+    ),
+  );
+  assert.equal(
+    second_starter_view_file._children[0]._href,
+    "/public/starter-dashboard-two/style/custom.css",
+  );
+  assert.equal(
+    second_starter_view_file._children[2]._logo,
+    "/public/starter-dashboard-two/assets/logo.svg",
+  );
+  await access(path.join(entity_sync_work_folder, "public", "starter-dashboard-two", "style", "custom.css"));
+  await access(path.join(entity_sync_work_folder, "public", "starter-dashboard-two", "assets", "logo.svg"));
+
+  const optional_starter_path =
+    path.join(configured_system_xapps_path, "app-starters", "optional-public-missing");
+  await mkdir(path.join(optional_starter_path, "views"), { recursive: true });
+  await writeFile(
+    path.join(optional_starter_path, "app.json"),
+    JSON.stringify({
+      _app_id: "optional-public-missing-starter",
+      _env: "starter",
+      _system: true,
+      _meta: {
+        _name: "Optional Public Missing Starter",
+        _version: 1,
+        _entry_view_id: "main",
+      },
+      _config: {},
+    }, null, 2),
+    "utf-8",
+  );
+  await writeFile(
+    path.join(optional_starter_path, "views", "main.json"),
+    JSON.stringify({
+      _id: "main",
+      _type: "view",
+      _children: [],
+    }, null, 2),
+    "utf-8",
+  );
+  const optional_starter_create_res = await starter_xvibe._create_app_from_starter({
+    _params: {
+      _starter_id: "optional-public-missing",
+      _app_id: "Optional Public Missing",
+      _env: "starter-test",
+    },
+  } as any);
+  assert.equal(optional_starter_create_res._ok, true);
+  await access(
+    path.join(
+      entity_sync_work_folder,
+      "xvm",
+      "apps",
+      "starter-test",
+      "optional-public-missing",
+      "views",
+      "main.json",
+    ),
+  );
+  await assert.rejects(access(path.join(entity_sync_work_folder, "public", "optional-public-missing", "style")));
+  await assert.rejects(access(path.join(entity_sync_work_folder, "public", "optional-public-missing", "assets")));
 
   const list_starter_apps = await _x.execute({
     _module: "server-xvm",
@@ -16755,6 +34138,7 @@ try {
   assert.ok(XVibeModule._ops["get-last-messages"]);
   assert.ok(XVibeModule._ops["update-conversation-action"]);
   assert.ok(XVibeModule._ops["update-conversation-artifact"]);
+  assert.ok(XVibeModule._ops["confirm-project-plan"]);
 
   const create_conversation_res = await (conversation_xvibe as any)._create_conversation({
     _params: {
@@ -17299,6 +34683,755 @@ try {
     assert.deepEqual(
       analyzed_conversation_res._result._messages[3]._intent,
       analyze_message_res._intent,
+    );
+
+    const capability_guidance_analyze_res =
+      await (conversation_xvibe as any)._analyze_message({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "primary-chat",
+          _message: "What can I do?",
+          _runtime_context: {
+            _active_view_id: "main",
+          },
+        },
+      });
+    assert.equal(capability_guidance_analyze_res._ok, true);
+    assert.equal(
+      capability_guidance_analyze_res._result._message._metadata._intent_processor,
+      "CapabilityGuidanceProcessor",
+    );
+    const capability_guidance_artifact =
+      capability_guidance_analyze_res._intent._artifact_request;
+    assert.equal(capability_guidance_artifact._type, "capability-guidance");
+    assert.equal(capability_guidance_artifact._capability_count > 0, true);
+    assert.equal(Array.isArray(capability_guidance_artifact._capabilities), true);
+    assert.equal(
+      typeof capability_guidance_artifact._capabilities[0],
+      "object",
+    );
+    assert.equal(
+      typeof capability_guidance_artifact._capabilities[0].title,
+      "string",
+    );
+    assert.equal(
+      typeof capability_guidance_artifact._capabilities[0].description,
+      "string",
+    );
+    assert.equal(
+      Array.isArray(capability_guidance_artifact._capabilities[0].prompt_examples),
+      true,
+    );
+    assert.equal(
+      Array.isArray(capability_guidance_artifact._capabilities[0].manual_steps),
+      true,
+    );
+    assert.equal(
+      typeof capability_guidance_artifact._capabilities[0].mode,
+      "string",
+    );
+    assert.equal(
+      typeof capability_guidance_artifact._capabilities[0].status,
+      "string",
+    );
+    assert.equal(Array.isArray(capability_guidance_artifact._sections), true);
+    assert.equal(capability_guidance_artifact._sections.length > 0, true);
+    assert.equal(
+      Array.isArray(capability_guidance_artifact._sections[0]._capabilities),
+      true,
+    );
+    assert.equal(
+      typeof capability_guidance_artifact._sections[0]._capabilities[0].title,
+      "string",
+    );
+
+    const capability_guidance_wormhole_res =
+      makeRes(
+        "capability-guidance-rid",
+        {
+          _ok: true,
+          _ts: Date.now(),
+          _pt: 0,
+          _result: capability_guidance_analyze_res,
+        },
+      );
+    const capability_guidance_serialized =
+      JSON.parse(JSON.stringify(capability_guidance_wormhole_res));
+    const serialized_artifact =
+      capability_guidance_serialized
+        ._payload
+        ._result
+        ._intent
+        ._artifact_request;
+    assert.equal(serialized_artifact._type, "capability-guidance");
+    assert.equal(serialized_artifact._capability_count > 0, true);
+    assert.equal(Array.isArray(serialized_artifact._capabilities), true);
+    assert.equal(
+      typeof serialized_artifact._capabilities[0],
+      "object",
+    );
+    assert.notEqual(
+      typeof serialized_artifact._capabilities[0],
+      "string",
+    );
+    assert.equal(
+      typeof serialized_artifact._capabilities[0].title,
+      "string",
+    );
+    assert.equal(
+      typeof serialized_artifact._capabilities[0].description,
+      "string",
+    );
+    assert.equal(
+      Array.isArray(serialized_artifact._capabilities[0].prompt_examples),
+      true,
+    );
+    assert.equal(
+      Array.isArray(serialized_artifact._capabilities[0].manual_steps),
+      true,
+    );
+    assert.equal(
+      typeof serialized_artifact._capabilities[0].mode,
+      "string",
+    );
+    assert.equal(
+      typeof serialized_artifact._capabilities[0].status,
+      "string",
+    );
+    assert.equal(Array.isArray(serialized_artifact._sections), true);
+    assert.equal(
+      typeof serialized_artifact._sections[0]._capabilities[0].title,
+      "string",
+    );
+    assert.deepEqual(
+      capability_guidance_analyze_res._result._message._intent._artifact_request,
+      capability_guidance_analyze_res._intent._artifact_request,
+    );
+
+    const confirm_plan_server_xvm =
+      new ServerXVMModule({ _work_folder: conversation_work_folder });
+    await (confirm_plan_server_xvm as any)._create_app({
+      _params: {
+        _app_id: "conversation-app",
+        _env: "test",
+      },
+    });
+    const planning_project_memory_path = path.join(
+      conversation_work_folder,
+      "xvm",
+      "apps",
+      "test",
+      "conversation-app",
+      "project-memory.json",
+    );
+    const planning_project_memory_before =
+      await readFile(planning_project_memory_path, "utf-8").catch(() => undefined);
+
+    const create_planning_conversation_res =
+      await (conversation_xvibe as any)._create_conversation({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "planning-chat",
+        },
+      });
+    assert.equal(create_planning_conversation_res._ok, true);
+
+    const create_no_draft_conversation_res =
+      await (conversation_xvibe as any)._create_conversation({
+        _params: {
+          _app_id: "conversation-app",
+          _env: "test",
+          _conversation_id: "planning-no-draft-chat",
+        },
+      });
+    assert.equal(create_no_draft_conversation_res._ok, true);
+
+    const planning_original_intent_engine =
+      (conversation_xvibe as any).intent_engine;
+    let planning_semantic_calls = 0;
+    const planning_execute_commands: any[] = [];
+    set_xvibe_semantic_intent_env("true");
+    try {
+      (conversation_xvibe as any).intent_engine =
+        xvibe_test_intent_engine({
+          _semantic_generate_json: async () => {
+            planning_semantic_calls += 1;
+            throw new Error("planning answers must not reach semantic intent");
+          },
+        });
+      (_x as any).execute = async (command: any) => {
+        planning_execute_commands.push(command);
+        if (command?._module === "server-xvm") {
+          const forbidden_artifact_ops = new Set([
+            "create_view",
+            "create-view",
+            "push_update",
+            "push-update",
+            "set_flow",
+            "set-flow",
+            "set_entity",
+            "set-entity",
+          ]);
+          if (forbidden_artifact_ops.has(command?._op)) {
+            throw new Error(`confirm-project-plan must not create artifacts: ${command._op}`);
+          }
+          if (command?._op === "patch-project-memory") {
+            return (confirm_plan_server_xvm as any)._patch_project_memory(command);
+          }
+        }
+        if (command?._module === "xai" && command?._op === "generate") {
+          planning_semantic_calls += 1;
+          throw new Error("planning answers must not reach semantic intent");
+        }
+
+        return original_execute.call(_x, command);
+      };
+
+      const planning_prompt_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "I want to build a CRM",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(planning_prompt_res._ok, true);
+      assert.equal(
+        planning_prompt_res._result._message._metadata._intent_processor,
+        "PlanningProcessor",
+      );
+      assert.equal(planning_prompt_res._intent._artifact_type, "project-plan");
+      assert.deepEqual(planning_prompt_res._intent._actions, []);
+
+      const planning_conversation_path =
+        path.join(conversations_dir, "planning-chat", "conversation.json");
+      const planning_conversation_after_prompt =
+        JSON.parse(await readFile(planning_conversation_path, "utf-8"));
+      assert.equal(
+        planning_conversation_after_prompt._planning_draft._type,
+        "project-plan",
+      );
+      assert.equal(
+        planning_conversation_after_prompt._planning_draft._current_question._id,
+        "primary_user",
+      );
+      assert.deepEqual(
+        planning_conversation_after_prompt._planning_draft._answers,
+        {},
+      );
+
+      const incomplete_confirm_plan_res =
+        await (conversation_xvibe as any)._confirm_project_plan({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+          },
+        });
+      assert.equal(incomplete_confirm_plan_res._ok, false);
+      assert.equal(
+        incomplete_confirm_plan_res._error._code,
+        "E_PLANNING_INCOMPLETE",
+      );
+      assert.ok(
+        incomplete_confirm_plan_res._error._details._errors.includes(
+          "draft_not_ready_for_confirmation",
+        ),
+      );
+      const planning_conversation_after_incomplete_confirm =
+        JSON.parse(await readFile(planning_conversation_path, "utf-8"));
+      assert.equal(
+        planning_conversation_after_incomplete_confirm._planning_draft._current_question._id,
+        "primary_user",
+      );
+
+      const missing_draft_confirm_plan_res =
+        await (conversation_xvibe as any)._confirm_project_plan({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-no-draft-chat",
+          },
+        });
+      assert.equal(missing_draft_confirm_plan_res._ok, false);
+      assert.equal(
+        missing_draft_confirm_plan_res._error._code,
+        "E_PLANNING_DRAFT_NOT_FOUND",
+      );
+
+      const planning_sales_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Sales",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(planning_sales_res._ok, true);
+      assert.equal(
+        planning_sales_res._result._message._metadata._intent_processor,
+        "PlanningSessionProcessor",
+      );
+      assert.deepEqual(
+        planning_sales_res._intent._artifact_request._answers.primary_user,
+        ["Sales"],
+      );
+      assert.equal(
+        planning_sales_res._intent._artifact_request._current_question._id,
+        "core_entities",
+      );
+      assert.deepEqual(planning_sales_res._intent._actions, []);
+
+      const planning_conversation_after_sales =
+        JSON.parse(await readFile(planning_conversation_path, "utf-8"));
+      assert.deepEqual(
+        planning_conversation_after_sales._planning_draft._answers.primary_user,
+        ["Sales"],
+      );
+      assert.equal(
+        planning_conversation_after_sales._planning_draft._current_question._id,
+        "core_entities",
+      );
+
+      const planning_entities_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Customers, Contacts",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(planning_entities_res._ok, true);
+      assert.deepEqual(
+        planning_entities_res._intent._artifact_request._answers.primary_user,
+        ["Sales"],
+      );
+      assert.deepEqual(
+        planning_entities_res._intent._artifact_request._answers.core_entities,
+        ["Customers", "Contacts"],
+      );
+      assert.equal(
+        planning_entities_res._intent._artifact_request._current_question._id,
+        "ai_capabilities",
+      );
+
+      const planning_conversation_after_entities =
+        JSON.parse(await readFile(planning_conversation_path, "utf-8"));
+      assert.deepEqual(
+        planning_conversation_after_entities._planning_draft._answers.core_entities,
+        ["Customers", "Contacts"],
+      );
+      assert.equal(
+        planning_conversation_after_entities._planning_draft._current_question._id,
+        "ai_capabilities",
+      );
+
+      const planning_ai_capabilities_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "None",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.deepEqual(
+        planning_ai_capabilities_res._intent._artifact_request._answers.ai_capabilities,
+        ["None"],
+      );
+      assert.equal(
+        planning_ai_capabilities_res._intent._artifact_request._current_question._id,
+        "notification_capabilities",
+      );
+
+      const planning_notification_capabilities_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "None",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_notification_capabilities_res._intent._artifact_request._current_question._id,
+        "reporting_capabilities",
+      );
+
+      const planning_reporting_capabilities_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "None",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_reporting_capabilities_res._intent._artifact_request._current_question._id,
+        "integration_capabilities",
+      );
+
+      const planning_integration_capabilities_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "None",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_integration_capabilities_res._intent._artifact_request._current_question._id,
+        "first_workflow",
+      );
+
+      const planning_workflow_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Create record",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_workflow_res._intent._artifact_request._current_question._id,
+        "authentication",
+      );
+
+      const planning_auth_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Staff login",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_auth_res._intent._artifact_request._current_question._id,
+        "customer_ownership",
+      );
+
+      const planning_owner_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Sales",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_owner_res._intent._artifact_request._current_question._id,
+        "company_contact_relationship",
+      );
+
+      const planning_relationship_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Company has many contacts",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_relationship_res._intent._artifact_request._current_question._id,
+        "follow_up_tasks",
+      );
+
+      const planning_complete_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+            _message: "Tasks",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(
+        planning_complete_res._intent._artifact_request._status,
+        "ready-for-confirmation",
+      );
+      assert.deepEqual(
+        planning_complete_res._intent._artifact_request._unanswered,
+        [],
+      );
+
+      assert.equal(typeof (conversation_xvibe as any)._confirm_project_plan, "function");
+      const confirm_plan_res =
+        await (conversation_xvibe as any)._confirm_project_plan({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-chat",
+          },
+        });
+      assert.equal(confirm_plan_res._ok, true);
+      assert.equal(confirm_plan_res._result._confirmed, true);
+      assert.equal(confirm_plan_res._result._memory._stage, "building");
+      assert.equal(confirm_plan_res._result._memory._goal, "Build a CRM app");
+      assert.equal(
+        confirm_plan_res._result._memory._summary,
+        "Plan a CRM app for customer tracking and follow-up workflows.",
+      );
+      assert.equal(
+        confirm_plan_res._result._memory._current_focus,
+        "Customer Management",
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._proposed._entities.map((entity: any) => entity._id),
+        ["customer", "contact"],
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._proposed._views.map((view: any) => view._id),
+        ["dashboard", "customer-list"],
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._proposed._flows.map((flow: any) => flow._id),
+        ["create-customer"],
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._proposed._server_modules.map((module: any) => module._id),
+        ["notifications"],
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._milestones,
+        [
+          {
+            _id: "customer-management",
+            _title: "Customer Management",
+            _items: [
+              {
+                _id: "customer-crud",
+                _title: "Customer CRUD",
+                _completed: false,
+              },
+              {
+                _id: "search-filters",
+                _title: "Search & Filters",
+                _completed: false,
+              },
+              {
+                _id: "customer-details",
+                _title: "Customer Details",
+                _completed: false,
+              },
+            ],
+          },
+        ],
+      );
+      assert.equal(
+        confirm_plan_res._result._memory._decisions.length,
+        11,
+      );
+      assert.deepEqual(
+        confirm_plan_res._result._memory._decisions.find(
+          (decision: any) => decision._id === "primary_user",
+        )?._answer,
+        ["Sales"],
+      );
+
+      const planning_conversation_after_confirm =
+        JSON.parse(await readFile(planning_conversation_path, "utf-8"));
+      assert.equal(planning_conversation_after_confirm._planning_draft, undefined);
+      assert.deepEqual(
+        JSON.parse(await readFile(planning_project_memory_path, "utf-8")),
+        confirm_plan_res._result._memory,
+      );
+      assert.deepEqual(
+        planning_execute_commands
+          .filter((command) => command?._module === "server-xvm")
+          .map((command) => command._op)
+          .filter((op) => op === "patch-project-memory"),
+        ["patch-project-memory"],
+      );
+      assert.deepEqual(
+        planning_execute_commands
+          .filter((command) => command?._module === "server-xvm")
+          .map((command) => command._op)
+          .filter((op) =>
+            [
+              "create_view",
+              "create-view",
+              "push_update",
+              "push-update",
+              "set_flow",
+              "set-flow",
+              "set_entity",
+              "set-entity",
+            ].includes(op),
+          ),
+        [],
+      );
+      const confirmed_app_dir = path.join(
+        conversation_work_folder,
+        "xvm",
+        "apps",
+        "test",
+        "conversation-app",
+      );
+      assert.deepEqual(
+        await readdir(path.join(confirmed_app_dir, "entities")).catch(() => []),
+        [],
+      );
+      assert.deepEqual(
+        await readdir(path.join(confirmed_app_dir, "views")).catch(() => []),
+        [],
+      );
+      assert.deepEqual(
+        await readdir(path.join(confirmed_app_dir, "flows")).catch(() => []),
+        [],
+      );
+
+      const legacy_runtime_missing_plan = {
+        ...planning_complete_res._intent._artifact_request,
+        _status: "collecting-information",
+        _current_question: {
+          _id: "runtime",
+          _type: "single",
+          _question: "Where should the app run first?",
+          _options: ["Local", "Internal server", "Hosted", "Xpell Cloud", "Other"],
+          _required: true,
+          _answer: null,
+        },
+        _unanswered: ["runtime"],
+        _questions: [
+          ...planning_complete_res._intent._artifact_request._questions,
+          {
+            _id: "runtime",
+            _type: "single",
+            _question: "Where should the app run first?",
+            _options: ["Local", "Internal server", "Hosted", "Xpell Cloud", "Other"],
+            _required: true,
+            _answer: null,
+          },
+        ],
+      };
+      const legacy_runtime_missing_confirm_res =
+        await (conversation_xvibe as any)._confirm_project_plan({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-no-draft-chat",
+            _project_plan: legacy_runtime_missing_plan,
+          },
+        });
+      assert.equal(legacy_runtime_missing_confirm_res._ok, true);
+      assert.equal(
+        legacy_runtime_missing_confirm_res._result._memory._stage,
+        "building",
+      );
+
+      const fallback_confirm_res =
+        await (conversation_xvibe as any).execute({
+          _op: "confirm-project-plan",
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-no-draft-chat",
+            _message_id: "fallback-confirm-message",
+            _artifact: {
+              _artifact_type: "project-plan",
+              _artifact_request: planning_complete_res._intent._artifact_request,
+            },
+          },
+        });
+      assert.equal(fallback_confirm_res._ok, true);
+      assert.equal(fallback_confirm_res._result._confirmed, true);
+      assert.equal(fallback_confirm_res._result._memory._stage, "building");
+      assert.equal(fallback_confirm_res._result._memory._goal, "Build a CRM app");
+      const planning_no_draft_conversation_after_fallback_raw =
+        await readFile(
+          path.join(conversations_dir, "planning-no-draft-chat", "conversation.json"),
+          "utf-8",
+        ).catch(() => undefined);
+      if (planning_no_draft_conversation_after_fallback_raw) {
+        assert.equal(
+          JSON.parse(planning_no_draft_conversation_after_fallback_raw)._planning_draft,
+          undefined,
+        );
+      }
+
+      const no_draft_sales_res =
+        await (conversation_xvibe as any)._analyze_message({
+          _params: {
+            _app_id: "conversation-app",
+            _env: "test",
+            _conversation_id: "planning-no-draft-chat",
+            _message: "Sales",
+            _runtime_context: {
+              _stage: "planning",
+            },
+          },
+        });
+      assert.equal(no_draft_sales_res._ok, true);
+      assert.equal(
+        no_draft_sales_res._result._message._metadata._intent_processor,
+        "PlanningSessionProcessor",
+      );
+      assert.equal(
+        no_draft_sales_res._intent._reason,
+        "planning_session_draft_not_found",
+      );
+      assert.deepEqual(no_draft_sales_res._intent._actions, []);
+      assert.equal(no_draft_sales_res._intent._artifact_request, undefined);
+      assert.equal(planning_semantic_calls, 0);
+    } finally {
+      (conversation_xvibe as any).intent_engine =
+        planning_original_intent_engine;
+      set_xvibe_semantic_intent_env(undefined);
+      (_x as any).execute = original_execute;
+    }
+
+    const planning_project_memory_after =
+      await readFile(planning_project_memory_path, "utf-8").catch(() => undefined);
+    assert.notEqual(
+      planning_project_memory_after,
+      planning_project_memory_before,
     );
 
     await rm(path.join(conversations_dir, "index.json"), { force: true });
@@ -18165,7 +36298,7 @@ try {
   assert.equal(capped_last_messages_res._ok, true);
   assert.equal(capped_last_messages_res._result._messages.length, 100);
   assert.equal(capped_last_messages_res._result._count, 100);
-  assert.equal(capped_last_messages_res._result._total, 114);
+  assert.equal(capped_last_messages_res._result._total, 115);
   assert.equal(capped_last_messages_res._result._messages[0]._id, "extra-10");
 
   const invalid_role_res = await (conversation_xvibe as any)._append_message({

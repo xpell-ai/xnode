@@ -2,14 +2,15 @@
 
 # AGENTS.md — @xpell/node
 
-Before making changes, apply:
+Before making changes, apply Codex skills:
 
-- /docs/skills/xpell-contract
-- /docs/skills/xpell-core
-- /docs/skills/xpell-node
-- /docs/skills/xpell-xdb
-- /docs/skills/xpell-xvm
-- /docs/skills/xflow-manager
+- xpell-contract
+- xpell-core
+- xpell-node
+- xpell-xdb
+- xpell-xvm
+- xflow-manager
+- xpell-xvibe
 
 Rules:
 - Server only.

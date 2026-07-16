@@ -54,11 +54,15 @@ export type XVibeResolvedTask = {
   _action: XVibeResolvedTaskAction;
   _artifact_type: XVibeResolvedTaskArtifactType;
   _target_id?: string;
-  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "set-interaction";
+  _edit_action?: "remove" | "hide" | "show" | "update" | "add-class" | "remove-class" | "replace-class" | "toggle-class" | "set-style" | "set-styles" | "remove-style" | "set-style-class-rule" | "remove-style-class-rule" | "set-property" | "update-property" | "remove-property" | "move-object" | "replace-object" | "duplicate-object" | "add-child" | "create-toolbar" | "set-interaction" | "bind-flow";
   _edit_target_id?: string;
   _edit_target_text?: string;
   _edit_target_type?: string;
   _edit_move_position?: "before" | "after" | "top" | "bottom";
+  _edit_position?: "append" | "prepend" | "before" | "after";
+  _edit_destination_id?: string;
+  _edit_destination_text?: string;
+  _edit_destination_type?: string;
   _edit_anchor_id?: string;
   _edit_anchor_text?: string;
   _edit_anchor_type?: string;
@@ -68,11 +72,15 @@ export type XVibeResolvedTask = {
   _edit_new_class_name?: string;
   _edit_style_property?: string;
   _edit_style_value?: string;
+  _edit_styles?: Record<string, unknown>;
   _edit_property_name?: string;
   _edit_property_value?: unknown;
   _edit_interaction_scope?: "_on" | "_once";
   _edit_trigger?: string;
   _edit_handler?: Record<string, any> | null;
+  _edit_flow?: { _id: string; _payload?: Record<string, unknown> };
+  _edit_flow_event?: string;
+  _edit_flow_auto?: boolean;
   _edit_object_value?: Record<string, any>;
   _edit_child_value?: Record<string, any>;
   _edit_field?: string;
@@ -261,7 +269,12 @@ export type XVibeIntentArtifactRequestType =
   | "view"
   | "form"
   | "table"
-  | "execution-graph";
+  | "crud-evolution"
+  | "crud-field-suggestion"
+  | "execution-graph"
+  | "project-plan"
+  | "capability-guidance"
+  | "mutation-plan";
 
 export interface XVibeIntentAction {
   _id: string;
@@ -270,6 +283,13 @@ export interface XVibeIntentAction {
   _action_type: XVibeIntentActionType;
   _status: XVibeIntentActionStatus;
   _params?: Record<string, any>;
+  _execution_payload?: {
+    _module: string;
+    _op: string;
+    _params: Record<string, any>;
+  };
+  _executable?: boolean;
+  _non_executable_reason?: string;
   _requires_approval?: boolean;
   _confidence?: number;
   _reason?: string;
@@ -290,9 +310,15 @@ export interface XVibeIntentResult {
 export interface XVibeIntentRuntimeContext {
   _app_id: string;
   _env: string;
+  _stage?: XVibeProjectMemory["_stage"];
   _active_view_id?: string;
+  _current_view?: Record<string, any>;
   _selected_object?: Record<string, any>;
   _conversation_id?: string;
+  _project_memory?: XVibeProjectMemory;
+  _current_artifact?: Record<string, any>;
+  _current_project_plan?: Record<string, any>;
+  _planning_answer?: string | string[];
   _available_artifacts?: {
     _views?: string[];
     _entities?: string[];
@@ -300,6 +326,38 @@ export interface XVibeIntentRuntimeContext {
     _modules?: string[];
   };
 }
+
+export type XVibeProjectMemory = {
+  _version: number;
+  _stage: "planning" | "building" | "review" | "completed";
+  _vision: string;
+  _goal: string;
+  _summary?: string;
+  _proposed?: {
+    _entities?: unknown[];
+    _views?: unknown[];
+    _flows?: unknown[];
+    _server_modules?: unknown[];
+  };
+  _current_focus: string;
+  _completed: unknown[];
+  _achievements?: unknown[];
+  _milestones?: unknown[];
+  _parking_lot: unknown[];
+  _decisions: unknown[];
+  _notes: unknown[];
+  _updated_at: string;
+};
+
+export type XVibeGuideRecommendation = {
+  _title: string;
+  _reason: string;
+  _type: "entity" | "crud" | "flow" | "view";
+  _priority: number;
+  _action: {
+    _prompt: string;
+  };
+};
 
 export interface XVibeIntentEngineRequest {
   _message: string;
