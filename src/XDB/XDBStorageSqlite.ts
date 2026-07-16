@@ -303,6 +303,21 @@ export class XDBStorageSqlite implements IXDBStorage,IXDBBackup {
     tx();
   }
 
+  async deleteEntity(entityName: string): Promise<void> {
+    const tx = this._db.transaction(() => {
+      this._db.prepare(`DELETE FROM xdb_entities WHERE name = ?`).run(entityName);
+    });
+
+    tx();
+
+    const blob_delete_entity =
+      (this._blob as unknown as { deleteEntity?: (name: string) => Promise<void> }).deleteEntity;
+
+    if (typeof blob_delete_entity === "function") {
+      await blob_delete_entity.call(this._blob, entityName);
+    }
+  }
+
   // -------------------- IXDBStorage: objects --------------------
   async saveObject(objectName: string, value: string | object): Promise<void> {
     const v = typeof value === "string" ? value : JSON.stringify(value);

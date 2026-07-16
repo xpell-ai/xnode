@@ -226,6 +226,12 @@ export class XDBStorageFS implements IXDBStorage, IXDBMaintenance {
         if (payload._entity_matrices_index !== undefined) this.writeJsonFile(files._entity_matrices_index, payload._entity_matrices_index, securityMode);
     }
 
+    async deleteEntity(entityName: string): Promise<void> {
+        const entityFolder = path.join(this._data_folder, entityName);
+        if (!fs.existsSync(entityFolder)) return;
+        fs.rmSync(entityFolder, { recursive: true, force: true });
+    }
+
     // -------------------- object store --------------------
     async saveObject(objectName: string, value: string | object): Promise<void> {
         const objectFile = this._objects_folder + objectName + _xdb_file_extension;

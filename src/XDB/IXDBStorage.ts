@@ -32,6 +32,7 @@ export interface IXDBStorage {
   listEntities(): Promise<string[]>;
   loadEntity(entityName: string): Promise<XDBEntityPersisted | null>;
   saveEntity(entityName: string, payload: XDBEntityPersisted, saveSchema: boolean): Promise<void>;
+  deleteEntity(entityName: string): Promise<void>;
 
   // object store
   saveObject(objectName: string, value: string | object): Promise<void>;

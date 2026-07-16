@@ -261,6 +261,16 @@ export class XDBEngine {
         return removed;
     }
 
+    async deleteEntity(entityName: string) {
+        const name = String(entityName ?? "");
+        if (!name) return false;
+
+        this.removeEntity(name, false);
+        await this._storage.deleteEntity(name);
+        await this.commit();
+        return true;
+    }
+
     /**
      * Commit meta to storage
      */

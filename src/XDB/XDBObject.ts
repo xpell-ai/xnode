@@ -7,7 +7,7 @@
  */
 
 import mongoose from "mongoose";
-import type { IndexDefinition, IndexOptions } from "mongoose";
+import type { Connection, IndexDefinition, IndexOptions } from "mongoose";
 import bcrypt from "bcryptjs";
 
 import { XObject, _xlog, type XObjectData, XResponse} from "@xpell/core";
@@ -16,6 +16,33 @@ import { XObject, _xlog, type XObjectData, XResponse} from "@xpell/core";
 const BCRYPT_SALT_OR_ROUNDS = 10;
 
 type XIndex = { keys: IndexDefinition; options?: IndexOptions };
+
+export type XDBObjectRawFindOptions = {
+  _skip?: number;
+  _limit?: number;
+  _sort?: any;
+  _no_ignore?: boolean;
+};
+
+export type XDBObjectRawWriteOptions = {
+  _hash?: boolean;
+  _no_ignore?: boolean;
+};
+
+export type XDBObjectAddRawOptions = XDBObjectRawWriteOptions & {
+  _preserve_id?: boolean;
+};
+
+export type XDBObjectUpdateRawOptions = XDBObjectRawWriteOptions & {
+  _upsert?: boolean;
+};
+
+export type XDBObjectProviderOptions = {
+  _mongoose_connection?: Connection;
+  _model_name?: string;
+  _collection_name?: string;
+  _throw_on_model_error?: boolean;
+};
 
 // Convert mongo camelCase keys to _xpell_snake_case when exporting.
 // Example: createdAt -> _created_at
@@ -64,9 +91,29 @@ export class XDBObject extends XObject {
   /** optional indexes, can be provided via data._indexes or subclass static "indexes" */
   protected _indexes: XIndex[] = [];
 
+  protected _mongoose_connection?: Connection;
+  protected _model_name?: string;
+  protected _collection_name?: string;
+  protected _throw_on_model_error = false;
+
   constructor(data: XObjectData) {
     super(data);
     this.parse(data);
+
+    const providerOptions =
+      data as XObjectData & XDBObjectProviderOptions;
+
+    this._mongoose_connection =
+      providerOptions._mongoose_connection;
+
+    this._model_name =
+      providerOptions._model_name;
+
+    this._collection_name =
+      providerOptions._collection_name;
+
+    this._throw_on_model_error =
+      providerOptions._throw_on_model_error === true;
 
     if (!this._name) {
       throw new Error("XDBObject: missing _name (collection/model name)");
@@ -84,11 +131,103 @@ export class XDBObject extends XObject {
     if (this._schema) this.createModel();
   }
 
+  private shouldUseConnectionScopedModel() {
+    return !!(
+      this._mongoose_connection ||
+      this._model_name ||
+      this._collection_name
+    );
+  }
+
+  private shouldThrowModelCreationErrors() {
+    return (
+      this._throw_on_model_error ||
+      this.shouldUseConnectionScopedModel()
+    );
+  }
+
+  private stableSchemaValue(value: any): any {
+    if (typeof value === "function") {
+      return `[Function:${value.name || "anonymous"}]`;
+    }
+
+    if (
+      value === null ||
+      typeof value !== "object"
+    ) {
+      return value;
+    }
+
+    if (Array.isArray(value)) {
+      return value.map((item) => this.stableSchemaValue(item));
+    }
+
+    const out: Record<string, any> = {};
+    for (const key of Object.keys(value).sort()) {
+      out[key] = this.stableSchemaValue(value[key]);
+    }
+    return out;
+  }
+
+  private schemaSignature(schema: any) {
+    return JSON.stringify(
+      this.stableSchemaValue(schema ?? {})
+    );
+  }
+
+  private modelCollectionName(model: any) {
+    return (
+      model?.collection?.name ??
+      model?.collection?.collectionName ??
+      model?.collectionName
+    );
+  }
+
+  private assertConnectionScopedModelCompatible(
+    modelName: string,
+    existing: any,
+    nextSchema: any,
+    collectionName?: string
+  ) {
+    const existingCollection =
+      this.modelCollectionName(existing);
+
+    if (
+      collectionName &&
+      existingCollection &&
+      existingCollection !== collectionName
+    ) {
+      throw new Error(
+        `XDBObject model '${modelName}' already exists for collection '${existingCollection}', not '${collectionName}'`
+      );
+    }
+
+    const existingSignature =
+      existing?.schema?.__xdb_schema_signature ??
+      this.schemaSignature(existing?.schema?.obj ?? {});
+
+    const nextSignature =
+      nextSchema?.__xdb_schema_signature ??
+      this.schemaSignature(nextSchema?.obj ?? {});
+
+    if (
+      existing?.schema &&
+      existingSignature !== nextSignature
+    ) {
+      throw new Error(
+        `XDBObject model '${modelName}' already exists with an incompatible schema`
+      );
+    }
+  }
+
   protected createModel() {
     const mongoSchema = new mongoose.Schema(<any>this._schema, {
       timestamps: true,
       autoIndex: true, // set false in prod if you manage indexes manually
     });
+
+    (mongoSchema as any).__xdb_schema_signature =
+      this.schemaSignature(this._schema);
 
     // apply configured indexes (if any)
     if (Array.isArray(this._indexes)) {
@@ -103,11 +242,54 @@ export class XDBObject extends XObject {
     }
 
     try {
-      // Avoid OverwriteModelError during hot reloads
-      const existing = (mongoose.models as any)?.[this._name as string] as mongoose.Model<any> | undefined;
+      const modelName =
+        String(
+          this._model_name ??
+          this._name
+        );
 
-      const modelFactory = mongoose.model as any;
-      this._model = existing ?? modelFactory(this._name, mongoSchema);
+      if (this.shouldUseConnectionScopedModel()) {
+        if (!this._mongoose_connection) {
+          throw new Error(
+            "XDBObject connection-scoped model creation requires _mongoose_connection"
+          );
+        }
+
+        const connection =
+          this._mongoose_connection as any;
+
+        const existing =
+          connection.models?.[modelName] as mongoose.Model<any> | undefined;
+
+        if (existing) {
+          this.assertConnectionScopedModelCompatible(
+            modelName,
+            existing,
+            mongoSchema,
+            this._collection_name
+          );
+        }
+
+        this._model =
+          existing ??
+          connection.model(
+            modelName,
+            mongoSchema,
+            this._collection_name
+          );
+      } else {
+        // Avoid OverwriteModelError during hot reloads for legacy callers.
+        const existing = (mongoose.models as any)?.[modelName] as mongoose.Model<any> | undefined;
+
+        const modelFactory = mongoose.model as any;
+        this._model = existing ?? modelFactory(modelName, mongoSchema);
+      }
+
+      if (!this._model) {
+        throw new Error(
+          `XDBObject model '${modelName}' was not created`
+        );
+      }
 
       // Optional: sync indexes ONLY when explicitly enabled (dev)
       if (process.env.XDB_SYNC_INDEXES === "true") {
@@ -119,6 +301,9 @@ export class XDBObject extends XObject {
       return this._model;
     } catch (error: any) {
       _xlog.error(`XDB ERROR Creating Model for ${this._name}: ${error?.message ?? error}`);
+      if (this.shouldThrowModelCreationErrors()) {
+        throw error;
+      }
     }
   }
 
@@ -182,6 +367,276 @@ export class XDBObject extends XObject {
     return outData;
   }
 
+  protected getModel() {
+    if (!this._model) {
+      throw new Error(
+        `XDBObject model '${this._model_name ?? this._name}' is not initialized`
+      );
+    }
+
+    return this._model as any;
+  }
+
+  protected async execModelQuery<T = any>(query: any): Promise<T> {
+    if (
+      query &&
+      typeof query.exec === "function"
+    ) {
+      return await query.exec();
+    }
+
+    return await query;
+  }
+
+  protected cloneInput(data: any) {
+    if (
+      data === null ||
+      data === undefined ||
+      typeof data !== "object"
+    ) {
+      return data;
+    }
+
+    return {
+      ...data
+    };
+  }
+
+  protected applyFindOptions(query: any, options: XDBObjectRawFindOptions = {}) {
+    let out =
+      query;
+
+    if (
+      options._sort &&
+      typeof out?.sort === "function"
+    ) {
+      out = out.sort(options._sort);
+    }
+
+    if (
+      typeof options._skip === "number" &&
+      typeof out?.skip === "function"
+    ) {
+      out = out.skip(Math.max(0, options._skip));
+    }
+
+    if (
+      typeof options._limit === "number" &&
+      typeof out?.limit === "function"
+    ) {
+      out = out.limit(Math.max(0, options._limit));
+    }
+
+    return out;
+  }
+
+  normalizeRecord(dbRecord?: any, noIgnore?: boolean) {
+    const out =
+      this.toXData(dbRecord, noIgnore);
+
+    delete out.__v;
+    delete out.$__;
+    delete out._doc;
+
+    return out;
+  }
+
+  async addRaw(data: any, options: XDBObjectAddRawOptions = {}) {
+    const input =
+      this.cloneInput(data ?? {});
+
+    if (
+      options._preserve_id === false &&
+      input &&
+      typeof input === "object"
+    ) {
+      delete input._id;
+    }
+
+    const dbModel =
+      new (this.getModel())();
+
+    const fixedData =
+      await this.fixFields(
+        input ?? {},
+        options._hash !== false
+      );
+
+    Object.assign(
+      dbModel,
+      fixedData
+    );
+
+    const mongoObj =
+      await dbModel.save();
+
+    return this.normalizeRecord(
+      mongoObj,
+      options._no_ignore
+    );
+  }
+
+  async findRaw(
+    filter: any = {},
+    options: XDBObjectRawFindOptions = {}
+  ): Promise<any[]> {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const query =
+      this.applyFindOptions(
+        this.getModel().find(fout),
+        options
+      );
+
+    const arrIn =
+      await this.execModelQuery<any[]>(query);
+
+    return Array.isArray(arrIn)
+      ? arrIn.map((rec) =>
+        this.normalizeRecord(
+          rec,
+          options._no_ignore
+        )
+      )
+      : [];
+  }
+
+  async findOneRaw(
+    filter: any,
+    options: Pick<XDBObjectRawFindOptions, "_no_ignore"> = {}
+  ) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const dbOut =
+      await this.execModelQuery<any>(
+        this.getModel().findOne(fout)
+      );
+
+    return dbOut == null
+      ? null
+      : this.normalizeRecord(
+        dbOut,
+        options._no_ignore
+      );
+  }
+
+  async countRaw(filter: any = {}) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const count =
+      await this.execModelQuery<number>(
+        this.getModel().countDocuments(fout)
+      );
+
+    return Number(count ?? 0);
+  }
+
+  async updateOneRaw(
+    filter: any,
+    updates: any,
+    options: XDBObjectUpdateRawOptions = {}
+  ) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const uout =
+      await this.fixFields(
+        this.cloneInput(updates ?? {}),
+        options._hash !== false
+      );
+
+    const modelResult =
+      await this.execModelQuery<any>(
+        this.getModel()
+          .findOneAndUpdate(
+            fout,
+            uout,
+            {
+              new: true,
+              upsert: options._upsert ?? false,
+            }
+          )
+      );
+
+    return modelResult
+      ? this.normalizeRecord(
+        modelResult,
+        options._no_ignore
+      )
+      : null;
+  }
+
+  async updateManyRaw(
+    filter: any,
+    updates: any,
+    options: XDBObjectRawWriteOptions = {}
+  ) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const uout =
+      await this.fixFields(
+        this.cloneInput(updates ?? {}),
+        options._hash !== false
+      );
+
+    const result =
+      await this.execModelQuery<any>(
+        this.getModel().updateMany(fout, uout)
+      );
+
+    return {
+      _matched:
+        Number(
+          result?.matchedCount ??
+          result?.n ??
+          0
+        ),
+      _modified:
+        Number(
+          result?.modifiedCount ??
+          result?.nModified ??
+          0
+        )
+    };
+  }
+
+  async deleteManyRaw(filter: any) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const result =
+      await this.execModelQuery<any>(
+        this.getModel().deleteMany(fout)
+      );
+
+    return {
+      _deleted:
+        Number(
+          result?.deletedCount ??
+          result?.n ??
+          0
+        )
+    };
+  }
+
+  async distinctRaw(field: string, filter: any = {}) {
+    const fout =
+      await this.fixFields(filter ?? {});
+
+    const arrIn =
+      await this.execModelQuery<any[]>(
+        this.getModel().distinct(field, fout)
+      );
+
+    return Array.isArray(arrIn)
+      ? arrIn
+      : [];
+  }
+
   // ----------------------------------------------------------------------------
   // CRUD
   // ----------------------------------------------------------------------------
@@ -190,14 +645,13 @@ export class XDBObject extends XObject {
     const res = new XResponse();
 
     try {
-      const dbModel = new this._model();
-      if (data && typeof data === "object") delete data._id;
-
-      const fixedData = await this.fixFields(data ?? {}, true);
-      Object.assign(dbModel, fixedData);
-
-      const mongoObj = await dbModel.save();
-      res._result = this.toXData(mongoObj);
+      res._result =
+        await this.addRaw(
+          data,
+          {
+            _preserve_id: false
+          }
+        );
       res._ok = true;
     } catch (e: any) {
       _xlog.error("XDBObject.add() error:", e);
@@ -211,10 +665,14 @@ export class XDBObject extends XObject {
   async searchArray(filter: any, noIgnore?: boolean) {
     const res = new XResponse();
     try {
-      const fout = await this.fixFields(filter ?? {});
-      const arrIn = await this._model.find(fout).exec();
-
-      res._result = Array.isArray(arrIn) ? arrIn.map((rec) => this.toXData(rec, noIgnore)) : [];
+      res._result =
+        await this.findRaw(
+          filter,
+          {
+            _no_ignore:
+              noIgnore
+          }
+        );
       res._ok = true;
     } catch (e: any) {
       res._result = e?.message ?? e;
@@ -229,11 +687,17 @@ export class XDBObject extends XObject {
   async search(filter: any, noIgnore?: boolean) {
     const res = new XResponse();
     try {
-      const fout = await this.fixFields(filter ?? {});
-      const arrIn = await this._model.find(fout).exec();
+      const arrIn =
+        await this.findRaw(
+          filter,
+          {
+            _no_ignore:
+              noIgnore
+          }
+        );
 
       if (Array.isArray(arrIn)) {
-        res._result = arrIn.length === 1 ? this.toXData(arrIn[0], noIgnore) : arrIn.map((rec) => this.toXData(rec, noIgnore));
+        res._result = arrIn.length === 1 ? arrIn[0] : arrIn;
       } else {
         res._result = [];
       }
@@ -249,8 +713,11 @@ export class XDBObject extends XObject {
   async distinct(field: string, filter: any, _noIgnore?: boolean) {
     const res = new XResponse();
     try {
-      const fout = await this.fixFields(filter ?? {});
-      const arrIn = await this._model.distinct(field, fout).exec();
+      const arrIn =
+        await this.distinctRaw(
+          field,
+          filter
+        );
 
       res._result = (arrIn?.[0] ?? null)?.toString?.() ?? null;
       res._ok = true;
@@ -263,12 +730,23 @@ export class XDBObject extends XObject {
   async findById(objId: string, noIgnore?: boolean) {
     const res = new XResponse();
     try {
-      const dbOut = await this._model.findOne({ _id: objId }).exec();
+      const dbOut =
+        await this.findOneRaw(
+          {
+            _id:
+              objId
+          },
+          {
+            _no_ignore:
+              noIgnore
+          }
+        );
+
       if (dbOut != null) {
-        res._result = this.toXData(dbOut, noIgnore);
+        res._result = dbOut;
         res._ok = true;
       } else {
-        res._result = `${this._model.name} Entity Not Found`;
+        res._result = `${this.getModel().name} Entity Not Found`;
       }
     } catch (e: any) {
       res._result = e?.message ?? e;
@@ -283,17 +761,17 @@ export class XDBObject extends XObject {
   async update(filter: any, updates: any, noIgnore?: boolean, opts?: { upsert?: boolean }) {
     const res = new XResponse();
     try {
-      const fout = await this.fixFields(filter ?? {});
-      const uout = await this.fixFields(updates ?? {}, true);
-
-      const modelResult = await this._model
-        .findOneAndUpdate(fout, uout, {
-          new: true,
-          upsert: opts?.upsert ?? false,
-        })
-        .exec();
-
-      res._result = modelResult ? this.toXData(modelResult, noIgnore) : null;
+      res._result =
+        await this.updateOneRaw(
+          filter,
+          updates,
+          {
+            _upsert:
+              opts?.upsert,
+            _no_ignore:
+              noIgnore
+          }
+        );
       res._ok = true;
     } catch (e: any) {
       _xlog.error("XDBObject.update() error:", e);
@@ -305,8 +783,15 @@ export class XDBObject extends XObject {
   async delete(filter: any) {
     const res = XResponse.create();
     try {
-      const fout = await this.fixFields(filter ?? {});
-      res._result = await this._model.deleteMany(fout).exec();
+      const result =
+        await this.deleteManyRaw(filter);
+
+      res._result = {
+        acknowledged:
+          true,
+        deletedCount:
+          result._deleted
+      };
       res._ok = true;
     } catch (e: any) {
       res._result = e?.message ?? e;

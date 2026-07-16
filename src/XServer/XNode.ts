@@ -17,6 +17,7 @@ import {
     XDB, XDBStorageFS, XDBStorageSqlite, type IXDBStorage
 } from "../XDB/index.js";
 import { XAuthModule } from "../XAuth/index.js";
+import { MongoConnections } from "../XEntityManager/MongoConnectionManager.js";
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
 import { XVibeModule } from "../XVIBE/XVibeModule.js";
@@ -190,7 +191,8 @@ export class XNode {
     /**
      * Stop the server if it is running.
      */
-    stop() {
+    async stop() {
+        await MongoConnections.disconnectAll();
         // this.server?.close();
         // this.server = undefined;
     }

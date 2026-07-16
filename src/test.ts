@@ -2,11 +2,16 @@ import assert from "assert";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
+import mongoose from "mongoose";
 import { _x, _xd, _xlog, XDataModule, XModule, XObject, XpellEngine } from "@xpell/core";
 import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
 import { XAuthModule } from "./XAuth/index.js";
 import { XDB, XDBStorageFS } from "./XDB/index.js";
+import XDBObject from "./XDB/XDBObject.js";
 import { XEntityManager } from "./XEntityManager/XEntityManager.js";
+import { XDBEntityProvider } from "./XEntityManager/XDBEntityProvider.js";
+import { MongoConnectionManager, MongoConnections } from "./XEntityManager/MongoConnectionManager.js";
 import FlowManagerModule from "./XFM/FlowManagerModule.js";
 import { _xem } from "./XEM/XEventManager.js";
 import { XStudioModule } from "./XStudio/XStudioModule.js";
@@ -117,6 +122,1902 @@ function test_entity_manager_server_command(command: any): any {
   if (command?._module !== "xvm" || command?._op !== "call-server") return undefined;
   const server_command = command?._params?._cmd;
   return server_command?._module === "entity-manager" ? server_command : undefined;
+}
+
+function quote_sqlite_identifier_for_test(identifier: string): string {
+  return `"${String(identifier).replace(/"/g, "\"\"")}"`;
+}
+
+function create_fake_xdbobject_connection_for_test(opts?: {
+  _fail_model_creation?: boolean;
+}) {
+  const models: Record<string, any> = {};
+  const stores: Record<string, any[]> = {};
+  let id_counter = 0;
+
+  const matches_filter = (record: any, filter: any) =>
+    Object.keys(filter ?? {}).every((key) =>
+      record?.[key] === filter[key]
+    );
+
+  const clone_record = (record: any) =>
+    JSON.parse(JSON.stringify(record));
+
+  const create_query = (records: any[]) => {
+    let out =
+      records.map(clone_record);
+
+    const query: any = {
+      sort(sort_input: any) {
+        const entries =
+          Object.entries(sort_input ?? {});
+        if (entries.length > 0) {
+          const [field, raw_order] =
+            entries[0];
+          const direction =
+            raw_order === -1 || raw_order === "desc"
+              ? -1
+              : 1;
+          out = [...out].sort((a, b) =>
+            String(a[field] ?? "").localeCompare(String(b[field] ?? "")) * direction
+          );
+        }
+        return query;
+      },
+      skip(skip: number) {
+        out = out.slice(skip);
+        return query;
+      },
+      limit(limit: number) {
+        out = out.slice(0, limit);
+        return query;
+      },
+      async exec() {
+        return out.map(clone_record);
+      },
+    };
+
+    return query;
+  };
+
+  const create_model = (
+    model_name: string,
+    schema: any,
+    collection_name?: string,
+  ) => {
+    const collection =
+      collection_name ?? model_name;
+    stores[collection] =
+      stores[collection] ?? [];
+    const records =
+      stores[collection];
+
+    const FakeModel: any = function fake_model_constructor(this: any) {};
+    Object.defineProperty(FakeModel, "name", {
+      value:
+        model_name,
+    });
+    FakeModel.schema =
+      schema;
+    FakeModel.collection = {
+      name:
+        collection,
+    };
+
+    FakeModel.prototype.save = async function save_fake_model(this: any) {
+      const now =
+        new Date().toISOString();
+      const record = {
+        ...this,
+        _id:
+          this._id ?? `mongo-${++id_counter}`,
+        __v:
+          0,
+        createdAt:
+          now,
+        updatedAt:
+          now,
+      };
+      records.push(record);
+      return clone_record(record);
+    };
+
+    FakeModel.find = (filter: any) =>
+      create_query(
+        records.filter((record) =>
+          matches_filter(record, filter)
+        )
+      );
+
+    FakeModel.findOne = (filter: any) => ({
+      async exec() {
+        const record =
+          records.find((row) =>
+            matches_filter(row, filter)
+          );
+        return record
+          ? clone_record(record)
+          : null;
+      },
+    });
+
+    FakeModel.countDocuments = (filter: any) => ({
+      async exec() {
+        return records.filter((record) =>
+          matches_filter(record, filter)
+        ).length;
+      },
+    });
+
+    FakeModel.findOneAndUpdate = (filter: any, updates: any) => ({
+      async exec() {
+        const record =
+          records.find((row) =>
+            matches_filter(row, filter)
+          );
+        if (!record) {
+          return null;
+        }
+        Object.assign(record, updates, {
+          updatedAt:
+            new Date().toISOString(),
+        });
+        return clone_record(record);
+      },
+    });
+
+    FakeModel.updateMany = (filter: any, updates: any) => ({
+      async exec() {
+        let matched =
+          0;
+        let modified =
+          0;
+        for (const record of records) {
+          if (!matches_filter(record, filter)) {
+            continue;
+          }
+          matched += 1;
+          Object.assign(record, updates, {
+            updatedAt:
+              new Date().toISOString(),
+          });
+          modified += 1;
+        }
+        return {
+          matchedCount:
+            matched,
+          modifiedCount:
+            modified,
+        };
+      },
+    });
+
+    FakeModel.deleteMany = (filter: any) => ({
+      async exec() {
+        const before =
+          records.length;
+        for (let index = records.length - 1; index >= 0; index -= 1) {
+          if (matches_filter(records[index], filter)) {
+            records.splice(index, 1);
+          }
+        }
+        return {
+          deletedCount:
+            before - records.length,
+        };
+      },
+    });
+
+    FakeModel.distinct = (field: string, filter: any) => ({
+      async exec() {
+        return Array.from(
+          new Set(
+            records
+              .filter((record) =>
+                matches_filter(record, filter)
+              )
+              .map((record) =>
+                record[field]
+              )
+              .filter((value) =>
+                value !== undefined
+              )
+          )
+        );
+      },
+    });
+
+    return FakeModel;
+  };
+
+  return {
+    models,
+    stores,
+    model(model_name: string, schema: any, collection_name?: string) {
+      if (opts?._fail_model_creation) {
+        throw new Error("fake model creation failed");
+      }
+      const model =
+        create_model(
+          model_name,
+          schema,
+          collection_name
+        );
+      models[model_name] =
+        model;
+      return model;
+    },
+  };
+}
+
+async function run_xdbobject_raw_provider_readiness_tests() {
+  const connection =
+    create_fake_xdbobject_connection_for_test();
+
+  const xdb_object =
+    new XDBObject({
+      _name:
+        "xdbobject_raw_users",
+      _schema: {
+        username:
+          String,
+        role:
+          String,
+        password: {
+          type:
+            String,
+          _xhash:
+            true,
+        },
+      },
+      _mongoose_connection:
+        connection as any,
+      _model_name:
+        "XDBObjectRawUsersModel",
+      _collection_name:
+        "xdbobject_raw_users_collection",
+    } as any);
+
+  assert.equal(
+    (xdb_object as any)._model.collection.name,
+    "xdbobject_raw_users_collection",
+  );
+
+  const add_input = {
+    _id:
+      "public-id",
+    username:
+      "tamir",
+    role:
+      "admin",
+    password:
+      "secret",
+  };
+  const add_raw_res =
+    await (xdb_object as any).addRaw(add_input, {
+      _no_ignore:
+        true,
+    });
+  assert.equal(add_input._id, "public-id");
+  assert.equal(add_input.password, "secret");
+  assert.equal(add_raw_res._id, "public-id");
+  assert.equal(add_raw_res._username, "tamir");
+  assert.equal(add_raw_res.__v, undefined);
+  assert.equal(add_raw_res._created_at !== undefined, true);
+  assert.equal(add_raw_res._updated_at !== undefined, true);
+  assert.equal(
+    await (xdb_object as any).compareHashField(add_raw_res._password, "secret"),
+    true,
+  );
+
+  const legacy_add_input = {
+    _id:
+      "legacy-id",
+    username:
+      "lee",
+    role:
+      "member",
+  };
+  const legacy_add_res =
+    await (xdb_object as any).add(legacy_add_input);
+  assert.equal(legacy_add_res._ok, true);
+  assert.equal(legacy_add_input._id, "legacy-id");
+  assert.notEqual(legacy_add_res._result._id, "legacy-id");
+
+  const search_array_res =
+    await (xdb_object as any).searchArray({});
+  assert.equal(search_array_res._ok, true);
+  assert.equal(Array.isArray(search_array_res._result), true);
+
+  const search_single_res =
+    await (xdb_object as any).search({
+      username:
+        "tamir",
+  });
+  assert.equal(search_single_res._ok, true);
+  assert.equal(Array.isArray(search_single_res._result), false);
+  assert.equal(search_single_res._result._username, "tamir");
+
+  const find_raw_all =
+    await (xdb_object as any).findRaw({});
+  assert.equal(Array.isArray(find_raw_all), true);
+  assert.equal(find_raw_all.length, 2);
+
+  const find_one_raw =
+    await (xdb_object as any).findOneRaw({
+      username:
+        "missing",
+    });
+  assert.equal(find_one_raw, null);
+
+  assert.equal(
+    await (xdb_object as any).countRaw({}),
+    2,
+  );
+
+  const update_one_res =
+    await (xdb_object as any).update({
+      username:
+        "tamir",
+    }, {
+      role:
+        "owner",
+  });
+  assert.equal(update_one_res._ok, true);
+  assert.equal(update_one_res._result._role, "owner");
+
+  await (xdb_object as any).addRaw({
+    _id:
+      "second-member",
+    username:
+      "mira",
+    role:
+      "member",
+  });
+
+  const update_many_res =
+    await (xdb_object as any).updateManyRaw({
+      role:
+        "member",
+    }, {
+      role:
+        "editor",
+    });
+  assert.deepEqual(update_many_res, {
+    _matched:
+      2,
+    _modified:
+      2,
+  });
+
+  const distinct_raw_res =
+    await (xdb_object as any).distinctRaw("role", {});
+  assert.equal(Array.isArray(distinct_raw_res), true);
+  assert.deepEqual(
+    distinct_raw_res.sort(),
+    ["editor", "owner"],
+  );
+
+  const distinct_res =
+    await (xdb_object as any).distinct("role", {
+      username:
+        "tamir",
+    });
+  assert.equal(distinct_res._ok, true);
+  assert.equal(distinct_res._result, "owner");
+
+  const find_by_id_res =
+    await (xdb_object as any).findById("public-id");
+  assert.equal(find_by_id_res._ok, true);
+  assert.equal(find_by_id_res._result._id, "public-id");
+
+  const delete_many_res =
+    await (xdb_object as any).deleteManyRaw({
+      role:
+        "editor",
+    });
+  assert.deepEqual(delete_many_res, {
+    _deleted:
+      2,
+  });
+
+  const public_delete_res =
+    await (xdb_object as any).delete({
+      role:
+        "owner",
+    });
+  assert.equal(public_delete_res._ok, true);
+  assert.deepEqual(public_delete_res._result, {
+    acknowledged:
+      true,
+    deletedCount:
+      1,
+  });
+
+  const collection_a =
+    new XDBObject({
+      _name:
+        "xdbobject_physical_a",
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        connection as any,
+      _model_name:
+        "XDBObjectPhysicalA",
+      _collection_name:
+        "physical_a",
+    } as any);
+  const collection_b =
+    new XDBObject({
+      _name:
+        "xdbobject_physical_b",
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        connection as any,
+      _model_name:
+        "XDBObjectPhysicalB",
+      _collection_name:
+        "physical_b",
+    } as any);
+  await (collection_a as any).addRaw({
+    _id:
+      "a",
+    username:
+      "same",
+  });
+  await (collection_b as any).addRaw({
+    _id:
+      "b",
+    username:
+      "same",
+  });
+  assert.equal(
+    await (collection_a as any).countRaw({}),
+    1,
+  );
+  assert.equal(
+    await (collection_b as any).countRaw({}),
+    1,
+  );
+
+  new XDBObject({
+    _name:
+      "xdbobject_collision",
+    _schema: {
+      username:
+        String,
+    },
+    _mongoose_connection:
+      connection as any,
+    _model_name:
+      "XDBObjectCollision",
+    _collection_name:
+      "collision_a",
+  } as any);
+  assert.throws(() =>
+    new XDBObject({
+      _name:
+        "xdbobject_collision",
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        connection as any,
+      _model_name:
+        "XDBObjectCollision",
+      _collection_name:
+        "collision_b",
+    } as any)
+  );
+
+  assert.throws(() =>
+    new XDBObject({
+      _name:
+        "xdbobject_model_failure",
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        create_fake_xdbobject_connection_for_test({
+          _fail_model_creation:
+            true,
+        }) as any,
+      _model_name:
+        "XDBObjectModelFailure",
+      _collection_name:
+        "failure",
+    } as any),
+    /fake model creation failed/,
+  );
+
+  const raw_failure =
+    new XDBObject({
+      _name:
+        "xdbobject_raw_failure",
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        connection as any,
+      _model_name:
+        "XDBObjectRawFailure",
+      _collection_name:
+        "raw_failure",
+    } as any);
+  (raw_failure as any)._model.find = () => ({
+    async exec() {
+      throw new Error("raw find failed");
+    },
+  });
+  await assert.rejects(
+    () => (raw_failure as any).findRaw({}),
+    /raw find failed/,
+  );
+
+  const legacy_global =
+    new XDBObject({
+      _name:
+        `xdbobject_legacy_global_${Date.now()}`,
+      _schema: {
+        username:
+          String,
+      },
+    } as any);
+  assert.equal(!!(legacy_global as any)._model, true);
+}
+
+await run_xdbobject_raw_provider_readiness_tests();
+
+function create_fake_mongo_connection_for_manager_test(opts?: {
+  _fail_as_promise?: boolean;
+}) {
+  const listeners: Record<string, Array<(value?: any) => void>> = {};
+  let closed =
+    false;
+  let as_promise_calls =
+    0;
+
+  return {
+    on(event_name: string, listener: (value?: any) => void) {
+      listeners[event_name] =
+        listeners[event_name] ?? [];
+      listeners[event_name].push(listener);
+      return this;
+    },
+    emit(event_name: string, value?: any) {
+      for (const listener of listeners[event_name] ?? []) {
+        listener(value);
+      }
+    },
+    async asPromise() {
+      as_promise_calls += 1;
+      if (opts?._fail_as_promise) {
+        throw new Error("fake mongo connect failed");
+      }
+      return this;
+    },
+    async close() {
+      closed = true;
+      this.emit("disconnected");
+    },
+    _debug() {
+      return {
+        _closed:
+          closed,
+        _as_promise_calls:
+          as_promise_calls,
+      };
+    },
+  };
+}
+
+async function run_mongo_connection_manager_tests() {
+  const previous_default_uri =
+    process.env.XPELL_MONGO_URI;
+  const previous_analytics_uri =
+    process.env.XPELL_MONGO_ANALYTICS_URI;
+  const previous_missing_uri =
+    process.env.XPELL_MONGO_MISSING_URI;
+
+  try {
+    process.env.XPELL_MONGO_URI =
+      "mongodb://default.example/xpell";
+    process.env.XPELL_MONGO_ANALYTICS_URI =
+      "mongodb://analytics.example/xpell";
+    delete process.env.XPELL_MONGO_MISSING_URI;
+
+    const created: Array<{
+      _uri: string;
+      _options: Record<string, any>;
+      _connection: any;
+    }> = [];
+
+    const manager =
+      new MongoConnectionManager({
+        _create_connection: (uri, options) => {
+          const connection =
+            create_fake_mongo_connection_for_manager_test();
+          created.push({
+            _uri:
+              uri,
+            _options:
+              options,
+            _connection:
+              connection,
+          });
+          return connection as any;
+        },
+      });
+
+    assert.equal(manager.getConnection("default"), undefined);
+    assert.equal(manager.getConnectionState("default"), "idle");
+
+    const default_connection =
+      await manager.connect("default");
+    const default_connection_again =
+      await manager.connect();
+    assert.equal(default_connection_again, default_connection);
+    assert.equal(created.length, 1);
+    assert.equal(created[0]._uri, "mongodb://default.example/xpell");
+    assert.equal(manager.getConnection("default"), default_connection);
+    assert.equal(manager.getConnectionState("default"), "connected");
+
+    const analytics_connection =
+      await manager.connect("analytics");
+    assert.notEqual(analytics_connection, default_connection);
+    assert.equal(created.length, 2);
+    assert.equal(created[1]._uri, "mongodb://analytics.example/xpell");
+
+    await manager.disconnectAll();
+    assert.equal(manager.getConnection("default"), undefined);
+    assert.equal(manager.getConnection("analytics"), undefined);
+    assert.equal(created[0]._connection._debug()._closed, true);
+    assert.equal(created[1]._connection._debug()._closed, true);
+
+    const reconnect_connection =
+      await manager.connect("default");
+    assert.notEqual(reconnect_connection, default_connection);
+    assert.equal(created.length, 3);
+    assert.equal(await manager.disconnect("default"), true);
+    assert.equal(await manager.disconnect("default"), false);
+
+    await assert.rejects(
+      () => manager.connect("missing"),
+      (err: any) =>
+        err?._code === "E_MONGO_CONNECTION_MISSING_URI" ||
+        err?.code === "E_MONGO_CONNECTION_MISSING_URI",
+    );
+
+    const failing_manager =
+      new MongoConnectionManager({
+        _create_connection: () =>
+          create_fake_mongo_connection_for_manager_test({
+            _fail_as_promise:
+              true,
+          }) as any,
+      });
+
+    await assert.rejects(
+      () => failing_manager.connect("default"),
+      (err: any) =>
+        err?._code === "E_MONGO_CONNECTION_FAILED" ||
+        err?.code === "E_MONGO_CONNECTION_FAILED",
+    );
+    assert.equal(failing_manager.getConnection("default"), undefined);
+    assert.equal(failing_manager.getConnectionState("default"), "idle");
+
+    await failing_manager.disconnectAll();
+  } finally {
+    if (previous_default_uri === undefined) {
+      delete process.env.XPELL_MONGO_URI;
+    } else {
+      process.env.XPELL_MONGO_URI =
+        previous_default_uri;
+    }
+
+    if (previous_analytics_uri === undefined) {
+      delete process.env.XPELL_MONGO_ANALYTICS_URI;
+    } else {
+      process.env.XPELL_MONGO_ANALYTICS_URI =
+        previous_analytics_uri;
+    }
+
+    if (previous_missing_uri === undefined) {
+      delete process.env.XPELL_MONGO_MISSING_URI;
+    } else {
+      process.env.XPELL_MONGO_MISSING_URI =
+        previous_missing_uri;
+    }
+  }
+}
+
+await run_mongo_connection_manager_tests();
+
+async function run_mongo_entity_provider_tests() {
+  const previous_default_uri =
+    process.env.XPELL_MONGO_URI;
+
+  const fake_connection =
+    create_fake_xdbobject_connection_for_test();
+
+  try {
+    process.env.XPELL_MONGO_URI =
+      "mongodb://provider.test/xpell";
+    await MongoConnections._resetForTest();
+    MongoConnections._setConnectionFactoryForTest(() =>
+      fake_connection as any
+    );
+
+    const manager =
+      new XEntityManager();
+
+    const users_entity = {
+      _id:
+        "users",
+      _storage: {
+        _provider:
+          "mongo",
+        _scope:
+          "app",
+      },
+      _schema: {
+        username: {
+          _type:
+            "String",
+          _required:
+            true,
+          _index: {
+            _unique:
+              true,
+          },
+        },
+        role: {
+          _type:
+            "String",
+          _index:
+            true,
+        },
+        login_count: {
+          _type:
+            "Number",
+        },
+      },
+    };
+
+    const register_a_res =
+      await (manager as any)._register({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            users_entity,
+        },
+      });
+    assert.equal(register_a_res._ok, true);
+
+    const register_b_res =
+      await (manager as any)._register({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            users_entity,
+        },
+      });
+    assert.equal(register_b_res._ok, true);
+
+    const diagnostic_a_res =
+      await (manager as any)._storage_diagnostics({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+        },
+    });
+    assert.equal(diagnostic_a_res._ok, true);
+    assert.equal(diagnostic_a_res._result._diagnostic._storage_provider, "mongo");
+    assert.equal(diagnostic_a_res._result._diagnostic._entity, "users");
+    assert.equal(
+      diagnostic_a_res._result._diagnostic._physical_entity_name.includes("mongo-app-a"),
+      false,
+    );
+
+    const add_a_res =
+      await (manager as any)._add({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _data: {
+            username:
+              "tamir",
+            role:
+              "owner",
+            login_count:
+              1,
+          },
+        },
+      });
+    assert.equal(add_a_res._ok, true);
+    assert.equal(typeof add_a_res._result._record._id, "string");
+    assert.equal(add_a_res._result._record.username, "tamir");
+    assert.equal(add_a_res._result._record.role, "owner");
+    assert.equal(add_a_res._result._record._created_at !== undefined, true);
+    assert.equal(add_a_res._result._record.__v, undefined);
+    assert.equal(add_a_res._result._record._doc, undefined);
+
+    const add_b_res =
+      await (manager as any)._add({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _data: {
+            username:
+              "tamir",
+            role:
+              "viewer",
+            login_count:
+              2,
+          },
+        },
+      });
+    assert.equal(add_b_res._ok, true);
+    assert.notEqual(
+      add_b_res._result._record._id,
+      add_a_res._result._record._id,
+    );
+
+    const get_a_res =
+      await (manager as any)._get({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _id:
+            add_a_res._result._record._id,
+        },
+      });
+    assert.equal(get_a_res._ok, true);
+    assert.equal(get_a_res._result._record.username, "tamir");
+    assert.equal(get_a_res._result._record.role, "owner");
+
+    const find_a_res =
+      await (manager as any)._find({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            username:
+              "tamir",
+          },
+        },
+      });
+    assert.equal(find_a_res._ok, true);
+    assert.equal(find_a_res._result._records._data.length, 1);
+    assert.equal(find_a_res._result._records._data[0].role, "owner");
+    assert.equal(
+      find_a_res._result._records._data[0]._physical_entity_name,
+      undefined,
+    );
+
+    const find_b_res =
+      await (manager as any)._find({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            username:
+              "tamir",
+          },
+        },
+      });
+    assert.equal(find_b_res._ok, true);
+    assert.equal(find_b_res._result._records._data.length, 1);
+    assert.equal(find_b_res._result._records._data[0].role, "viewer");
+
+    const update_a_res =
+      await (manager as any)._update({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            username:
+              "tamir",
+          },
+          _updates: {
+            role:
+              "admin",
+          },
+        },
+      });
+    assert.equal(update_a_res._ok, true);
+    assert.equal(update_a_res._result._matched, 1);
+    assert.equal(update_a_res._result._modified, 1);
+
+    const count_a_after_update =
+      await (manager as any).getStoredEntity({
+        _app_id:
+          "mongo-app-a",
+        _env:
+          "test",
+        _entity:
+          "users",
+      })._provider.count({
+        role:
+          "admin",
+      });
+    assert.equal(count_a_after_update, 1);
+
+    const delete_a_res =
+      await (manager as any)._delete({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            username:
+              "tamir",
+          },
+        },
+      });
+    assert.equal(delete_a_res._ok, true);
+    assert.equal(delete_a_res._result._deleted, 1);
+
+    const find_a_after_delete =
+      await (manager as any)._find({
+        _params: {
+          _app_id:
+            "mongo-app-a",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {},
+        },
+      });
+    assert.equal(find_a_after_delete._ok, true);
+    assert.equal(find_a_after_delete._result._records._data.length, 0);
+
+    const restart_manager =
+      new XEntityManager();
+    const restart_register_b_res =
+      await (restart_manager as any)._register({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            users_entity,
+        },
+      });
+    assert.equal(restart_register_b_res._ok, true);
+
+    const restart_find_b_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            username:
+              "tamir",
+          },
+        },
+      });
+    assert.equal(restart_find_b_res._ok, true);
+    assert.equal(restart_find_b_res._result._records._data.length, 1);
+    assert.equal(restart_find_b_res._result._records._data[0].role, "viewer");
+
+    const unsupported_raw_query_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            "mongo-app-b",
+          _env:
+            "test",
+          _entity:
+            "users",
+          _filter: {
+            $where:
+              "this.username === 'tamir'",
+          },
+        },
+      });
+    assert.equal(unsupported_raw_query_res._ok, false);
+  } finally {
+    await MongoConnections._resetForTest();
+    MongoConnections._resetConnectionFactoryForTest();
+
+    if (previous_default_uri === undefined) {
+      delete process.env.XPELL_MONGO_URI;
+    } else {
+      process.env.XPELL_MONGO_URI =
+        previous_default_uri;
+    }
+  }
+}
+
+await run_mongo_entity_provider_tests();
+
+async function maybe_run_real_mongo_entity_provider_integration_tests() {
+  try {
+    MongoConnections.resolveConnectionConfig("default");
+  } catch {
+    console.log("MongoEntityProvider real Mongo integration skipped: no default Mongo connection configured");
+    return;
+  }
+
+  try {
+    await MongoConnections._resetForTest();
+    await MongoConnections.connect("default");
+  } catch (err: any) {
+    console.log(`MongoEntityProvider real Mongo integration skipped: ${err?._message ?? err?.message ?? err}`);
+    await MongoConnections._resetForTest();
+    return;
+  }
+
+  const run_id =
+    `mongo-real-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+  const entity_id =
+    `${run_id}-users`;
+  const parity_entity_id =
+    `${run_id}-parity`;
+  const env =
+    "integration";
+  const app_a =
+    `${run_id}-app-a`;
+  const app_b =
+    `${run_id}-app-b`;
+  const collection_names =
+    new Set<string>();
+
+  const manager =
+    new XEntityManager();
+
+  const mongo_call = async (
+    op: string,
+    params: Record<string, any>,
+  ) =>
+    await (manager as any)[`_${op}`]({
+      _params:
+        params,
+    });
+
+  const stored_provider = (
+    owner: any,
+    app_id: string,
+    entity: string,
+  ) =>
+    (owner as any).getStoredEntity({
+      _app_id:
+        app_id,
+      _env:
+        env,
+      _entity:
+        entity,
+    })._provider;
+
+  const track_collection = (provider: any) => {
+    const handle =
+      provider.getRuntimeEntityHandle();
+    const collection_name =
+      handle?._model?.collection?.name;
+    if (collection_name) {
+      collection_names.add(collection_name);
+    }
+    return handle;
+  };
+
+  try {
+    const users_entity = {
+      _id:
+        entity_id,
+      _storage: {
+        _provider:
+          "mongo",
+        _scope:
+          "app",
+      },
+      _schema: {
+        username: {
+          _type:
+            "String",
+          _required:
+            true,
+          _index: {
+            _unique:
+              true,
+          },
+        },
+        status: {
+          _type:
+            "String",
+          _default:
+            "active",
+          _index:
+            true,
+        },
+        age: {
+          _type:
+            "Number",
+          _index:
+            true,
+        },
+        password: {
+          _type:
+            "Hash",
+          _required:
+            true,
+        },
+        manager_id: {
+          _type:
+            "ObjectId",
+          _index:
+            true,
+        },
+        tags: {
+          _type:
+            "Array",
+        },
+      },
+    };
+
+    for (const app_id of [app_a, app_b]) {
+      const register_res =
+        await mongo_call("register", {
+          _app_id:
+            app_id,
+          _env:
+            env,
+          _entity:
+            users_entity,
+        });
+      assert.equal(register_res._ok, true);
+      await track_collection(
+        stored_provider(manager, app_id, entity_id)
+      ).rebuildIndexes();
+    }
+
+    const handle_a =
+      track_collection(
+        stored_provider(manager, app_a, entity_id)
+      );
+    const handle_b =
+      track_collection(
+        stored_provider(manager, app_b, entity_id)
+      );
+
+    assert.notEqual(
+      handle_a._model.collection.name,
+      handle_b._model.collection.name,
+    );
+    assert.notEqual(
+      handle_a._model.modelName,
+      handle_b._model.modelName,
+    );
+    assert.equal(
+      handle_a._model.db,
+      handle_b._model.db,
+    );
+
+    const indexes_a =
+      await handle_a.listIndexes();
+    const index_names_a =
+      indexes_a.map((index: any) => index.name);
+    assert.equal(index_names_a.some((name: string) => name.includes("username")), true);
+    assert.equal(index_names_a.some((name: string) => name.includes("status")), true);
+
+    const missing_required_res =
+      await mongo_call("add", {
+        _app_id:
+          app_a,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _data: {
+          password:
+            "secret",
+        },
+      });
+    assert.equal(missing_required_res._ok, false);
+    assert.equal(missing_required_res._error._code, "E_ENTITY_MONGO_VALIDATION");
+
+    const parent_res =
+      await mongo_call("add", {
+        _app_id:
+          app_a,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _data: {
+          username:
+            "parent",
+          age:
+            41,
+          password:
+            "parent-secret",
+          tags:
+            ["root"],
+        },
+      });
+    assert.equal(parent_res._ok, true);
+    const parent =
+      parent_res._result._record;
+    assert.equal(typeof parent._id, "string");
+    assert.equal(parent._id.length > 0, true);
+    assert.equal(parent.status, "active");
+    assert.equal(parent.username, "parent");
+    assert.equal(parent._id._bsontype, undefined);
+    assert.equal(parent.__v, undefined);
+    assert.notEqual(parent.password, "parent-secret");
+
+    const child_res =
+      await mongo_call("add", {
+        _app_id:
+          app_a,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _data: {
+          username:
+            "child",
+          age:
+            12,
+          password:
+            "child-secret",
+          manager_id:
+            parent._id,
+          tags:
+            ["child"],
+        },
+      });
+    assert.equal(child_res._ok, true);
+
+    const duplicate_res =
+      await mongo_call("add", {
+        _app_id:
+          app_a,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _data: {
+          username:
+            "child",
+          password:
+            "other-secret",
+        },
+      });
+    assert.equal(duplicate_res._ok, false);
+    assert.equal(duplicate_res._error._code, "E_ENTITY_MONGO_CONSTRAINT");
+
+    const app_b_same_username_res =
+      await mongo_call("add", {
+        _app_id:
+          app_b,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _data: {
+          username:
+            "child",
+          age:
+            99,
+          password:
+            "app-b-secret",
+        },
+      });
+    assert.equal(app_b_same_username_res._ok, true);
+
+    const relationship_res =
+      await mongo_call("find", {
+        _app_id:
+          app_a,
+        _env:
+          env,
+        _entity:
+          entity_id,
+        _filter: {
+          manager_id:
+            parent._id,
+        },
+      });
+    assert.equal(relationship_res._ok, true);
+    assert.equal(relationship_res._result._records._data.length, 1);
+    assert.equal(relationship_res._result._records._data[0].username, "child");
+
+    const restart_manager =
+      new XEntityManager();
+    const restart_register_res =
+      await (restart_manager as any)._register({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            users_entity,
+        },
+      });
+    assert.equal(restart_register_res._ok, true);
+    const restart_provider =
+      stored_provider(restart_manager, app_a, entity_id);
+    track_collection(restart_provider);
+    const restart_get_res =
+      await (restart_manager as any)._get({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _id:
+            parent._id,
+        },
+      });
+    assert.equal(restart_get_res._ok, true);
+    assert.equal(restart_get_res._result._record._id, parent._id);
+    assert.equal(restart_get_res._result._record.username, "parent");
+    assert.equal(restart_get_res._result._record._id._bsontype, undefined);
+
+    const hash_ok_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {
+            username:
+              "parent",
+          },
+          _hash_filter: {
+            password:
+              "parent-secret",
+          },
+        },
+      });
+    assert.equal(hash_ok_res._ok, true);
+    assert.equal(hash_ok_res._result._records._data.length, 1);
+
+    const hash_wrong_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {
+            username:
+              "parent",
+          },
+          _hash_filter: {
+            password:
+              "wrong-secret",
+          },
+        },
+      });
+    assert.equal(hash_wrong_res._ok, true);
+    assert.equal(hash_wrong_res._result._records._data.length, 0);
+
+    for (let index = 0; index < 26; index += 1) {
+      const bulk_res =
+        await (restart_manager as any)._add({
+          _params: {
+            _app_id:
+              app_a,
+            _env:
+              env,
+            _entity:
+              entity_id,
+            _data: {
+              username:
+                `bulk-${index}`,
+              age:
+                100 + index,
+              password:
+                "bulk-secret",
+            },
+          },
+        });
+      assert.equal(bulk_res._ok, true);
+    }
+
+    const unbounded_hash_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {},
+          _hash_filter: {
+            password:
+              "bulk-secret",
+          },
+        },
+      });
+    assert.equal(unbounded_hash_res._ok, false);
+    assert.equal(unbounded_hash_res._error._code, "E_ENTITY_MONGO_HASH_FILTER_UNBOUNDED");
+
+    const unsupported_query_res =
+      await (restart_manager as any)._find({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {
+            username: {
+              _contains:
+                "par",
+            },
+          },
+        },
+      });
+    assert.equal(unsupported_query_res._ok, false);
+    assert.equal(unsupported_query_res._error._code, "E_ENTITY_MONGO_QUERY_UNSUPPORTED");
+
+    const invalid_schema_res =
+      await (restart_manager as any)._register({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity: {
+            _id:
+              `${run_id}-invalid-schema`,
+            _storage: {
+              _provider:
+                "mongo",
+              _scope:
+                "app",
+            },
+            _schema: {
+              embedding: {
+                _type:
+                  "Vector",
+              },
+            },
+          },
+        },
+      });
+    assert.equal(invalid_schema_res._ok, false);
+    assert.equal(invalid_schema_res._error._code, "E_ENTITY_MONGO_SCHEMA_UNSUPPORTED");
+
+    const app_a_count =
+      await restart_provider.count({});
+    const app_b_count =
+      await stored_provider(manager, app_b, entity_id).count({});
+    assert.equal(app_a_count, 28);
+    assert.equal(app_b_count, 1);
+
+    const parity_schema = {
+      name: {
+        _type:
+          "String",
+        _index:
+          true,
+      },
+      score: {
+        _type:
+          "Number",
+        _index:
+          true,
+      },
+      group: {
+        _type:
+          "String",
+        _index:
+          true,
+      },
+    };
+    const parity_mongo_entity = {
+      _id:
+        parity_entity_id,
+      _storage: {
+        _provider:
+          "mongo",
+        _scope:
+          "app",
+      },
+      _schema:
+        parity_schema,
+    };
+    const parity_xdb_entity = {
+      _id:
+        `${parity_entity_id}-xdb`,
+      _schema:
+        parity_schema,
+    };
+
+    const parity_register_mongo =
+      await (restart_manager as any)._register({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            parity_mongo_entity,
+        },
+      });
+    assert.equal(parity_register_mongo._ok, true);
+    track_collection(
+      stored_provider(restart_manager, app_a, parity_entity_id)
+    );
+
+    const parity_register_xdb =
+      await (restart_manager as any)._register({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            parity_xdb_entity,
+        },
+      });
+    assert.equal(parity_register_xdb._ok, true);
+
+    const parity_records = [
+      {
+        _id:
+          `${run_id}-p1`,
+        name:
+          "alpha",
+        score:
+          10,
+        group:
+          "a",
+      },
+      {
+        _id:
+          `${run_id}-p2`,
+        name:
+          "beta",
+        score:
+          20,
+        group:
+          "b",
+      },
+      {
+        _id:
+          `${run_id}-p3`,
+        name:
+          "gamma",
+        score:
+          30,
+        group:
+          "a",
+      },
+      {
+        _id:
+          `${run_id}-p4`,
+        name:
+          "delta",
+        score:
+          40,
+        group:
+          "b",
+      },
+    ];
+
+    for (const record of parity_records) {
+      const mongo_add =
+        await (restart_manager as any)._add({
+          _params: {
+            _app_id:
+              app_a,
+            _env:
+              env,
+            _entity:
+              parity_entity_id,
+            _data:
+              record,
+          },
+        });
+      const xdb_add =
+        await (restart_manager as any)._add({
+          _params: {
+            _app_id:
+              app_a,
+            _env:
+              env,
+            _entity:
+              `${parity_entity_id}-xdb`,
+            _data:
+              record,
+          },
+        });
+      assert.equal(mongo_add._ok, true);
+      assert.equal(xdb_add._ok, true);
+    }
+
+    const parity_cases = [
+      {
+        _filter: {
+          group:
+            "a",
+        },
+      },
+      {
+        _filter: {
+          score: {
+            _gt:
+              15,
+          },
+        },
+      },
+      {
+        _filter: {
+          name: {
+            _in:
+              ["alpha", "delta"],
+          },
+        },
+      },
+      {
+        _filter: {},
+        _sort: {
+          _sort_by:
+            "score",
+          _sort_order:
+            "asc",
+        },
+        _skip:
+          1,
+        _limit:
+          2,
+      },
+    ];
+
+    for (const parity_case of parity_cases) {
+      const mongo_find =
+        await (restart_manager as any)._find({
+          _params: {
+            _app_id:
+              app_a,
+            _env:
+              env,
+            _entity:
+              parity_entity_id,
+            ...parity_case,
+          },
+        });
+      const xdb_find =
+        await (restart_manager as any)._find({
+          _params: {
+            _app_id:
+              app_a,
+            _env:
+              env,
+            _entity:
+              `${parity_entity_id}-xdb`,
+            ...parity_case,
+          },
+        });
+      assert.equal(mongo_find._ok, true);
+      assert.equal(xdb_find._ok, true);
+      assert.deepEqual(
+        mongo_find._result._records._data.map((record: any) => record._id),
+        xdb_find._result._records._data.map((record: any) => record._id),
+      );
+    }
+
+    assert.equal(
+      await stored_provider(restart_manager, app_a, parity_entity_id).count({
+        score: {
+          _gte:
+            20,
+        },
+      }),
+      await stored_provider(restart_manager, app_a, `${parity_entity_id}-xdb`).count({
+        score: {
+          _gte:
+            20,
+        },
+      }),
+    );
+
+    const update_res =
+      await (restart_manager as any)._update({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {
+            username:
+              "child",
+          },
+          _updates: {
+            status:
+              "disabled",
+          },
+        },
+      });
+    assert.equal(update_res._ok, true);
+    assert.equal(update_res._result._matched, 1);
+
+    const delete_res =
+      await (restart_manager as any)._delete({
+        _params: {
+          _app_id:
+            app_a,
+          _env:
+            env,
+          _entity:
+            entity_id,
+          _filter: {
+            username:
+              "child",
+          },
+        },
+      });
+    assert.equal(delete_res._ok, true);
+    assert.equal(delete_res._result._deleted, 1);
+
+    await restart_provider.dispose();
+    assert.ok(MongoConnections.getConnection("default"));
+
+    const repeated_a =
+      await MongoConnections.connect("default");
+    const repeated_b =
+      await MongoConnections.connect("default");
+    assert.equal(repeated_a, repeated_b);
+
+    await MongoConnections.disconnectAll();
+    assert.equal(MongoConnections.getConnection("default"), undefined);
+
+    const after_shutdown =
+      await MongoConnections.connect("default");
+    assert.ok(after_shutdown);
+
+    const unavailable_uri_before =
+      process.env.XPELL_MONGO_UNAVAILABLE_URI;
+    try {
+      process.env.XPELL_MONGO_UNAVAILABLE_URI =
+        "mongodb://127.0.0.1:1/xpell-unavailable";
+      const unavailable_manager =
+        new MongoConnectionManager({
+          _create_connection: (uri, options) =>
+            mongoose.createConnection(
+              uri,
+              {
+                ...options,
+                serverSelectionTimeoutMS:
+                  50,
+              },
+            ),
+        });
+      await assert.rejects(
+        () => unavailable_manager.connect("unavailable"),
+        (err: any) =>
+          err?._code === "E_MONGO_CONNECTION_FAILED" ||
+          err?.code === "E_MONGO_CONNECTION_FAILED",
+      );
+      await unavailable_manager.disconnectAll();
+    } finally {
+      if (unavailable_uri_before === undefined) {
+        delete process.env.XPELL_MONGO_UNAVAILABLE_URI;
+      } else {
+        process.env.XPELL_MONGO_UNAVAILABLE_URI =
+          unavailable_uri_before;
+      }
+    }
+
+    new XDBObject({
+      _name:
+        `${run_id}-collision`,
+      _schema: {
+        username:
+          String,
+      },
+      _mongoose_connection:
+        after_shutdown,
+      _model_name:
+        `${run_id}_collision_model`,
+      _collection_name:
+        `${run_id}_collision_a`,
+    } as any);
+
+    assert.throws(() =>
+      new XDBObject({
+        _name:
+          `${run_id}-collision`,
+        _schema: {
+          username:
+            String,
+        },
+        _mongoose_connection:
+          after_shutdown,
+        _model_name:
+          `${run_id}_collision_model`,
+        _collection_name:
+          `${run_id}_collision_b`,
+      } as any)
+    );
+  } finally {
+    try {
+      const cleanup_connection =
+        await MongoConnections.connect("default");
+      for (const collection_name of collection_names) {
+        try {
+          await cleanup_connection.db?.collection(collection_name).drop();
+        } catch (err: any) {
+          if (
+            err?.codeName !== "NamespaceNotFound" &&
+            err?.code !== 26
+          ) {
+            throw err;
+          }
+        }
+      }
+    } finally {
+      await MongoConnections._resetForTest();
+    }
+  }
 }
 
 class TestClientXVMModule extends XModule {
@@ -26810,6 +28711,18 @@ const entity_sync_work_folder = await mkdtemp(path.join(tmpdir(), "xvm-entity-sy
 try {
   XDB.init({
     storage: new XDBStorageFS({ xdbFolder: path.join(entity_sync_work_folder, "xdb") }),
+    embedder: {
+      async embedArray(input: string[]) {
+        return {
+          _ok: true,
+          _result: input.map((value, index) => [
+            String(value).length,
+            index + 1,
+            42,
+          ]),
+        } as any;
+      },
+    },
     enableCache: false,
     workFolder: entity_sync_work_folder,
   });
@@ -26819,6 +28732,8 @@ try {
   if (!((_x as any).getModule?.("xd"))) {
     await _x.loadModuleAsync(new XDataModule());
   }
+
+  await maybe_run_real_mongo_entity_provider_integration_tests();
 
   const hash_entity = XDB.create({
     _type: "xdb-entity",
@@ -27005,6 +28920,2587 @@ try {
   assert.equal(persisted_contact_records.length, 1);
   assert.equal(persisted_contact_records[0]._name, "Ada");
 
+  const provider_compat_entity = {
+    _id: "provider-compat-users",
+    _schema: {
+      username: {
+        _type: "String",
+        _required: true,
+        _index: {
+          _unique: true,
+        },
+      },
+      password_hash: {
+        _type: "Hash",
+      },
+      display_name: {
+        _type: "String",
+      },
+      score: {
+        _type: "Number",
+      },
+    },
+  };
+
+  const provider_compat_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: provider_compat_entity,
+    },
+  });
+  assert.equal(provider_compat_register._ok, true);
+  assert.equal(provider_compat_register._result._action, "create");
+
+  const provider_compat_schema = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity_id: "provider-compat-users",
+    },
+  });
+  assert.equal(provider_compat_schema._ok, true);
+  assert.equal(provider_compat_schema._result.entity._schema.username._type, "String");
+
+  const provider_compat_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity_id: "provider-compat-users",
+    },
+  });
+  assert.equal(provider_compat_diagnostic._ok, true);
+  assert.equal(provider_compat_diagnostic._result._diagnostic._provider, "xdb");
+  assert.equal(provider_compat_diagnostic._result._diagnostic._provider_type, "xdb-entity");
+  assert.equal(
+    provider_compat_diagnostic._result._diagnostic._physical_entity_name,
+    "provider-compat-users",
+  );
+  assert.equal(provider_compat_diagnostic._result._diagnostic._storage_scope, "global");
+
+  const provider_compat_list = await _x.execute({
+    _module: "entity-manager",
+    _op: "list",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+    },
+  });
+  assert.equal(provider_compat_list._ok, true);
+  assert.deepEqual(provider_compat_list._result.entities, ["provider-compat-users"]);
+
+  const provider_compat_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _data: {
+        username: "ada",
+        password_hash: "provider-secret",
+        display_name: "Ada",
+        score: 7,
+      },
+    },
+  });
+  assert.equal(provider_compat_add._ok, true);
+  assert.equal(provider_compat_add._result._record.username, "ada");
+  assert.notEqual(provider_compat_add._result._record.password_hash, "provider-secret");
+  assert.equal(provider_compat_add._result._physical_entity_name, undefined);
+
+  const provider_compat_duplicate_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _data: {
+        username: "ada",
+        password_hash: "provider-secret-2",
+        display_name: "Ada Duplicate",
+        score: 11,
+      },
+    },
+  });
+  assert.equal(provider_compat_duplicate_add._ok, false);
+  assert.match(
+    String(provider_compat_duplicate_add._result?.message ?? ""),
+    /duplicate value for unique field/,
+  );
+
+  const provider_compat_get = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _id: provider_compat_add._result._record._id,
+    },
+  });
+  assert.equal(provider_compat_get._ok, true);
+  assert.equal(provider_compat_get._result._record.display_name, "Ada");
+
+  const provider_compat_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _filter: {
+        username: "ada",
+      },
+      _hash_filter: {
+        password_hash: "provider-secret",
+      },
+    },
+  });
+  assert.equal(provider_compat_find._ok, true);
+  assert.equal(provider_compat_find._result._records._data.length, 1);
+  assert.equal(provider_compat_find._result._physical_entity_name, undefined);
+
+  const provider_compat_aggregate = await _x.execute({
+    _module: "entity-manager",
+    _op: "aggregate",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _records: provider_compat_find._result._records._data,
+      _aggregation: {
+        _op: "sum",
+        _field: "score",
+      },
+    },
+  });
+  assert.equal(provider_compat_aggregate._ok, true);
+  assert.equal(provider_compat_aggregate._result._value, 7);
+
+  const provider_capability_probe = new XDBEntityProvider({
+    _definition: {
+      _id: "provider-capability-probe",
+      _schema: {
+        name: {
+          _type: "String",
+        },
+      },
+    },
+    _physical_identity: {
+      _logical_entity_id: "provider-capability-probe",
+      _physical_identity: "provider-capability-probe",
+      _physical_entity_name: "provider-capability-probe",
+      _physical_entity_encoding: "plain",
+      _provider: "xdb",
+      _provider_type: "xdb",
+      _storage_scope: "global",
+      _is_global_storage: true,
+      _is_scoped_storage: false,
+    },
+  });
+  await provider_capability_probe.init();
+  assert.throws(
+    () => provider_capability_probe.assertCapability("transactions"),
+    (err: any) =>
+      err?._code === "E_ENTITY_PROVIDER_CAPABILITY_UNSUPPORTED" &&
+      err?._meta?._capability === "transactions",
+  );
+  const provider_capability_probe_dispose = await provider_capability_probe.dispose();
+  assert.equal(provider_capability_probe_dispose._disposed, true);
+
+  const provider_compat_find_wrong_hash = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _filter: {
+        username: "ada",
+      },
+      _hash_filter: {
+        password_hash: "wrong-secret",
+      },
+    },
+  });
+  assert.equal(provider_compat_find_wrong_hash._ok, true);
+  assert.equal(provider_compat_find_wrong_hash._result._records._data.length, 0);
+
+  const provider_compat_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "update",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _filter: {
+        _id: provider_compat_add._result._record._id,
+      },
+      _updates: {
+        display_name: "Ada Lovelace",
+      },
+    },
+  });
+  assert.equal(provider_compat_update._ok, true);
+  assert.equal(provider_compat_update._result._updated, 1);
+
+  const provider_compat_get_after_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _id: provider_compat_add._result._record._id,
+    },
+  });
+  assert.equal(provider_compat_get_after_update._ok, true);
+  assert.equal(provider_compat_get_after_update._result._record.display_name, "Ada Lovelace");
+
+  const provider_compat_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "delete",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _id: provider_compat_add._result._record._id,
+    },
+  });
+  assert.equal(provider_compat_delete._ok, true);
+  assert.equal(provider_compat_delete._result._deleted, 1);
+
+  const provider_compat_find_after_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity: "provider-compat-users",
+      _filter: {},
+    },
+  });
+  assert.equal(provider_compat_find_after_delete._ok, true);
+  assert.equal(provider_compat_find_after_delete._result._records._data.length, 0);
+
+  const provider_compat_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "entity-provider-compat-app",
+      _env: "test",
+      _entity_id: "provider-compat-users",
+    },
+  });
+  assert.equal(provider_compat_unregister._ok, true);
+  assert.equal(provider_compat_unregister._result._runtime_unregistered, true);
+  assert.equal(provider_compat_unregister._result._xdb_unregistered, true);
+  assert.equal(
+    XDB._engine._xdb_data._entities.includes("provider-compat-users"),
+    false,
+  );
+
+  const memory_provider_entity = {
+    _id: "memory-provider-users",
+    _storage: {
+      _provider: "memory",
+      _scope: "app",
+    },
+    _schema: {
+      username: {
+        _type: "String",
+        _required: true,
+        _index: {
+          _unique: true,
+        },
+      },
+      password_hash: {
+        _type: "Hash",
+      },
+      display_name: {
+        _type: "String",
+        _default: "Anonymous Memory User",
+      },
+      score: {
+        _type: "Number",
+        _default: 0,
+      },
+      tags: {
+        _type: "Array",
+        _index: {
+          _unique: false,
+        },
+      },
+    },
+  };
+
+  const memory_app_a_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: memory_provider_entity,
+    },
+  });
+  const memory_app_b_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity: memory_provider_entity,
+    },
+  });
+  assert.equal(memory_app_a_register._ok, true);
+  assert.equal(memory_app_b_register._ok, true);
+
+  const memory_env_b_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test-b",
+      _entity: memory_provider_entity,
+    },
+  });
+  assert.equal(memory_env_b_register._ok, true);
+
+  const memory_app_a_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  const memory_app_b_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  assert.equal(memory_app_a_diagnostic._ok, true);
+  assert.equal(memory_app_b_diagnostic._ok, true);
+  assert.equal(memory_app_a_diagnostic._result._diagnostic._storage_provider, "memory");
+  assert.equal(memory_app_a_diagnostic._result._diagnostic._provider, "memory");
+  assert.equal(memory_app_a_diagnostic._result._diagnostic._provider_type, "memory-entity");
+  assert.equal(memory_app_a_diagnostic._result._diagnostic._storage_scope, "app");
+  assert.equal(
+    memory_app_a_diagnostic._result._diagnostic._physical_identity,
+    "memory-test::memory-app-a::memory-provider-users",
+  );
+  assert.equal(
+    memory_app_b_diagnostic._result._diagnostic._physical_identity,
+    "memory-test::memory-app-b::memory-provider-users",
+  );
+  assert.notEqual(
+    memory_app_a_diagnostic._result._diagnostic._physical_entity_name,
+    memory_app_b_diagnostic._result._diagnostic._physical_entity_name,
+  );
+
+  const memory_app_a_physical =
+    memory_app_a_diagnostic._result._diagnostic._physical_entity_name;
+  const memory_app_b_physical =
+    memory_app_b_diagnostic._result._diagnostic._physical_entity_name;
+
+  const memory_provider_handle_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "get-entity",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  assert.equal(memory_provider_handle_res._ok, true);
+  const memory_provider_handle =
+    memory_provider_handle_res._result.entity;
+  const memory_capabilities =
+    memory_provider_handle.getCapabilities();
+  assert.equal(
+    memory_capabilities.find((capability: any) => capability._name === "persistent-storage")?._supported,
+    false,
+  );
+  assert.equal(
+    memory_capabilities.find((capability: any) => capability._name === "transactions")?._supported,
+    false,
+  );
+  assert.equal(
+    memory_capabilities.find((capability: any) => capability._name === "hash-verification")?._supported,
+    true,
+  );
+  assert.equal(
+    memory_capabilities.find((capability: any) => capability._name === "query-operators")?._supported,
+    true,
+  );
+
+  const memory_missing_required = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _data: {
+        password_hash: "missing-username-secret",
+      },
+    },
+  });
+  assert.equal(memory_missing_required._ok, false);
+  assert.match(
+    String(memory_missing_required._result?.message ?? ""),
+    /missing required field: username/,
+  );
+
+  const memory_app_a_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _data: {
+        username: "shared-user",
+        password_hash: "memory-secret-a",
+        display_name: "Memory Ada",
+        score: 5,
+        tags: ["alpha", "shared"],
+      },
+    },
+  });
+  const memory_app_b_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _data: {
+        username: "shared-user",
+        password_hash: "memory-secret-b",
+        display_name: "Memory Grace",
+        score: 8,
+        tags: ["beta", "shared"],
+      },
+    },
+  });
+  assert.equal(memory_app_a_add._ok, true);
+  assert.equal(memory_app_b_add._ok, true);
+  assert.equal(memory_app_a_add._result._record.username, "shared-user");
+  assert.notEqual(memory_app_a_add._result._record.password_hash, "memory-secret-a");
+  assert.equal(memory_app_a_add._result._physical_entity_name, undefined);
+  assert.equal(memory_app_b_add._result._physical_entity_name, undefined);
+
+  const memory_app_a_default_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _data: {
+        username: "default-user",
+        password_hash: "default-secret",
+      },
+    },
+  });
+  assert.equal(memory_app_a_default_add._ok, true);
+  assert.equal(memory_app_a_default_add._result._record.display_name, "Anonymous Memory User");
+  assert.equal(memory_app_a_default_add._result._record.score, 0);
+  assert.equal(await memory_provider_handle.count({}), 2);
+
+  const memory_app_a_duplicate = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _data: {
+        username: "shared-user",
+        password_hash: "memory-secret-a-2",
+        display_name: "Duplicate Ada",
+        score: 3,
+      },
+    },
+  });
+  assert.equal(memory_app_a_duplicate._ok, false);
+  assert.match(
+    String(memory_app_a_duplicate._result?.message ?? ""),
+    /duplicate value for unique field/,
+  );
+
+  const memory_app_a_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {
+        username: "shared-user",
+        tags: {
+          _includes: "alpha",
+        },
+      },
+      _hash_filter: {
+        password_hash: "memory-secret-a",
+      },
+    },
+  });
+  const memory_app_b_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+      _hash_filter: {
+        password_hash: "memory-secret-b",
+      },
+    },
+  });
+  assert.equal(memory_app_a_find._ok, true);
+  assert.equal(memory_app_b_find._ok, true);
+  assert.equal(memory_app_a_find._result._records._data.length, 1);
+  assert.equal(memory_app_b_find._result._records._data.length, 1);
+  assert.equal(memory_app_a_find._result._records._data[0].display_name, "Memory Ada");
+  assert.equal(memory_app_b_find._result._records._data[0].display_name, "Memory Grace");
+  assert.equal(memory_app_a_find._result._records._meta._name, "memory-provider-users");
+  assert.equal(memory_app_a_find._result._physical_entity_name, undefined);
+
+  const memory_app_a_wrong_hash = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+      _hash_filter: {
+        password_hash: "wrong-secret",
+      },
+    },
+  });
+  assert.equal(memory_app_a_wrong_hash._ok, true);
+  assert.equal(memory_app_a_wrong_hash._result._records._data.length, 0);
+
+  const memory_app_a_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "update",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {
+        _id: memory_app_a_add._result._record._id,
+      },
+      _updates: {
+        display_name: "Memory Ada Updated",
+        score: 6,
+      },
+    },
+  });
+  assert.equal(memory_app_a_update._ok, true);
+  assert.equal(memory_app_a_update._result._updated, 1);
+
+  const memory_app_a_get_after_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _id: memory_app_a_add._result._record._id,
+    },
+  });
+  assert.equal(memory_app_a_get_after_update._ok, true);
+  assert.equal(memory_app_a_get_after_update._result._record.display_name, "Memory Ada Updated");
+  assert.equal(memory_app_a_get_after_update._result._record.score, 6);
+
+  const memory_env_b_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test-b",
+      _entity: "memory-provider-users",
+      _data: {
+        username: "shared-user",
+        password_hash: "memory-secret-env-b",
+        display_name: "Memory Env B",
+      },
+    },
+  });
+  assert.equal(memory_env_b_add._ok, true);
+
+  const memory_env_b_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test-b",
+      _entity: "memory-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+    },
+  });
+  assert.equal(memory_env_b_find._ok, true);
+  assert.equal(memory_env_b_find._result._records._data.length, 1);
+  assert.equal(memory_env_b_find._result._records._data[0].display_name, "Memory Env B");
+
+  const memory_app_b_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "delete",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {
+        _id: memory_app_b_add._result._record._id,
+      },
+    },
+  });
+  assert.equal(memory_app_b_delete._ok, true);
+  assert.equal(memory_app_b_delete._result._deleted, 1);
+
+  const memory_app_b_find_after_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {},
+    },
+  });
+  assert.equal(memory_app_b_find_after_delete._ok, true);
+  assert.equal(memory_app_b_find_after_delete._result._records._data.length, 0);
+
+  assert.equal(XDB._engine._xdb_data._entities.includes(memory_app_a_physical), false);
+  assert.equal(XDB._engine._xdb_data._entities.includes(memory_app_b_physical), false);
+  await assert.rejects(
+    access(path.join(entity_sync_work_folder, "xdb", "entities", memory_app_a_physical)),
+  );
+  await assert.rejects(
+    access(path.join(entity_sync_work_folder, "xdb", "entities", memory_app_b_physical)),
+  );
+
+  const memory_app_a_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  assert.equal(memory_app_a_unregister._ok, true);
+  assert.equal(memory_app_a_unregister._result._runtime_unregistered, true);
+  assert.equal(memory_app_a_unregister._result._xdb_unregistered, false);
+
+  const memory_app_a_reregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: memory_provider_entity,
+    },
+  });
+  assert.equal(memory_app_a_reregister._ok, true);
+
+  const memory_app_a_after_restart = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity: "memory-provider-users",
+      _filter: {},
+    },
+  });
+  assert.equal(memory_app_a_after_restart._ok, true);
+  assert.equal(memory_app_a_after_restart._result._records._data.length, 0);
+
+  const memory_app_a_cleanup = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  const memory_app_b_cleanup = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "memory-app-b",
+      _env: "memory-test",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  const memory_env_b_cleanup = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "memory-app-a",
+      _env: "memory-test-b",
+      _entity_id: "memory-provider-users",
+    },
+  });
+  assert.equal(memory_app_a_cleanup._ok, true);
+  assert.equal(memory_app_b_cleanup._ok, true);
+  assert.equal(memory_env_b_cleanup._ok, true);
+
+  const sqlite_provider_entity = {
+    _id: "sqlite-provider-users",
+    _storage: {
+      _provider: "sqlite",
+      _scope: "app",
+    },
+    _schema: {
+      username: {
+        _type: "String",
+        _required: true,
+        _index: {
+          _unique: true,
+        },
+      },
+      email: {
+        _type: "String",
+        _required: true,
+        _index: {
+          _unique: true,
+        },
+      },
+      password_hash: {
+        _type: "Hash",
+      },
+      display_name: {
+        _type: "String",
+      },
+      search_text: {
+        _type: "String",
+        _index: true,
+      },
+      score: {
+        _type: "Number",
+        _index: true,
+      },
+      active: {
+        _type: "Boolean",
+        _default: true,
+        _index: true,
+      },
+      signed_up_at: {
+        _type: "Date",
+      },
+      tags: {
+        _type: "Array",
+      },
+      profile: {
+        _type: "Object",
+      },
+      middle_name: {
+        _type: "String",
+      },
+    },
+  };
+
+  const sqlite_app_a_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: sqlite_provider_entity,
+    },
+  });
+  const sqlite_app_b_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "sqlite-app-b",
+      _env: "sqlite-test",
+      _entity: sqlite_provider_entity,
+    },
+  });
+  const sqlite_app_a_prod_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-prod",
+      _entity: sqlite_provider_entity,
+    },
+  });
+  assert.equal(sqlite_app_a_register._ok, true);
+  assert.equal(sqlite_app_b_register._ok, true);
+  assert.equal(sqlite_app_a_prod_register._ok, true);
+
+  const sqlite_app_a_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  const sqlite_app_b_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "sqlite-app-b",
+      _env: "sqlite-test",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  const sqlite_app_a_prod_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-prod",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  assert.equal(sqlite_app_a_diagnostic._ok, true);
+  assert.equal(sqlite_app_b_diagnostic._ok, true);
+  assert.equal(sqlite_app_a_prod_diagnostic._ok, true);
+  assert.equal(sqlite_app_a_diagnostic._result._diagnostic._storage_provider, "sqlite");
+  assert.equal(sqlite_app_a_diagnostic._result._diagnostic._provider, "sqlite");
+  assert.equal(sqlite_app_a_diagnostic._result._diagnostic._provider_type, "sqlite-entity");
+  assert.equal(sqlite_app_a_diagnostic._result._diagnostic._storage_scope, "app");
+  assert.equal(
+    sqlite_app_a_diagnostic._result._diagnostic._physical_identity,
+    "sqlite-test::sqlite-app-a::sqlite-provider-users",
+  );
+  assert.equal(
+    sqlite_app_b_diagnostic._result._diagnostic._physical_identity,
+    "sqlite-test::sqlite-app-b::sqlite-provider-users",
+  );
+  assert.equal(
+    sqlite_app_a_prod_diagnostic._result._diagnostic._physical_identity,
+    "sqlite-prod::sqlite-app-a::sqlite-provider-users",
+  );
+  assert.notEqual(
+    sqlite_app_a_diagnostic._result._diagnostic._physical_entity_name,
+    sqlite_app_b_diagnostic._result._diagnostic._physical_entity_name,
+  );
+  assert.notEqual(
+    sqlite_app_a_diagnostic._result._diagnostic._physical_entity_name,
+    sqlite_app_a_prod_diagnostic._result._diagnostic._physical_entity_name,
+  );
+
+  const sqlite_app_a_runtime_before = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_entity",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  assert.equal(sqlite_app_a_runtime_before._ok, true);
+  assert.equal(
+    (sqlite_app_a_runtime_before._result.entity as any).getDebugStats()._loaded_rows,
+    0,
+  );
+
+  const sqlite_app_a_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "shared-user",
+        email: "shared-a@example.test",
+        password_hash: "sqlite-secret-a",
+        display_name: "SQLite Ada",
+        search_text: "alpha ada sqlite",
+        score: 10,
+        signed_up_at: "2026-01-01T00:00:00.000Z",
+      },
+    },
+  });
+  const sqlite_app_b_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-b",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "shared-user",
+        email: "shared-b@example.test",
+        password_hash: "sqlite-secret-b",
+        display_name: "SQLite Grace",
+        search_text: "beta grace sqlite",
+        score: 12,
+      },
+    },
+  });
+  const sqlite_app_a_prod_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-prod",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "shared-user",
+        email: "shared-prod@example.test",
+        password_hash: "sqlite-secret-prod",
+        display_name: "SQLite Prod Ada",
+        search_text: "prod ada sqlite",
+        score: 14,
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_add._ok, true);
+  assert.equal(sqlite_app_b_add._ok, true);
+  assert.equal(sqlite_app_a_prod_add._ok, true);
+  assert.equal(sqlite_app_a_add._result._record.username, "shared-user");
+  assert.notEqual(sqlite_app_a_add._result._record.password_hash, "sqlite-secret-a");
+  assert.equal(sqlite_app_a_add._result._physical_entity_name, undefined);
+
+  const sqlite_app_a_duplicate = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "shared-user",
+        email: "duplicate@example.test",
+        password_hash: "sqlite-secret-a-2",
+        display_name: "SQLite Duplicate",
+        search_text: "duplicate sqlite",
+        score: 2,
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_duplicate._ok, false);
+  assert.match(
+    String(sqlite_app_a_duplicate._result?.message ?? ""),
+    /UNIQUE constraint failed|constraint/i,
+  );
+
+  const sqlite_app_a_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+      _hash_filter: {
+        password_hash: "sqlite-secret-a",
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_find._ok, true);
+  assert.equal(sqlite_app_a_find._result._records._data.length, 1);
+  assert.equal(sqlite_app_a_find._result._records._data[0].display_name, "SQLite Ada");
+  assert.equal(sqlite_app_a_find._result._records._meta._name, "sqlite-provider-users");
+  assert.equal(sqlite_app_a_find._result._physical_entity_name, undefined);
+
+  const sqlite_app_a_find_range = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _gte: 10,
+        },
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_find_range._ok, true);
+  assert.equal(sqlite_app_a_find_range._result._records._data.length, 1);
+
+  const sqlite_app_a_contains = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        search_text: {
+          _contains: "ada",
+        },
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_contains._ok, true);
+  assert.equal(sqlite_app_a_contains._result._records._data.length, 1);
+  assert.equal(sqlite_app_a_contains._result._records._data[0].username, "shared-user");
+
+  const sqlite_app_a_unindexed_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        display_name: "SQLite Ada",
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_unindexed_find._ok, false);
+  assert.match(
+    String(sqlite_app_a_unindexed_find._result?.message ?? ""),
+    /indexed fields/,
+  );
+
+  const sqlite_app_a_unsupported_operator = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _object_search: {
+            k: "x",
+            v: 1,
+          },
+        },
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_unsupported_operator._ok, false);
+  assert.match(
+    String(sqlite_app_a_unsupported_operator._result?.message ?? ""),
+    /does not support query operator/,
+  );
+
+  const sqlite_loaded_before_count =
+    (sqlite_app_a_runtime_before._result.entity as any).getDebugStats()._loaded_rows;
+  const sqlite_app_a_count_before_bulk =
+    await (sqlite_app_a_runtime_before._result.entity as any).count({});
+  const sqlite_loaded_after_count =
+    (sqlite_app_a_runtime_before._result.entity as any).getDebugStats()._loaded_rows;
+  assert.equal(sqlite_app_a_count_before_bulk, 1);
+  assert.equal(sqlite_loaded_after_count, sqlite_loaded_before_count);
+
+  await Promise.all(
+    Array.from({ length: 8 }, async (_value, index) => {
+      const result = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: "sqlite-app-a",
+          _env: "sqlite-test",
+          _entity: "sqlite-provider-users",
+          _data: {
+            username: `bulk-${index}`,
+            email: `bulk-${index}@example.test`,
+            password_hash: `bulk-secret-${index}`,
+            display_name: `Bulk ${index}`,
+            search_text: `bulk ${index} sqlite`,
+            score: 20 + index,
+          },
+        },
+      });
+      assert.equal(result._ok, true);
+    }),
+  );
+
+  const sqlite_app_a_count_after_bulk =
+    await (sqlite_app_a_runtime_before._result.entity as any).count({});
+  assert.equal(sqlite_app_a_count_after_bulk, 9);
+
+  const sqlite_app_a_sorted_page = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _gte: 20,
+        },
+      },
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "desc",
+      },
+      _skip: 1,
+      _limit: 3,
+    },
+  });
+  assert.equal(sqlite_app_a_sorted_page._ok, true);
+  assert.deepEqual(
+    sqlite_app_a_sorted_page._result._records._data.map((record: any) => record.score),
+    [26, 25, 24],
+  );
+  assert.equal(sqlite_app_a_sorted_page._result._records._meta._total_records, 8);
+  assert.equal(sqlite_app_a_sorted_page._result._records._meta._skip, 1);
+  assert.equal(sqlite_app_a_sorted_page._result._records._meta._limit, 3);
+
+  const sqlite_bulk_update = await _x.execute({
+    _module: "entity-manager",
+    _op: "update",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _gte: 20,
+        },
+      },
+      _updates: {
+        active: false,
+        search_text: "bulk updated sqlite",
+      },
+    },
+  });
+  assert.equal(sqlite_bulk_update._ok, true);
+  assert.equal(sqlite_bulk_update._result._updated, 8);
+
+  const sqlite_bulk_updated_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        active: false,
+      },
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+    },
+  });
+  assert.equal(sqlite_bulk_updated_find._ok, true);
+  assert.equal(sqlite_bulk_updated_find._result._records._data.length, 8);
+  assert.equal(sqlite_bulk_updated_find._result._records._data[0].score, 20);
+
+  const sqlite_filtered_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "delete",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _gte: 27,
+        },
+      },
+    },
+  });
+  assert.equal(sqlite_filtered_delete._ok, true);
+  assert.equal(sqlite_filtered_delete._result._deleted, 1);
+
+  const sqlite_count_before_rollback =
+    await (sqlite_app_a_runtime_before._result.entity as any).count({});
+  const sqlite_rollback_failure = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "rollback-user",
+        email: "shared-a@example.test",
+        password_hash: "rollback-secret",
+        display_name: "Rollback",
+        search_text: "rollback sqlite",
+        score: 99,
+      },
+    },
+  });
+  assert.equal(sqlite_rollback_failure._ok, false);
+  const sqlite_count_after_rollback =
+    await (sqlite_app_a_runtime_before._result.entity as any).count({});
+  assert.equal(sqlite_count_after_rollback, sqlite_count_before_rollback);
+
+  const sqlite_app_a_delete = await _x.execute({
+    _module: "entity-manager",
+    _op: "delete",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        _id: sqlite_app_a_add._result._record._id,
+      },
+    },
+  });
+  assert.equal(sqlite_app_a_delete._ok, true);
+  assert.equal(sqlite_app_a_delete._result._deleted, 1);
+
+  const sqlite_app_a_deleted_get = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _id: sqlite_app_a_add._result._record._id,
+    },
+  });
+  assert.equal(sqlite_app_a_deleted_get._ok, true);
+  assert.equal(sqlite_app_a_deleted_get._result._record, null);
+
+  const sqlite_persisted_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "persisted-user",
+        email: "persisted@example.test",
+        password_hash: "persisted-secret",
+        display_name: "Persisted",
+        search_text: "persisted sqlite",
+        score: 33,
+      },
+    },
+  });
+  assert.equal(sqlite_persisted_add._ok, true);
+
+  const sqlite_json_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _data: {
+        username: "json-user",
+        email: "json@example.test",
+        password_hash: "json-secret",
+        display_name: "JSON User",
+        search_text: "json sqlite",
+        score: 44,
+        tags: ["alpha", { nested: true }],
+        profile: {
+          nested: {
+            ok: true,
+            missing: null,
+          },
+          values: [1, 2, 3],
+        },
+        middle_name: null,
+      },
+    },
+  });
+  assert.equal(sqlite_json_add._ok, true);
+  assert.deepEqual(sqlite_json_add._result._record.tags, ["alpha", { nested: true }]);
+  assert.equal(sqlite_json_add._result._record.profile.nested.missing, null);
+  assert.equal(sqlite_json_add._result._record.middle_name, null);
+
+  const sqlite_db_path =
+    (sqlite_app_a_runtime_before._result.entity as any).getDebugStats()._db_path;
+  const sqlite_table_name =
+    (sqlite_app_a_runtime_before._result.entity as any).getDebugStats()._table_name;
+  await access(sqlite_db_path);
+
+  const sqlite_inspect_db = new Database(sqlite_db_path, {
+    readonly: true,
+  });
+  try {
+    const sqlite_meta = sqlite_inspect_db.prepare(
+      "SELECT * FROM entity_provider_meta WHERE physical_entity_name = ?",
+    ).get(sqlite_app_a_diagnostic._result._diagnostic._physical_entity_name) as any;
+    assert.equal(sqlite_meta.provider, "sqlite");
+    assert.equal(sqlite_meta.provider_type, "sqlite-entity");
+    assert.equal(sqlite_meta.table_name, sqlite_table_name);
+    const sqlite_schema = JSON.parse(sqlite_meta.schema_json);
+    assert.equal(sqlite_schema.username._type, "String");
+
+    const sqlite_table = sqlite_inspect_db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+    ).get(sqlite_table_name) as any;
+    assert.equal(sqlite_table.name, sqlite_table_name);
+
+    const sqlite_index_rows = sqlite_inspect_db.prepare(
+      "SELECT field_name, is_unique FROM entity_provider_indexes WHERE physical_entity_name = ? ORDER BY field_name ASC",
+    ).all(sqlite_app_a_diagnostic._result._diagnostic._physical_entity_name) as any[];
+    assert.ok(sqlite_index_rows.some((row) => row.field_name === "username" && row.is_unique === 1));
+    assert.ok(sqlite_index_rows.some((row) => row.field_name === "score" && row.is_unique === 0));
+
+    const sqlite_record_count = sqlite_inspect_db.prepare(
+      `SELECT COUNT(*) as count FROM ${quote_sqlite_identifier_for_test(sqlite_table_name)}`,
+    ).get() as any;
+    assert.equal(sqlite_record_count.count, 9);
+  } finally {
+    sqlite_inspect_db.close();
+  }
+
+  const sqlite_app_a_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  assert.equal(sqlite_app_a_unregister._ok, true);
+  assert.equal(sqlite_app_a_unregister._result._xdb_unregistered, false);
+
+  const sqlite_app_a_reregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: sqlite_provider_entity,
+    },
+  });
+  assert.equal(sqlite_app_a_reregister._ok, true);
+
+  const sqlite_app_a_runtime_after_restart = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_entity",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity_id: "sqlite-provider-users",
+    },
+  });
+  assert.equal(sqlite_app_a_runtime_after_restart._ok, true);
+  assert.equal(
+    (sqlite_app_a_runtime_after_restart._result.entity as any).getDebugStats()._loaded_rows,
+    0,
+  );
+
+  const sqlite_persisted_get = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _id: sqlite_persisted_add._result._record._id,
+    },
+  });
+  assert.equal(sqlite_persisted_get._ok, true);
+  assert.equal(sqlite_persisted_get._result._record.display_name, "Persisted");
+
+  const sqlite_json_get_after_restart = await _x.execute({
+    _module: "entity-manager",
+    _op: "get",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _id: sqlite_json_add._result._record._id,
+    },
+  });
+  assert.equal(sqlite_json_get_after_restart._ok, true);
+  assert.deepEqual(sqlite_json_get_after_restart._result._record.tags, ["alpha", { nested: true }]);
+  assert.equal(sqlite_json_get_after_restart._result._record.profile.nested.missing, null);
+  assert.equal(sqlite_json_get_after_restart._result._record.middle_name, null);
+
+  for (let index = 0; index < 150; index += 1) {
+    const sqlite_page_add = await _x.execute({
+      _module: "entity-manager",
+      _op: "add",
+      _params: {
+        _app_id: "sqlite-app-a",
+        _env: "sqlite-test",
+        _entity: "sqlite-provider-users",
+        _data: {
+          username: `page-${index}`,
+          email: `page-${index}@example.test`,
+          password_hash: `page-secret-${index}`,
+          display_name: `Page ${index}`,
+          search_text: `page ${index} sqlite`,
+          score: 1000 + index,
+        },
+      },
+    });
+    assert.equal(sqlite_page_add._ok, true);
+  }
+
+  const sqlite_loaded_before_large_page =
+    (sqlite_app_a_runtime_after_restart._result.entity as any).getDebugStats()._loaded_rows;
+  const sqlite_large_page = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        score: {
+          _gte: 1000,
+        },
+      },
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+      _skip: 50,
+      _limit: 10,
+    },
+  });
+  assert.equal(sqlite_large_page._ok, true);
+  assert.equal(sqlite_large_page._result._records._data.length, 10);
+  assert.equal(sqlite_large_page._result._records._data[0].score, 1050);
+  assert.equal(sqlite_large_page._result._records._meta._total_records, 150);
+  const sqlite_loaded_after_large_page =
+    (sqlite_app_a_runtime_after_restart._result.entity as any).getDebugStats()._loaded_rows;
+  assert.equal(sqlite_loaded_after_large_page - sqlite_loaded_before_large_page, 10);
+
+  const sqlite_large_count =
+    await (sqlite_app_a_runtime_after_restart._result.entity as any).count({
+      score: {
+        _gte: 1000,
+      },
+    });
+  assert.equal(sqlite_large_count, 150);
+
+  const sqlite_unbounded_hash_find = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {},
+      _hash_filter: {
+        password_hash: "page-secret-1",
+      },
+    },
+  });
+  assert.equal(sqlite_unbounded_hash_find._ok, false);
+  assert.match(
+    String(sqlite_unbounded_hash_find._result?.message ?? ""),
+    /bounded result set/,
+  );
+
+  const sqlite_app_b_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-b",
+      _env: "sqlite-test",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+    },
+  });
+  const sqlite_app_a_prod_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-prod",
+      _entity: "sqlite-provider-users",
+      _filter: {
+        username: "shared-user",
+      },
+    },
+  });
+  assert.equal(sqlite_app_b_records._ok, true);
+  assert.equal(sqlite_app_a_prod_records._ok, true);
+  assert.equal(sqlite_app_b_records._result._records._data.length, 1);
+  assert.equal(sqlite_app_a_prod_records._result._records._data.length, 1);
+  assert.equal(sqlite_app_b_records._result._records._data[0].display_name, "SQLite Grace");
+  assert.equal(sqlite_app_a_prod_records._result._records._data[0].display_name, "SQLite Prod Ada");
+
+  for (const cleanup of [
+    {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-test",
+    },
+    {
+      _app_id: "sqlite-app-b",
+      _env: "sqlite-test",
+    },
+    {
+      _app_id: "sqlite-app-a",
+      _env: "sqlite-prod",
+    },
+  ]) {
+    const sqlite_cleanup = await _x.execute({
+      _module: "entity-manager",
+      _op: "unregister",
+      _params: {
+        _app_id: cleanup._app_id,
+        _env: cleanup._env,
+        _entity_id: "sqlite-provider-users",
+      },
+    });
+    assert.equal(sqlite_cleanup._ok, true);
+  }
+
+  const provider_parity_entity = {
+    _id: "provider-parity-users",
+    _schema: {
+      username: {
+        _type: "String",
+        _required: true,
+        _index: {
+          _unique: true,
+        },
+      },
+      group: {
+        _type: "String",
+        _index: true,
+      },
+      search_text: {
+        _type: "String",
+        _index: true,
+      },
+      score: {
+        _type: "Number",
+        _index: true,
+      },
+      active: {
+        _type: "Boolean",
+        _index: true,
+      },
+      status: {
+        _type: "String",
+        _index: true,
+      },
+      tags: {
+        _type: "Array",
+      },
+      profile: {
+        _type: "Object",
+      },
+    },
+  };
+
+  const provider_parity_sqlite_entity = {
+    ...provider_parity_entity,
+    _storage: {
+      _provider: "sqlite",
+      _scope: "app",
+    },
+  };
+  const provider_parity_xdb_entity = {
+    ...provider_parity_entity,
+    _storage: {
+      _provider: "xdb",
+      _scope: "app",
+    },
+  };
+
+  const provider_parity_sqlite_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "provider-parity-sqlite-app",
+      _env: "provider-parity",
+      _entity: provider_parity_sqlite_entity,
+    },
+  });
+  const provider_parity_xdb_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "provider-parity-xdb-app",
+      _env: "provider-parity",
+      _entity: provider_parity_xdb_entity,
+    },
+  });
+  assert.equal(provider_parity_sqlite_register._ok, true);
+  assert.equal(provider_parity_xdb_register._ok, true);
+
+  const provider_parity_records = [
+    {
+      username: "ada",
+      group: "ops",
+      search_text: "Ada runs operations",
+      score: 10,
+      active: true,
+      status: "new",
+      tags: ["ops", "admin"],
+      profile: {
+        level: 1,
+      },
+    },
+    {
+      username: "grace",
+      group: "ops",
+      search_text: "Grace builds systems",
+      score: 30,
+      active: true,
+      status: "new",
+      tags: ["ops"],
+      profile: {
+        level: 2,
+      },
+    },
+    {
+      username: "linus",
+      group: "dev",
+      search_text: "Linus ships kernels",
+      score: 20,
+      active: false,
+      status: "new",
+      tags: ["dev"],
+      profile: {
+        level: 3,
+      },
+    },
+    {
+      username: "margaret",
+      group: "science",
+      search_text: "Margaret writes guidance",
+      score: 40,
+      active: true,
+      status: "new",
+      tags: ["science"],
+      profile: {
+        level: 4,
+      },
+    },
+  ];
+
+  for (const record of provider_parity_records) {
+    for (const app_id of ["provider-parity-sqlite-app", "provider-parity-xdb-app"]) {
+      const provider_parity_add = await _x.execute({
+        _module: "entity-manager",
+        _op: "add",
+        _params: {
+          _app_id: app_id,
+          _env: "provider-parity",
+          _entity: "provider-parity-users",
+          _data: record,
+        },
+      });
+      assert.equal(provider_parity_add._ok, true);
+    }
+  }
+
+  const provider_parity_usernames = async (
+    app_id: string,
+    filter: any,
+    options: any = {},
+  ) => {
+    const result = await _x.execute({
+      _module: "entity-manager",
+      _op: "find",
+      _params: {
+        _app_id: app_id,
+        _env: "provider-parity",
+        _entity: "provider-parity-users",
+        _filter: filter,
+        ...options,
+      },
+    });
+    assert.equal(result._ok, true);
+    return result._result._records._data.map((record: any) => record.username);
+  };
+
+  const parity_sqlite_equality = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {
+      group: "ops",
+    },
+  );
+  const parity_xdb_equality = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {
+      group: "ops",
+    },
+  );
+  assert.deepEqual(parity_sqlite_equality, parity_xdb_equality);
+
+  const parity_sqlite_comparison = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {
+      score: {
+        _gte: 20,
+      },
+    },
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+    },
+  );
+  const parity_xdb_comparison = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {
+      score: {
+        _gte: 20,
+      },
+    },
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+    },
+  );
+  assert.deepEqual(parity_sqlite_comparison, parity_xdb_comparison);
+
+  const parity_sqlite_contains = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {
+      search_text: {
+        _contains: "systems",
+      },
+    },
+  );
+  const parity_xdb_contains = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {
+      search_text: {
+        _contains: "systems",
+      },
+    },
+  );
+  assert.deepEqual(parity_sqlite_contains, parity_xdb_contains);
+
+  const parity_sqlite_page = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {},
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "desc",
+      },
+      _skip: 1,
+      _limit: 2,
+    },
+  );
+  const parity_xdb_page = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {},
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "desc",
+      },
+      _skip: 1,
+      _limit: 2,
+    },
+  );
+  assert.deepEqual(parity_sqlite_page, parity_xdb_page);
+
+  for (const app_id of ["provider-parity-sqlite-app", "provider-parity-xdb-app"]) {
+    const parity_update = await _x.execute({
+      _module: "entity-manager",
+      _op: "update",
+      _params: {
+        _app_id: app_id,
+        _env: "provider-parity",
+        _entity: "provider-parity-users",
+        _filter: {
+          group: "ops",
+        },
+        _updates: {
+          status: "done",
+        },
+      },
+    });
+    assert.equal(parity_update._ok, true);
+    assert.equal(parity_update._result._updated, 2);
+  }
+
+  const parity_sqlite_updated = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {
+      status: "done",
+    },
+  );
+  const parity_xdb_updated = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {
+      status: "done",
+    },
+  );
+  assert.deepEqual(parity_sqlite_updated, parity_xdb_updated);
+
+  for (const app_id of ["provider-parity-sqlite-app", "provider-parity-xdb-app"]) {
+    const parity_delete = await _x.execute({
+      _module: "entity-manager",
+      _op: "delete",
+      _params: {
+        _app_id: app_id,
+        _env: "provider-parity",
+        _entity: "provider-parity-users",
+        _filter: {
+          status: "done",
+        },
+      },
+    });
+    assert.equal(parity_delete._ok, true);
+    assert.equal(parity_delete._result._deleted, 2);
+  }
+
+  const parity_sqlite_remaining = await provider_parity_usernames(
+    "provider-parity-sqlite-app",
+    {},
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+    },
+  );
+  const parity_xdb_remaining = await provider_parity_usernames(
+    "provider-parity-xdb-app",
+    {},
+    {
+      _sort: {
+        _sort_by: "score",
+        _sort_order: "asc",
+      },
+    },
+  );
+  assert.deepEqual(parity_sqlite_remaining, ["linus", "margaret"]);
+  assert.equal(parity_xdb_remaining.length, 2);
+
+  const parity_sqlite_runtime = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_entity",
+    _params: {
+      _app_id: "provider-parity-sqlite-app",
+      _env: "provider-parity",
+      _entity_id: "provider-parity-users",
+    },
+  });
+  assert.equal(parity_sqlite_runtime._ok, true);
+  assert.equal(await (parity_sqlite_runtime._result.entity as any).count({}), 2);
+  const parity_xdb_count = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "provider-parity-xdb-app",
+      _env: "provider-parity",
+      _entity: "provider-parity-users",
+      _filter: {},
+    },
+  });
+  assert.equal(parity_xdb_count._ok, true);
+  assert.equal(parity_xdb_count._result._records._data.length, 2);
+
+  for (const app_id of ["provider-parity-sqlite-app", "provider-parity-xdb-app"]) {
+    const parity_cleanup = await _x.execute({
+      _module: "entity-manager",
+      _op: "unregister",
+      _params: {
+        _app_id: app_id,
+        _env: "provider-parity",
+        _entity_id: "provider-parity-users",
+      },
+    });
+    assert.equal(parity_cleanup._ok, true);
+  }
+
+  const app_scoped_users_v1 = {
+    _id: "users",
+    _schema: {
+      app_a_name: {
+        _type: "String",
+        _required: true,
+      },
+    },
+  };
+
+  const app_a_users_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity: app_scoped_users_v1,
+    },
+  });
+  assert.equal(app_a_users_register._ok, true);
+
+  const app_a_users_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity: "users",
+      _data: {
+        app_a_name: "Ada App A",
+      },
+    },
+  });
+  assert.equal(app_a_users_add._ok, true);
+  assert.equal(app_a_users_add._result._record.app_a_name, "Ada App A");
+  assert.equal(app_a_users_add._result._physical_entity_name, undefined);
+
+  const app_scoped_users_v2 = {
+    _id: "users",
+    _schema: {
+      app_b_email: {
+        _type: "String",
+      },
+    },
+  };
+
+  const app_b_users_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity: app_scoped_users_v2,
+    },
+  });
+  assert.equal(app_b_users_register._ok, true);
+
+  const app_a_users_has = await _x.execute({
+    _module: "entity-manager",
+    _op: "has",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  const app_b_users_has = await _x.execute({
+    _module: "entity-manager",
+    _op: "has",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_a_users_has._result._exists, true);
+  assert.equal(app_b_users_has._result._exists, true);
+
+  const app_a_users_schema = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  const app_b_users_schema = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_schema",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_a_users_schema._result.entity._schema.app_a_name._type, "String");
+  assert.equal(app_b_users_schema._result.entity._schema.app_b_email._type, "String");
+
+  const app_a_storage_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  const app_b_storage_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_a_storage_diagnostic._ok, true);
+  assert.equal(app_b_storage_diagnostic._ok, true);
+  assert.deepEqual(app_a_storage_diagnostic._result._diagnostic, {
+    _app_id: "app-a",
+    _env: "collision-test",
+    _entity: "users",
+    _entity_id: "users",
+    _logical_entity_id: "users",
+    _physical_entity_name: "users",
+    _physical_identity: "users",
+    _physical_entity_encoding: "plain",
+    _storage_provider: "xdb",
+    _provider: "xdb",
+    _provider_type: "xdb-entity",
+    _storage_scope: "global",
+    _is_global_storage: true,
+    _is_scoped_storage: false,
+  });
+  assert.equal(
+    app_b_storage_diagnostic._result._diagnostic._physical_entity_name,
+    "users",
+  );
+  assert.equal(app_b_storage_diagnostic._result._diagnostic._storage_scope, "global");
+
+  const xdb_users_names =
+    XDB._engine._xdb_data._entities.filter((entity_name: string) => entity_name === "users");
+  assert.equal(xdb_users_names.length, 1);
+
+  const app_b_users_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(app_b_users_records._ok, true);
+  assert.equal(app_b_users_records._result._records._data.length, 1);
+  assert.equal(app_b_users_records._result._records._data[0].app_a_name, "Ada App A");
+  assert.equal(app_b_users_records._result._physical_entity_name, undefined);
+
+  const physical_users_schema = JSON.parse(
+    await readFile(
+      path.join(entity_sync_work_folder, "xdb", "entities", "users", "_schema.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(physical_users_schema.app_b_email._type, "String");
+  assert.equal(physical_users_schema.app_a_name, undefined);
+
+  const physical_users_records = JSON.parse(
+    await readFile(
+      path.join(entity_sync_work_folder, "xdb", "entities", "users", "_data.json"),
+      "utf-8",
+    ),
+  );
+  assert.equal(physical_users_records.length, 1);
+  assert.equal(physical_users_records[0].app_a_name, "Ada App A");
+
+  const app_b_users_delete_shared = await _x.execute({
+    _module: "entity-manager",
+    _op: "delete",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity: "users",
+      _filter: {
+        _id: app_a_users_add._result._record._id,
+      },
+    },
+  });
+  assert.equal(app_b_users_delete_shared._ok, true);
+  assert.equal(app_b_users_delete_shared._result._deleted, 1);
+
+  const app_a_users_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "app-a",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  const app_b_users_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: "app-b",
+      _env: "collision-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_a_users_unregister._ok, true);
+  assert.equal(app_b_users_unregister._ok, true);
+
+  const app_scope_users_entity = {
+    _id: "users",
+    _storage: {
+      _provider: "xdb",
+      _scope: "app",
+    },
+    _schema: {
+      tenant_name: {
+        _type: "String",
+      },
+    },
+  };
+
+  const app_a_scope_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-test",
+      _entity: app_scope_users_entity,
+    },
+  });
+  const app_b_scope_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-b",
+      _env: "scope-test",
+      _entity: app_scope_users_entity,
+    },
+  });
+  assert.equal(app_a_scope_register._ok, true);
+  assert.equal(app_b_scope_register._ok, true);
+
+  const app_a_scope_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-test",
+      _entity: "users",
+      _data: {
+        tenant_name: "Ada App A",
+      },
+    },
+  });
+  const app_b_scope_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-b",
+      _env: "scope-test",
+      _entity: "users",
+      _data: {
+        tenant_name: "Grace App B",
+      },
+    },
+  });
+  assert.equal(app_a_scope_add._ok, true);
+  assert.equal(app_b_scope_add._ok, true);
+  assert.equal(app_a_scope_add._result._physical_entity_name, undefined);
+  assert.equal(app_b_scope_add._result._physical_entity_name, undefined);
+
+  const app_a_scope_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-test",
+      _entity_id: "users",
+    },
+  });
+  const app_b_scope_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-b",
+      _env: "scope-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_a_scope_diagnostic._ok, true);
+  assert.equal(app_b_scope_diagnostic._ok, true);
+  assert.equal(app_a_scope_diagnostic._result._diagnostic._storage_scope, "app");
+  assert.equal(app_b_scope_diagnostic._result._diagnostic._storage_scope, "app");
+  assert.equal(
+    app_a_scope_diagnostic._result._diagnostic._physical_identity,
+    "scope-test::app-a::users",
+  );
+  assert.equal(
+    app_b_scope_diagnostic._result._diagnostic._physical_identity,
+    "scope-test::app-b::users",
+  );
+  assert.notEqual(
+    app_a_scope_diagnostic._result._diagnostic._physical_entity_name,
+    app_b_scope_diagnostic._result._diagnostic._physical_entity_name,
+  );
+  assert.match(
+    app_a_scope_diagnostic._result._diagnostic._physical_entity_name,
+    /^xent_[A-Za-z0-9_-]+$/,
+  );
+  assert.equal(
+    app_a_scope_diagnostic._result._diagnostic._physical_entity_name.includes("::"),
+    false,
+  );
+  assert.equal(app_a_scope_diagnostic._result._diagnostic._physical_entity_encoding, "base64url");
+  assert.equal(app_a_scope_diagnostic._result._diagnostic._is_scoped_storage, true);
+  assert.equal(app_b_scope_diagnostic._result._diagnostic._is_scoped_storage, true);
+
+  assert.equal(
+    XDB._engine._xdb_data._entities.includes(
+      app_a_scope_diagnostic._result._diagnostic._physical_entity_name,
+    ),
+    true,
+  );
+  assert.equal(
+    XDB._engine._xdb_data._entities.includes(
+      app_b_scope_diagnostic._result._diagnostic._physical_entity_name,
+    ),
+    true,
+  );
+
+  const app_a_scope_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-test",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  const app_b_scope_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-b",
+      _env: "scope-test",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(app_a_scope_records._ok, true);
+  assert.equal(app_b_scope_records._ok, true);
+  assert.equal(app_a_scope_records._result._records._data.length, 1);
+  assert.equal(app_b_scope_records._result._records._data.length, 1);
+  assert.equal(app_a_scope_records._result._records._data[0].tenant_name, "Ada App A");
+  assert.equal(app_b_scope_records._result._records._data[0].tenant_name, "Grace App B");
+  assert.equal(app_a_scope_records._result._records._meta._name, "users");
+  assert.equal(app_b_scope_records._result._records._meta._name, "users");
+  assert.equal(app_a_scope_records._result._physical_entity_name, undefined);
+  assert.equal(app_b_scope_records._result._physical_entity_name, undefined);
+
+  const app_a_scoped_physical_records = JSON.parse(
+    await readFile(
+      path.join(
+        entity_sync_work_folder,
+        "xdb",
+        "entities",
+        app_a_scope_diagnostic._result._diagnostic._physical_entity_name,
+        "_data.json",
+      ),
+      "utf-8",
+    ),
+  );
+  const app_b_scoped_physical_records = JSON.parse(
+    await readFile(
+      path.join(
+        entity_sync_work_folder,
+        "xdb",
+        "entities",
+        app_b_scope_diagnostic._result._diagnostic._physical_entity_name,
+        "_data.json",
+      ),
+      "utf-8",
+    ),
+  );
+  assert.equal(app_a_scoped_physical_records.length, 1);
+  assert.equal(app_b_scoped_physical_records.length, 1);
+  assert.equal(app_a_scoped_physical_records[0].tenant_name, "Ada App A");
+  assert.equal(app_b_scoped_physical_records[0].tenant_name, "Grace App B");
+
+  const app_scope_dev_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-dev",
+      _entity: app_scope_users_entity,
+    },
+  });
+  const app_scope_prod_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-prod",
+      _entity: app_scope_users_entity,
+    },
+  });
+  assert.equal(app_scope_dev_register._ok, true);
+  assert.equal(app_scope_prod_register._ok, true);
+  const app_scope_dev_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-dev",
+      _entity: "users",
+      _data: {
+        tenant_name: "Dev Ada",
+      },
+    },
+  });
+  const app_scope_prod_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-prod",
+      _entity: "users",
+      _data: {
+        tenant_name: "Prod Ada",
+      },
+    },
+  });
+  assert.equal(app_scope_dev_add._ok, true);
+  assert.equal(app_scope_prod_add._ok, true);
+
+  const app_scope_dev_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-dev",
+      _entity_id: "users",
+    },
+  });
+  const app_scope_prod_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-prod",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(app_scope_dev_diagnostic._result._diagnostic._physical_identity, "scope-dev::app-a::users");
+  assert.equal(app_scope_prod_diagnostic._result._diagnostic._physical_identity, "scope-prod::app-a::users");
+  assert.notEqual(
+    app_scope_dev_diagnostic._result._diagnostic._physical_entity_name,
+    app_scope_prod_diagnostic._result._diagnostic._physical_entity_name,
+  );
+
+  const app_scope_dev_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-dev",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  const app_scope_prod_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-a",
+      _env: "scope-prod",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(app_scope_dev_records._result._records._data.length, 1);
+  assert.equal(app_scope_prod_records._result._records._data.length, 1);
+  assert.equal(app_scope_dev_records._result._records._data[0].tenant_name, "Dev Ada");
+  assert.equal(app_scope_prod_records._result._records._data[0].tenant_name, "Prod Ada");
+
+  const server_scope_users_entity = {
+    _id: "users",
+    _storage: {
+      _provider: "xdb",
+      _scope: "server",
+    },
+    _schema: {
+      tenant_name: {
+        _type: "String",
+      },
+    },
+  };
+  const server_scope_app_a_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-a",
+      _env: "server-scope-test",
+      _entity: server_scope_users_entity,
+    },
+  });
+  const server_scope_app_b_register = await _x.execute({
+    _module: "entity-manager",
+    _op: "register",
+    _params: {
+      _app_id: "app-b",
+      _env: "server-scope-test",
+      _entity: server_scope_users_entity,
+    },
+  });
+  assert.equal(server_scope_app_a_register._ok, true);
+  assert.equal(server_scope_app_b_register._ok, true);
+
+  const server_scope_app_a_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-a",
+      _env: "server-scope-test",
+      _entity_id: "users",
+    },
+  });
+  const server_scope_app_b_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: "app-b",
+      _env: "server-scope-test",
+      _entity_id: "users",
+    },
+  });
+  assert.equal(server_scope_app_a_diagnostic._result._diagnostic._storage_scope, "server");
+  assert.equal(server_scope_app_b_diagnostic._result._diagnostic._storage_scope, "server");
+  assert.equal(server_scope_app_a_diagnostic._result._diagnostic._physical_identity, "server::users");
+  assert.equal(server_scope_app_b_diagnostic._result._diagnostic._physical_identity, "server::users");
+  assert.equal(
+    server_scope_app_a_diagnostic._result._diagnostic._physical_entity_name,
+    server_scope_app_b_diagnostic._result._diagnostic._physical_entity_name,
+  );
+  assert.equal(
+    server_scope_app_a_diagnostic._result._diagnostic._physical_entity_name.includes("::"),
+    false,
+  );
+
+  const server_scope_app_a_add = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "app-a",
+      _env: "server-scope-test",
+      _entity: "users",
+      _data: {
+        tenant_name: "Shared Server Ada",
+      },
+    },
+  });
+  assert.equal(server_scope_app_a_add._ok, true);
+
+  const server_scope_app_b_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "app-b",
+      _env: "server-scope-test",
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(server_scope_app_b_records._ok, true);
+  assert.equal(server_scope_app_b_records._result._records._data.length, 1);
+  assert.equal(server_scope_app_b_records._result._records._data[0].tenant_name, "Shared Server Ada");
+  assert.equal(server_scope_app_b_records._result._records._meta._name, "users");
+  assert.equal(server_scope_app_b_records._result._physical_entity_name, undefined);
+
+  for (const cleanup of [
+    {
+      _app_id: "app-a",
+      _env: "scope-test",
+      _id: app_a_scope_add._result._record._id,
+    },
+    {
+      _app_id: "app-b",
+      _env: "scope-test",
+      _id: app_b_scope_add._result._record._id,
+    },
+    {
+      _app_id: "app-a",
+      _env: "scope-dev",
+      _id: app_scope_dev_add._result._record._id,
+    },
+    {
+      _app_id: "app-a",
+      _env: "scope-prod",
+      _id: app_scope_prod_add._result._record._id,
+    },
+    {
+      _app_id: "app-b",
+      _env: "server-scope-test",
+      _id: server_scope_app_a_add._result._record._id,
+    },
+  ]) {
+    const cleanup_delete = await _x.execute({
+      _module: "entity-manager",
+      _op: "delete",
+      _params: {
+        _app_id: cleanup._app_id,
+        _env: cleanup._env,
+        _entity: "users",
+        _filter: {
+          _id: cleanup._id,
+        },
+      },
+    });
+    assert.equal(cleanup_delete._ok, true);
+    assert.equal(cleanup_delete._result._deleted, 1);
+  }
+
+  for (const cleanup of [
+    {
+      _app_id: "app-a",
+      _env: "scope-test",
+    },
+    {
+      _app_id: "app-b",
+      _env: "scope-test",
+    },
+    {
+      _app_id: "app-a",
+      _env: "scope-dev",
+    },
+    {
+      _app_id: "app-a",
+      _env: "scope-prod",
+    },
+    {
+      _app_id: "app-a",
+      _env: "server-scope-test",
+    },
+    {
+      _app_id: "app-b",
+      _env: "server-scope-test",
+    },
+  ]) {
+    const cleanup_unregister = await _x.execute({
+      _module: "entity-manager",
+      _op: "unregister",
+      _params: {
+        _app_id: cleanup._app_id,
+        _env: cleanup._env,
+        _entity_id: "users",
+      },
+    });
+    assert.equal(cleanup_unregister._ok, true);
+  }
+
   const recent_meal_entity = {
     _id: "recent-meal",
     _schema: {
@@ -27080,6 +31576,942 @@ try {
 
   const server_xvm = new ServerXVMModule({ _work_folder: entity_sync_work_folder });
   await _x.loadModuleAsync(server_xvm);
+  if (!((_x as any).getModule?.("flow"))) {
+    await _x.loadModuleAsync(new FlowManagerModule());
+  }
+
+  const scoped_xvm_env = "scope-xvm";
+  const scoped_xvm_app_a = "scoped-xvm-app-a";
+  const scoped_xvm_app_b = "scoped-xvm-app-b";
+  const scoped_xvm_users_app_a = {
+    _id: "users",
+    _storage: {
+      _provider: "xdb",
+      _scope: "app",
+    },
+    _schema: {
+      username: {
+        _type: "String",
+        _index: {
+          _unique: true,
+        },
+      },
+      avatar: {
+        _type: "File",
+      },
+      bio: {
+        _type: "String",
+        _embed: true,
+      },
+      app_a_only: {
+        _type: "String",
+      },
+    },
+  };
+  const scoped_xvm_users_app_b = {
+    _id: "users",
+    _storage: {
+      _provider: "xdb",
+      _scope: "app",
+    },
+    _schema: {
+      username: {
+        _type: "String",
+        _index: {
+          _unique: true,
+        },
+      },
+      avatar: {
+        _type: "File",
+      },
+      bio: {
+        _type: "String",
+        _embed: true,
+      },
+      app_b_only: {
+        _type: "String",
+      },
+    },
+  };
+
+  for (const app_id of [scoped_xvm_app_a, scoped_xvm_app_b]) {
+    const create_scoped_app_res = await _x.execute({
+      _module: "server-xvm",
+      _op: "create_app",
+      _params: {
+        _app_id: app_id,
+        _env: scoped_xvm_env,
+      },
+    });
+    assert.equal(create_scoped_app_res._ok, true);
+  }
+
+  const scoped_xvm_app_a_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity: scoped_xvm_users_app_a,
+    },
+  });
+  const scoped_xvm_app_b_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity: scoped_xvm_users_app_b,
+    },
+  });
+  assert.equal(scoped_xvm_app_a_entity_res._ok, true);
+  assert.equal(scoped_xvm_app_b_entity_res._ok, true);
+
+  const scoped_xvm_create_user_flow = {
+    _id: "create-user",
+    _steps: [
+      {
+        _id: "add-user",
+        _command: {
+          _module: "entity-manager",
+          _op: "add",
+          _params: {
+            _app_id: scoped_xvm_app_a,
+            _env: scoped_xvm_env,
+            _entity: "users",
+            _data: {
+              username: "$event.username",
+              avatar: "$event.avatar",
+              bio: "$event.bio",
+              app_a_only: "$event.app_a_only",
+            },
+          },
+        },
+      },
+    ],
+  };
+  const scoped_xvm_flow_set_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_flow",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _flow: scoped_xvm_create_user_flow,
+    },
+  });
+  assert.equal(scoped_xvm_flow_set_res._ok, true);
+
+  const scoped_xvm_flow_run_res = await _x.execute({
+    _module: "flow",
+    _op: "run",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _flow_id: "create-user",
+      _event_payload: {
+        username: "shared-user",
+        avatar: {
+          _file_name: "app-a-avatar.txt",
+          _content: "app-a avatar",
+        },
+        bio: "Ada scoped app A",
+        app_a_only: "only-a",
+      },
+    },
+  });
+  assert.equal(scoped_xvm_flow_run_res._ok, true);
+  assert.equal(
+    scoped_xvm_flow_run_res._result._flow._last._result._record.username,
+    "shared-user",
+  );
+  assert.equal(scoped_xvm_flow_run_res._result._flow._last._result._physical_entity_name, undefined);
+
+  const scoped_xvm_app_b_add_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _data: {
+        username: "shared-user",
+        avatar: {
+          _file_name: "app-b-avatar.txt",
+          _content: "app-b avatar",
+        },
+        bio: "Grace scoped app B",
+        app_b_only: "only-b",
+      },
+    },
+  });
+  assert.equal(scoped_xvm_app_b_add_res._ok, true);
+  assert.equal(scoped_xvm_app_b_add_res._result._record.username, "shared-user");
+  assert.equal(scoped_xvm_app_b_add_res._result._physical_entity_name, undefined);
+
+  const scoped_xvm_app_a_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  const scoped_xvm_app_b_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  assert.equal(scoped_xvm_app_a_diagnostic._ok, true);
+  assert.equal(scoped_xvm_app_b_diagnostic._ok, true);
+  assert.equal(
+    scoped_xvm_app_a_diagnostic._result._diagnostic._physical_identity,
+    `${scoped_xvm_env}::${scoped_xvm_app_a}::users`,
+  );
+  assert.equal(
+    scoped_xvm_app_b_diagnostic._result._diagnostic._physical_identity,
+    `${scoped_xvm_env}::${scoped_xvm_app_b}::users`,
+  );
+  assert.notEqual(
+    scoped_xvm_app_a_diagnostic._result._diagnostic._physical_entity_name,
+    scoped_xvm_app_b_diagnostic._result._diagnostic._physical_entity_name,
+  );
+
+  const scoped_xvm_app_a_physical =
+    scoped_xvm_app_a_diagnostic._result._diagnostic._physical_entity_name;
+  const scoped_xvm_app_b_physical =
+    scoped_xvm_app_b_diagnostic._result._diagnostic._physical_entity_name;
+  const scoped_xvm_app_a_entity_dir =
+    path.join(entity_sync_work_folder, "xdb", "entities", scoped_xvm_app_a_physical);
+  const scoped_xvm_app_b_entity_dir =
+    path.join(entity_sync_work_folder, "xdb", "entities", scoped_xvm_app_b_physical);
+
+  const scoped_xvm_app_a_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  const scoped_xvm_app_b_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(scoped_xvm_app_a_records._ok, true);
+  assert.equal(scoped_xvm_app_b_records._ok, true);
+  assert.equal(scoped_xvm_app_a_records._result._records._data.length, 1);
+  assert.equal(scoped_xvm_app_b_records._result._records._data.length, 1);
+  assert.equal(scoped_xvm_app_a_records._result._records._data[0].app_a_only, "only-a");
+  assert.equal(scoped_xvm_app_a_records._result._records._data[0].app_b_only, undefined);
+  assert.equal(scoped_xvm_app_b_records._result._records._data[0].app_b_only, "only-b");
+  assert.equal(scoped_xvm_app_b_records._result._records._data[0].app_a_only, undefined);
+  assert.equal(scoped_xvm_app_a_records._result._records._meta._name, "users");
+  assert.equal(scoped_xvm_app_b_records._result._records._meta._name, "users");
+
+  const scoped_xvm_app_a_record =
+    scoped_xvm_app_a_records._result._records._data[0];
+  const scoped_xvm_app_b_record =
+    scoped_xvm_app_b_records._result._records._data[0];
+
+  const scoped_xvm_app_a_schema = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_a_entity_dir, "_schema.json"), "utf-8"),
+  );
+  const scoped_xvm_app_b_schema = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_b_entity_dir, "_schema.json"), "utf-8"),
+  );
+  assert.equal(scoped_xvm_app_a_schema.app_a_only._type, "String");
+  assert.equal(scoped_xvm_app_a_schema.app_b_only, undefined);
+  assert.equal(scoped_xvm_app_b_schema.app_b_only._type, "String");
+  assert.equal(scoped_xvm_app_b_schema.app_a_only, undefined);
+
+  const scoped_xvm_app_a_indices = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_a_entity_dir, "_indices.json"), "utf-8"),
+  );
+  const scoped_xvm_app_b_indices = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_b_entity_dir, "_indices.json"), "utf-8"),
+  );
+  assert.equal(scoped_xvm_app_a_indices.username._data["shared-user"], scoped_xvm_app_a_record._id);
+  assert.equal(scoped_xvm_app_b_indices.username._data["shared-user"], scoped_xvm_app_b_record._id);
+
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_files", `${scoped_xvm_app_a_record.avatar}.json`));
+  await access(path.join(scoped_xvm_app_b_entity_dir, "_files", `${scoped_xvm_app_b_record.avatar}.json`));
+  await assert.rejects(
+    access(path.join(scoped_xvm_app_b_entity_dir, "_files", `${scoped_xvm_app_a_record.avatar}.json`)),
+  );
+  await assert.rejects(
+    access(path.join(scoped_xvm_app_a_entity_dir, "_files", `${scoped_xvm_app_b_record.avatar}.json`)),
+  );
+
+  const scoped_xvm_app_a_vector_index = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_a_entity_dir, "_entity_vectors.json"), "utf-8"),
+  );
+  const scoped_xvm_app_b_vector_index = JSON.parse(
+    await readFile(path.join(scoped_xvm_app_b_entity_dir, "_entity_vectors.json"), "utf-8"),
+  );
+  const scoped_xvm_app_a_bio_vector_id =
+    scoped_xvm_app_a_vector_index[scoped_xvm_app_a_record._id].bio[0];
+  const scoped_xvm_app_b_bio_vector_id =
+    scoped_xvm_app_b_vector_index[scoped_xvm_app_b_record._id].bio[0];
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_vectors", `${scoped_xvm_app_a_bio_vector_id}.json`));
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_vectors", `${scoped_xvm_app_a_bio_vector_id}.data`));
+  await access(path.join(scoped_xvm_app_b_entity_dir, "_vectors", `${scoped_xvm_app_b_bio_vector_id}.json`));
+  await access(path.join(scoped_xvm_app_b_entity_dir, "_vectors", `${scoped_xvm_app_b_bio_vector_id}.data`));
+  await assert.rejects(
+    access(path.join(scoped_xvm_app_b_entity_dir, "_vectors", `${scoped_xvm_app_a_bio_vector_id}.json`)),
+  );
+  await assert.rejects(
+    access(path.join(scoped_xvm_app_a_entity_dir, "_vectors", `${scoped_xvm_app_b_bio_vector_id}.json`)),
+  );
+
+  const scoped_xvm_app_a_runtime_entity = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_entity",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  const scoped_xvm_app_b_runtime_entity = await _x.execute({
+    _module: "entity-manager",
+    _op: "get_entity",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  assert.equal(scoped_xvm_app_a_runtime_entity._ok, true);
+  assert.equal(scoped_xvm_app_b_runtime_entity._ok, true);
+  await (scoped_xvm_app_a_runtime_entity._result.entity as any)._xdb_temp.appendTemp(
+    "add",
+    "app-a-temp",
+    { _value: "app-a-temp" },
+  );
+  await (scoped_xvm_app_b_runtime_entity._result.entity as any)._xdb_temp.appendTemp(
+    "add",
+    "app-b-temp",
+    { _value: "app-b-temp" },
+  );
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_temp", "app-a-temp.json"));
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_temp", "_temp_csv.csv"));
+  await access(path.join(scoped_xvm_app_b_entity_dir, "_temp", "app-b-temp.json"));
+  await access(path.join(scoped_xvm_app_b_entity_dir, "_temp", "_temp_csv.csv"));
+  await assert.rejects(access(path.join(scoped_xvm_app_b_entity_dir, "_temp", "app-a-temp.json")));
+  await assert.rejects(access(path.join(scoped_xvm_app_a_entity_dir, "_temp", "app-b-temp.json")));
+
+  const scoped_xvm_app_a_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  const scoped_xvm_app_b_unregister = await _x.execute({
+    _module: "entity-manager",
+    _op: "unregister",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  assert.equal(scoped_xvm_app_a_unregister._ok, true);
+  assert.equal(scoped_xvm_app_b_unregister._ok, true);
+
+  const scoped_xvm_boot_reload = new ServerXVMModule({ _work_folder: entity_sync_work_folder });
+  const scoped_xvm_boot_reload_res = await scoped_xvm_boot_reload.init_on_boot();
+  assert.ok(scoped_xvm_boot_reload_res._entities_loaded >= 2);
+
+  const scoped_xvm_app_a_boot_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  const scoped_xvm_app_b_boot_diagnostic = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-diagnostics",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  assert.equal(scoped_xvm_app_a_boot_diagnostic._result._diagnostic._physical_entity_name, scoped_xvm_app_a_physical);
+  assert.equal(scoped_xvm_app_b_boot_diagnostic._result._diagnostic._physical_entity_name, scoped_xvm_app_b_physical);
+
+  const scoped_xvm_app_a_records_after_boot = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  const scoped_xvm_app_b_records_after_boot = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: scoped_xvm_app_b,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(scoped_xvm_app_a_records_after_boot._result._records._data.length, 1);
+  assert.equal(scoped_xvm_app_b_records_after_boot._result._records._data.length, 1);
+  assert.equal(scoped_xvm_app_a_records_after_boot._result._records._data[0].app_a_only, "only-a");
+  assert.equal(scoped_xvm_app_b_records_after_boot._result._records._data[0].app_b_only, "only-b");
+
+  const scoped_xvm_delete_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "delete_entity",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity_id: "users",
+    },
+  });
+  assert.equal(scoped_xvm_delete_entity_res._ok, true);
+  await access(path.join(scoped_xvm_app_a_entity_dir, "_data.json"));
+
+  const scoped_xvm_restore_entity_res = await _x.execute({
+    _module: "server-xvm",
+    _op: "set_entity",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity: scoped_xvm_users_app_a,
+    },
+  });
+  assert.equal(scoped_xvm_restore_entity_res._ok, true);
+  const scoped_xvm_app_a_records_after_restore = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: scoped_xvm_app_a,
+      _env: scoped_xvm_env,
+      _entity: "users",
+      _filter: {},
+    },
+  });
+  assert.equal(scoped_xvm_app_a_records_after_restore._ok, true);
+  assert.equal(scoped_xvm_app_a_records_after_restore._result._records._data.length, 1);
+  assert.equal(scoped_xvm_app_a_records_after_restore._result._records._data[0].app_a_only, "only-a");
+
+  const recent_meal_global_records_after_scope = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "entity-sync-app",
+      _env: "test",
+      _entity: "recent-meal",
+      _filter: {},
+    },
+  });
+  assert.equal(recent_meal_global_records_after_scope._ok, true);
+  assert.equal(recent_meal_global_records_after_scope._result._records._data.length, 12);
+
+  const create_legacy_global_entity = async (
+    entity_id: string,
+    schema: Record<string, any>,
+    records: any[],
+  ) => {
+    const entity = XDB.create({
+      _type: "xdb-entity",
+      _id: entity_id,
+      _name: entity_id,
+      _schema: schema,
+    }) as any;
+
+    await entity.waitUntilLoaded();
+
+    for (const record of records) {
+      await entity.add(record);
+    }
+
+    return entity;
+  };
+
+  const create_migration_target_entity = async (
+    app_id: string,
+    env: string,
+    entity_id: string,
+    schema: Record<string, any>,
+  ) => {
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "create_app",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+        },
+      }))?._ok,
+      true,
+    );
+
+    assert.equal(
+      (await _x.execute({
+        _module: "server-xvm",
+        _op: "set_entity",
+        _params: {
+          _app_id: app_id,
+          _env: env,
+          _entity: {
+            _id: entity_id,
+            _storage: {
+              _provider: "xdb",
+              _scope: "app",
+            },
+            _schema: schema,
+          },
+        },
+      }))?._ok,
+      true,
+    );
+  };
+
+  const migration_schema = {
+    username: {
+      _type: "String",
+      _index: {
+        _unique: true,
+      },
+    },
+    display_name: {
+      _type: "String",
+    },
+  };
+
+  await create_legacy_global_entity(
+    "legacy-copy-users",
+    migration_schema,
+    [
+      {
+        username: "ada",
+        display_name: "Ada",
+      },
+      {
+        username: "grace",
+        display_name: "Grace",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-copy-app",
+    "migration-test",
+    "legacy-copy-users",
+    migration_schema,
+  );
+
+  const migration_copy_dry_run = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migration-dry-run",
+    _params: {
+      _entity_id: "legacy-copy-users",
+      _target_app_id: "migration-copy-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-copy-users",
+    },
+  });
+  assert.equal(migration_copy_dry_run._ok, true);
+  assert.equal(migration_copy_dry_run._result._migration._status, "ready");
+  assert.equal(migration_copy_dry_run._result._migration._global._record_count, 2);
+  assert.equal(migration_copy_dry_run._result._migration._global._schema.username._type, "String");
+  assert.equal(migration_copy_dry_run._result._migration._schema_differences._has_conflicts, false);
+  assert.equal(migration_copy_dry_run._result._migration._uniqueness_conflicts.length, 0);
+  assert.equal(
+    migration_copy_dry_run._result._migration._target._physical_identity,
+    "migration-test::migration-copy-app::legacy-copy-users",
+  );
+
+  const migration_copy_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "copy",
+      _entity_id: "legacy-copy-users",
+      _target_app_id: "migration-copy-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-copy-users",
+    },
+  });
+  assert.equal(migration_copy_res._ok, true);
+  assert.equal(migration_copy_res._result._migration._status, "copied");
+  assert.equal(migration_copy_res._result._migration._verify._source_count, 2);
+  assert.equal(migration_copy_res._result._migration._verify._target_count, 2);
+  assert.equal(XDB._engine._xdb_data._entities.includes("legacy-copy-users"), true);
+
+  const migration_copy_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "migration-copy-app",
+      _env: "migration-test",
+      _entity: "legacy-copy-users",
+      _filter: {},
+    },
+  });
+  assert.equal(migration_copy_records._ok, true);
+  assert.deepEqual(
+    migration_copy_records._result._records._data.map((record: any) => record.username).sort(),
+    ["ada", "grace"],
+  );
+
+  const migration_diagnostics = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migration-diagnostics",
+    _params: {
+      _entity_id: "legacy-copy-users",
+    },
+  });
+  assert.equal(migration_diagnostics._ok, true);
+  assert.equal(
+    migration_diagnostics._result._migration_diagnostics._global_entities.some(
+      (entity: any) =>
+        entity._physical_entity_name === "legacy-copy-users" &&
+        entity._record_count === 2,
+    ),
+    true,
+  );
+  assert.equal(
+    migration_diagnostics._result._migration_diagnostics._app_scoped_entities.some(
+      (entity: any) =>
+        entity._logical_entity_id === "legacy-copy-users" &&
+        entity._record_count === 2,
+    ),
+    true,
+  );
+  assert.equal(
+    migration_diagnostics._result._migration_diagnostics._migration_status.some(
+      (status: any) =>
+        status._logical_entity_id === "legacy-copy-users" &&
+        status._status === "already_migrated",
+    ),
+    true,
+  );
+
+  const migration_copy_retry = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "copy",
+      _entity_id: "legacy-copy-users",
+      _target_app_id: "migration-copy-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-copy-users",
+    },
+  });
+  assert.equal(migration_copy_retry._ok, true);
+  assert.equal(migration_copy_retry._result._migration._status, "already_migrated");
+  assert.equal(migration_copy_retry._result._migration._executed, false);
+
+  await create_legacy_global_entity(
+    "legacy-move-users",
+    migration_schema,
+    [
+      {
+        username: "linus",
+        display_name: "Linus",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-move-app",
+    "migration-test",
+    "legacy-move-users",
+    migration_schema,
+  );
+
+  const migration_move_res = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "move",
+      _entity_id: "legacy-move-users",
+      _target_app_id: "migration-move-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-move-users",
+    },
+  });
+  assert.equal(migration_move_res._ok, true);
+  assert.equal(migration_move_res._result._migration._status, "moved");
+  assert.equal(migration_move_res._result._migration._backup._created, true);
+  assert.equal(
+    await XDB._engine.hasObject(migration_move_res._result._migration._backup._id),
+    true,
+  );
+  assert.equal(XDB._engine._xdb_data._entities.includes("legacy-move-users"), false);
+  await assert.rejects(
+    access(path.join(entity_sync_work_folder, "xdb", "entities", "legacy-move-users", "_data.json")),
+  );
+
+  const migration_move_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "migration-move-app",
+      _env: "migration-test",
+      _entity: "legacy-move-users",
+      _filter: {},
+    },
+  });
+  assert.equal(migration_move_records._ok, true);
+  assert.equal(migration_move_records._result._records._data.length, 1);
+  assert.equal(migration_move_records._result._records._data[0].username, "linus");
+
+  const migration_move_retry = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "move",
+      _entity_id: "legacy-move-users",
+      _target_app_id: "migration-move-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-move-users",
+    },
+  });
+  assert.equal(migration_move_retry._ok, true);
+  assert.equal(migration_move_retry._result._migration._status, "already_migrated");
+  assert.equal(migration_move_retry._result._migration._source_missing_after_move, true);
+  assert.equal(migration_move_retry._result._migration._executed, false);
+
+  await create_legacy_global_entity(
+    "legacy-ambiguous-users",
+    migration_schema,
+    [
+      {
+        username: "ambiguous",
+        display_name: "Ambiguous",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-ambiguous-app-a",
+    "migration-test",
+    "legacy-ambiguous-users",
+    migration_schema,
+  );
+  await create_migration_target_entity(
+    "migration-ambiguous-app-b",
+    "migration-test",
+    "legacy-ambiguous-users",
+    migration_schema,
+  );
+  const migration_ambiguous_dry_run = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migration-dry-run",
+    _params: {
+      _entity_id: "legacy-ambiguous-users",
+    },
+  });
+  assert.equal(migration_ambiguous_dry_run._ok, true);
+  assert.equal(migration_ambiguous_dry_run._result._migration._ambiguous_ownership, true);
+  assert.deepEqual(
+    migration_ambiguous_dry_run._result._migration._required_selection,
+    ["_target_app_id", "_target_env", "_target_entity_id"],
+  );
+  assert.ok(migration_ambiguous_dry_run._result._migration._conflicts.includes("ambiguous_ownership"));
+
+  const migration_ambiguous_copy = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "copy",
+      _entity_id: "legacy-ambiguous-users",
+    },
+  });
+  assert.equal(migration_ambiguous_copy._ok, true);
+  assert.equal(migration_ambiguous_copy._result._migration._status, "blocked");
+  assert.equal(migration_ambiguous_copy._result._migration._executed, false);
+
+  await create_legacy_global_entity(
+    "legacy-schema-conflict-users",
+    migration_schema,
+    [
+      {
+        username: "schema",
+        display_name: "Schema",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-schema-conflict-app",
+    "migration-test",
+    "legacy-schema-conflict-users",
+    {
+      username: {
+        _type: "Number",
+        _index: {
+          _unique: true,
+        },
+      },
+      display_name: {
+        _type: "String",
+      },
+    },
+  );
+  const migration_schema_conflict = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migration-dry-run",
+    _params: {
+      _entity_id: "legacy-schema-conflict-users",
+      _target_app_id: "migration-schema-conflict-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-schema-conflict-users",
+    },
+  });
+  assert.equal(migration_schema_conflict._ok, true);
+  assert.equal(migration_schema_conflict._result._migration._status, "blocked");
+  assert.ok(migration_schema_conflict._result._migration._conflicts.includes("schema_conflict"));
+  assert.equal(
+    migration_schema_conflict._result._migration._schema_differences._conflicts[0]._field,
+    "username",
+  );
+
+  await create_legacy_global_entity(
+    "legacy-unique-conflict-users",
+    migration_schema,
+    [
+      {
+        username: "taken",
+        display_name: "Source Taken",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-unique-conflict-app",
+    "migration-test",
+    "legacy-unique-conflict-users",
+    migration_schema,
+  );
+  const migration_unique_target_seed = await _x.execute({
+    _module: "entity-manager",
+    _op: "add",
+    _params: {
+      _app_id: "migration-unique-conflict-app",
+      _env: "migration-test",
+      _entity: "legacy-unique-conflict-users",
+      _data: {
+        username: "taken",
+        display_name: "Target Taken",
+      },
+    },
+  });
+  assert.equal(migration_unique_target_seed._ok, true);
+
+  const migration_unique_conflict = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migration-dry-run",
+    _params: {
+      _entity_id: "legacy-unique-conflict-users",
+      _target_app_id: "migration-unique-conflict-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-unique-conflict-users",
+    },
+  });
+  assert.equal(migration_unique_conflict._ok, true);
+  assert.equal(migration_unique_conflict._result._migration._status, "blocked");
+  assert.ok(migration_unique_conflict._result._migration._conflicts.includes("uniqueness_conflict"));
+  assert.equal(
+    migration_unique_conflict._result._migration._uniqueness_conflicts[0]._field,
+    "username",
+  );
+
+  await create_legacy_global_entity(
+    "legacy-partial-users",
+    migration_schema,
+    [
+      {
+        _id: "legacy-partial-record",
+        username: "partial",
+        display_name: "Partial",
+      },
+    ],
+  );
+  await create_migration_target_entity(
+    "migration-partial-app",
+    "migration-test",
+    "legacy-partial-users",
+    migration_schema,
+  );
+  const migration_partial_failure = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "move",
+      _entity_id: "legacy-partial-users",
+      _target_app_id: "migration-partial-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-partial-users",
+      _test_fail_after_target_write: true,
+    },
+  });
+  assert.equal(migration_partial_failure._ok, true);
+  assert.equal(migration_partial_failure._result._migration._status, "failed");
+  assert.equal(migration_partial_failure._result._migration._backup._created, true);
+  assert.equal(migration_partial_failure._result._migration._backup._strategy, "xdb-object-store");
+  assert.equal(migration_partial_failure._result._migration._rollback._attempted, true);
+  assert.equal(migration_partial_failure._result._migration._rollback._source_restored, true);
+  assert.equal(migration_partial_failure._result._migration._rollback._target_removed, true);
+  assert.equal(migration_partial_failure._result._migration._rollback._ok, true);
+  assert.equal(
+    await XDB._engine.hasObject(migration_partial_failure._result._migration._backup._id),
+    true,
+  );
+  assert.equal(XDB._engine._xdb_data._entities.includes("legacy-partial-users"), true);
+
+  const migration_partial_retry = await _x.execute({
+    _module: "entity-manager",
+    _op: "storage-migrate",
+    _params: {
+      _mode: "move",
+      _entity_id: "legacy-partial-users",
+      _target_app_id: "migration-partial-app",
+      _target_env: "migration-test",
+      _target_entity_id: "legacy-partial-users",
+    },
+  });
+  assert.equal(migration_partial_retry._ok, true);
+  assert.equal(migration_partial_retry._result._migration._status, "moved");
+  assert.equal(migration_partial_retry._result._migration._executed, true);
+  assert.equal(XDB._engine._xdb_data._entities.includes("legacy-partial-users"), false);
+
+  const migration_partial_retry_records = await _x.execute({
+    _module: "entity-manager",
+    _op: "find",
+    _params: {
+      _app_id: "migration-partial-app",
+      _env: "migration-test",
+      _entity: "legacy-partial-users",
+      _filter: {},
+    },
+  });
+  assert.equal(migration_partial_retry_records._ok, true);
+  assert.equal(migration_partial_retry_records._result._records._data.length, 1);
+  assert.equal(migration_partial_retry_records._result._records._data[0].username, "partial");
 
   await _x.execute({
     _module: "server-xvm",
