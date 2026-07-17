@@ -1,5 +1,5 @@
 import { _x, _xlog, type XCommand } from "@xpell/core";
-import { _xu } from "../../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import { RunArchiveManager } from "../Archive/RunArchiveManager.js";
 import type { XVibeJsonObject } from "../VibeOutputParser.js";
 

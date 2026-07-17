@@ -2,9 +2,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { XModule, type XCommand, _xlog, _x, XError, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
-import { _xem } from "../XEM/XEventManager.js";
-import { _xu } from "../XNUtils/XUtils.js";
-import { _xs } from "../XSettings/XSettings.js";
+import { _xem } from "@xpell/node-core";
+import { _xu } from "@xpell/node-core";
+import { _xs } from "@xpell/node-core";
 import { wsBroadcastScoped, wsSetScope } from "../Wormholes/wh.index.js";
 import {
   append_project_memory_achievement,

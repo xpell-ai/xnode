@@ -1,6 +1,6 @@
 import bcrypt from "bcryptjs";
 import { XError } from "@xpell/core";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import XDBObject from "../XDB/XDBObject.js";
 import type {
     EntityAggregationRequest,

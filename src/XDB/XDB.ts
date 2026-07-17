@@ -4,11 +4,11 @@
 // - cache remains optional
 
 import { XModule, type XCommand, _xlog ,type XpellSkill} from "@xpell/core";
-import { _xem } from "../XEM/XEventManager.js";
+import { _xem } from "@xpell/node-core";
 
 import { XDBEngine, type IXDBEmbeddingProvider, type IXDBVectorQueryProvider } from "./XDBEngine.js";
 import type { IXDBStorage } from "./IXDBStorage.js";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 
 import XDBEntity from "./XDBEntity.js";
 import XDBVector from "./XDBVector.js";

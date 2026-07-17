@@ -5,7 +5,7 @@ import { createHash } from "crypto";
 import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { XError } from "@xpell/core";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import XDB from "../XDB/XDB.js";
 import type {
     EntityAggregationRequest,

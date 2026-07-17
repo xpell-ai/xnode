@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { _x, _xlog, type XCommand } from "@xpell/core";
-import { _xu } from "../../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import {
   IntentMemoryStore,
   normalize_learned_intent_prompt,

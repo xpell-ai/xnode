@@ -1,6 +1,6 @@
 import { _x, _xlog, type XCommand } from "@xpell/core";
-import { _xem } from "../../XEM/XEventManager.js";
-import { _xu } from "../../XNUtils/XUtils.js";
+import { _xem } from "@xpell/node-core";
+import { _xu } from "@xpell/node-core";
 import { wsBroadcastScoped } from "../../Wormholes/wh.index.js";
 import { record_project_memory_achievement } from "../../XVM/ProjectMemoryAchievements.js";
 import type { XVibeJsonObject } from "../VibeOutputParser.js";

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { _xlog } from "@xpell/core";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import { VibeSelectionArtifactType, type VibeCapabilityNode, type VibeCapabilityNodeKind } from "./XVibeTypes.js";
 
 

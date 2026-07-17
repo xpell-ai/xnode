@@ -1,4 +1,4 @@
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 
 export type XVMProjectMemoryStage =
   | "planning"

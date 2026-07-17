@@ -5,6 +5,8 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import mongoose from "mongoose";
 import { _x, _xd, _xlog, XDataModule, XModule, XObject, XpellEngine } from "@xpell/core";
+import * as NodePackage from "./index.js";
+import * as NodeCorePackage from "@xpell/node-core";
 import { XModuleCreatorModule } from "./XGenerative/XModuleCreator/index.js";
 import { XAuthModule } from "./XAuth/index.js";
 import { XDB, XDBStorageFS } from "./XDB/index.js";
@@ -127,6 +129,79 @@ function test_entity_manager_server_command(command: any): any {
 function quote_sqlite_identifier_for_test(identifier: string): string {
   return `"${String(identifier).replace(/"/g, "\"\"")}"`;
 }
+
+async function run_node_core_compatibility_tests() {
+  assert.equal(NodePackage.XEventManager, NodeCorePackage.XEventManager);
+  assert.equal(NodePackage._xem, NodeCorePackage._xem);
+  assert.equal(_xem, NodeCorePackage._xem);
+  assert.equal(NodePackage.XSettings, NodeCorePackage.XSettings);
+  assert.equal(NodePackage.Settings, NodeCorePackage.XSettings);
+  assert.equal(NodePackage._xs, NodeCorePackage._xs);
+  assert.equal(NodePackage.XUtils, NodeCorePackage.XUtils);
+  assert.equal(NodePackage._xu, NodeCorePackage._xu);
+  assert.equal(_XSettings, NodeCorePackage._XSettings);
+
+  const event_name =
+    `node-core:compat:${Date.now()}`;
+  const event_payload = {
+    _ok: true,
+  };
+  let observed_payload: unknown;
+  const listener_id =
+    NodePackage._xem.on(event_name, (payload: unknown) => {
+      observed_payload = payload;
+    });
+  try {
+    await NodeCorePackage._xem.fire(event_name, event_payload);
+    assert.equal(observed_payload, event_payload);
+  } finally {
+    NodePackage._xem.remove(listener_id);
+  }
+
+  const work_folder =
+    await mkdtemp(path.join(tmpdir(), "xnode-core-settings-"));
+  const settings_file =
+    path.join(work_folder, "settings", "server-settings.json");
+  const settings =
+    new NodeCorePackage._XSettings();
+  const loaded_settings =
+    new NodeCorePackage._XSettings();
+  try {
+    settings.onSetup(work_folder);
+    settings.set("compat", {
+      _ok: true,
+    });
+    assert.deepEqual(
+      JSON.parse(await readFile(settings_file, "utf-8")).compat,
+      { _ok: true },
+    );
+    assert.equal(loaded_settings.load(settings_file), true);
+    assert.deepEqual(loaded_settings.get("compat"), {
+      _ok: true,
+    });
+  } finally {
+    settings.close();
+    loaded_settings.close();
+    await rm(work_folder, { recursive: true, force: true });
+  }
+
+  const encoded =
+    NodePackage._xu.encode("hello node core");
+  assert.equal(NodeCorePackage._xu.decode(encoded), "hello node core");
+  const utils_folder =
+    await mkdtemp(path.join(tmpdir(), "xnode-core-utils-"));
+  try {
+    const nested_folder =
+      path.join(utils_folder, "a", "b");
+    NodePackage._xu.checkFolders([nested_folder]);
+    assert.equal((await stat(nested_folder)).isDirectory(), true);
+  } finally {
+    await rm(utils_folder, { recursive: true, force: true });
+  }
+  assert.equal((NodePackage._xu as any).is_plain_object({ _ok: true }), true);
+}
+
+await run_node_core_compatibility_tests();
 
 function create_fake_xdbobject_connection_for_test(opts?: {
   _fail_model_creation?: boolean;

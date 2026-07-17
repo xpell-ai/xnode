@@ -12,7 +12,7 @@
  */
 
 import { _xlog, XResponse } from "@xpell/core";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 
 import type XDBEntity from "./XDBEntity.js";
 import type { IXDBStorage, XDBData, XDBEntityPersisted } from "./IXDBStorage.js";

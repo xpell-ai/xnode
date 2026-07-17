@@ -15,7 +15,7 @@ import fs from "fs";
 import crypto from "crypto";
 
 import {  _xlog } from "@xpell/core";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 const DEFAULT_CACHE_FOLDER = "./data/xdb/cache/";
 
 const JSON_EXT = ".json";

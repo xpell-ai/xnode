@@ -12,7 +12,7 @@
  * - Keep transport-agnostic (no ws/express imports).
  */
 
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import type { XResponseData } from "@xpell/core";
 
 import {

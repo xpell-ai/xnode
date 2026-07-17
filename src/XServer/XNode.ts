@@ -2,14 +2,14 @@
 import path from "path";
 import fs from "fs";
 import { _x, _xlog } from "@xpell/core";
-import { _xs } from "../XSettings/XSettings.js";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xs } from "@xpell/node-core";
+import { _xu } from "@xpell/node-core";
 import { XWebServer } from "./XWebServer.js";
 import type { XWebSettings } from "./XWebServer.js";
 import { PingModule } from "../modules/PingModule.js";
 import { ServerXVMModule } from "../XVM/ServerXVMModule.js";
 import { setXEventManager, } from "@xpell/core";
-import { _xem, XEventManager } from "../XEM/XEventManager.js";
+import { _xem, XEventManager } from "@xpell/node-core";
 import { XAI } from "../XAI/XAI.js";
 import FlowManagerModule from "../XFM/FlowManagerModule.js";
 import { XEntityManager } from "../XEntityManager/XEntityManager.js";

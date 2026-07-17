@@ -1,6 +1,6 @@
 import type { VibeKnowledgeSelection, VibeSkillDocument } from "./VibeKnowledgeSelector.js";
 import { _xlog } from "@xpell/core";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import type { VibeArtifactType, VibeRequestedArtifactType, XVibeRuntimePlan } from "./XVibeTypes.js";
 
 type XVibeJsonObject = {

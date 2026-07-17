@@ -1,8 +1,8 @@
 import { XModule, type XpellSkill, type XpellSkillCommand, type XCommand, _xlog } from "@xpell/core";
 import { XAIRegistry } from "./XAIRegistry.js";
 import { XAIProvider, type XAIInput } from "./XAIProvider.js";
-import { _xs } from "../XSettings/XSettings.js";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xs } from "@xpell/node-core";
+import { _xu } from "@xpell/node-core";
 
 function as_string(
   value: unknown,

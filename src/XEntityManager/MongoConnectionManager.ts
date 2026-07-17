@@ -1,7 +1,7 @@
 import mongoose from "mongoose";
 import type { Connection } from "mongoose";
 import { XError, _xlog } from "@xpell/core";
-import { _xs } from "../XSettings/XSettings.js";
+import { _xs } from "@xpell/node-core";
 
 export type MongoConnectionName = string;
 

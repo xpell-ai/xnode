@@ -1,5 +1,5 @@
 import {  XObject, _xlog, type XObjectData } from "@xpell/core";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import { getXdbEngine } from "./xdbReady.js";
 
 export type XDBNewFileIndex = {

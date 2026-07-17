@@ -15,8 +15,8 @@ import cors from "cors";
 import enforce from "express-sslify";
 
 import { _x, _xlog } from "@xpell/core";
-import { _xu } from "../XNUtils/XUtils.js";
-import { _xs } from "../XSettings/XSettings.js";
+import { _xu } from "@xpell/node-core";
+import { _xs } from "@xpell/node-core";
 import { fileURLToPath } from "url";
 import {
   createWormholesWSServer,

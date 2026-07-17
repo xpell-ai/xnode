@@ -1,7 +1,7 @@
 
 
 import {  _xlog } from "@xpell/core"
-import { _xu } from "../XNUtils/XUtils.js"
+import { _xu } from "@xpell/node-core"
 import  fetch, { Blob, FormData } from 'node-fetch'
 import { readFile } from "node:fs/promises";
 

@@ -10,8 +10,8 @@ import {
   type XpellSkill
 } from "@xpell/core";
 
-import { _xem } from "../XEM/XEventManager.js";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xem } from "@xpell/node-core";
+import { _xu } from "@xpell/node-core";
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */

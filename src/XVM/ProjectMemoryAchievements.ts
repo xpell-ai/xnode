@@ -1,5 +1,5 @@
 import { _x, _xlog } from "@xpell/core";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 
 export type XVMProjectMemoryAchievementId =
   | "first-project-memory-focus"

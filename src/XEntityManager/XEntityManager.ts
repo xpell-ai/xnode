@@ -9,7 +9,7 @@ import {
 
 import XDB from "../XDB/XDB.js";
 import type { XDBEntityPersisted } from "../XDB/IXDBStorage.js";
-import { _xem } from "../XEM/XEventManager.js";
+import { _xem } from "@xpell/node-core";
 import { wsBroadcastScoped } from "../Wormholes/wh.index.js";
 import type {
     EntityAggregationRequest,

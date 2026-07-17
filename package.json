@@ -46,6 +46,7 @@
     "node": ">=14.0.0"
   },
   "dependencies": {
+    "@xpell/node-core": "workspace:*",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.10.1",
     "cors": "^2.8.6",

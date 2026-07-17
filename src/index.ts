@@ -83,11 +83,17 @@ export {
   XResponse, XResponseOK, XResponseError
 } from "@xpell/core";
 
-export {XUtils,_xu } from "./XNUtils/XUtils.js"
-
-export { XEventManager, XEventManager as _xem, type XEventListenerOptions, _XEventManager } from "./XEM/XEventManager.js";
-// Settings module for server properties
-export { XSettings as Settings,_xs,XSettings } from "./XSettings/XSettings.js";
+export {
+  XUtils,
+  _xu,
+  XEventManager,
+  XEventManager as _xem,
+  type XEventListenerOptions,
+  _XEventManager,
+  XSettings as Settings,
+  _xs,
+  XSettings,
+} from "@xpell/node-core";
 
 export { XWebServer } from "./XServer/XWebServer.js";
 export { XNode } from "./XServer/XNode.js";

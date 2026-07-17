@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { _x, _xlog, XCommand, XModule, type XpellSkill, type XpellSkillCommand } from "@xpell/core";
-import { _xem } from "../XEM/XEventManager.js";
+import { _xem } from "@xpell/node-core";
 import { VibeKnowledgeSelector, type VibeKnowledgeSelection } from "./VibeKnowledgeSelector.js";
 import { wsBroadcastScoped } from "../Wormholes/wh.index.js";
 
@@ -21,7 +21,7 @@ import {
   type VibeParsedOutput,
   type XVibeViewArtifact,
 } from "./VibeOutputParser.js";
-import { _xu } from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import { VibePromptBuilder } from "./VibePromptBuilder.js";
 import { ensure_view_ids, VibeViewBuilder } from "./VibeViewBuilder.js";
 import {

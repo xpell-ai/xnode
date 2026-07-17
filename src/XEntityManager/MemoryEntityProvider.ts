@@ -1,5 +1,5 @@
 import bcrypt from "bcryptjs";
-import _xu from "../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import type {
     EntityAggregationRequest,
     EntityAggregationResult,

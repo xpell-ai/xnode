@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { _x, _xlog } from "@xpell/core";
-import { _xu } from "../../XNUtils/XUtils.js";
+import { _xu } from "@xpell/node-core";
 import type { VibeKnowledgeSelection } from "../VibeKnowledgeSelector.js";
 import type { XVibeJsonObject } from "../VibeOutputParser.js";
 import type { XVibeRuntimePlan } from "../XVibeTypes.js";
