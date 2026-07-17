@@ -20,10 +20,11 @@ import { XAuthModule } from "../XAuth/index.js";
 import { MongoConnections } from "../XEntityManager/MongoConnectionManager.js";
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
-import { XVibeModule } from "../XVIBE/XVibeModule.js";
+import { XVibeModule } from "@xpell/vibe";
 import { XModuleCreatorModule } from "../XGenerative/index.js";
 import { XMutatorModule } from "../XMutator/XMutatorModule.js";
 import { XStudioModule } from "../XStudio/index.js";
+import { WormholesModule } from "../Wormholes/wh.index.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -165,6 +166,7 @@ export class XNode {
         });
         await _x.loadModuleAsync(XDB);
         await _x.loadModuleAsync(new PingModule());
+        await _x.loadModuleAsync(new WormholesModule());
         await _x.loadModuleAsync(new XAuthModule());
         await _x.loadModuleAsync(XAI);
 

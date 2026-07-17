@@ -1,9 +1,11 @@
 import assert from "assert";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import http from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Database from "better-sqlite3";
 import mongoose from "mongoose";
+import WebSocket, { WebSocketServer } from "ws";
 import { _x, _xd, _xlog, XDataModule, XModule, XObject, XpellEngine } from "@xpell/core";
 import * as NodePackage from "./index.js";
 import * as NodeCorePackage from "@xpell/node-core";
@@ -77,6 +79,12 @@ import { VibeBehaviorPlanner } from "./XVIBE/VibeBehaviorPlanner.js";
 import { XMutator } from "./XMutator/XMutator.js";
 import { _XSettings } from "./XSettings/XSettings.js";
 import { makeRes } from "./Wormholes/wh.codec.js";
+import {
+  createWormholesWSServer,
+  WormholesModule,
+  wsGetConnections,
+  wsSetScope,
+} from "./Wormholes/wh.index.js";
 
 type ValidateGeneratedArtifact = (input: {
   _artifact_type: "view" | "command";
@@ -202,6 +210,218 @@ async function run_node_core_compatibility_tests() {
 }
 
 await run_node_core_compatibility_tests();
+
+async function listen_on_ephemeral_port(server: http.Server): Promise<number> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return address.port;
+}
+
+async function close_http_server_for_test(server: http.Server): Promise<void> {
+  if (!server.listening) return;
+  await new Promise<void>((resolve, reject) => {
+    server.close((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+async function close_wss_for_test(wss: WebSocketServer): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    wss.close((err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+async function wait_for_test_condition<T>(
+  read: () => T | undefined,
+  label: string,
+  timeout_ms = 3000,
+): Promise<T> {
+  const started = Date.now();
+  while (Date.now() - started < timeout_ms) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function wait_for_ws_open_for_test(ws: WebSocket): Promise<void> {
+  if (ws.readyState === WebSocket.OPEN) return;
+  await new Promise<void>((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.once("error", reject);
+  });
+}
+
+async function close_ws_for_test(ws: WebSocket): Promise<void> {
+  if (ws.readyState === WebSocket.CLOSED) return;
+  await new Promise<void>((resolve) => {
+    ws.once("close", () => resolve());
+    ws.close();
+  });
+}
+
+async function wait_for_wormholes_evt_for_test(
+  ws: WebSocket,
+  event_name: string,
+): Promise<any> {
+  return await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      ws.off("message", on_message);
+      reject(new Error(`Timed out waiting for Wormholes EVT ${event_name}`));
+    }, 3000);
+
+    const on_message = (data: WebSocket.RawData) => {
+      const raw = typeof data === "string" ? data : data.toString("utf8");
+      const env = JSON.parse(raw);
+      if (env?._kind !== "EVT" || env?._payload?._name !== event_name) return;
+      clearTimeout(timeout);
+      ws.off("message", on_message);
+      resolve(env._payload);
+    };
+
+    ws.on("message", on_message);
+  });
+}
+
+async function run_wormholes_xmodule_facade_tests() {
+  assert.equal(NodePackage.WormholesModule, WormholesModule);
+
+  if (!_x.getModule("wormholes")) {
+    await _x.loadModuleAsync(new WormholesModule());
+  }
+
+  const missing_app_res = await _x.execute({
+    _module: "wormholes",
+    _op: "broadcast",
+    _params: {
+      _event: "test:event",
+      _payload: {},
+    },
+  });
+  assert.equal(missing_app_res._ok, false);
+  assert.equal(missing_app_res._result._code, "E_WH_INVALID_SCOPE");
+
+  const missing_event_res = await _x.execute({
+    _module: "wormholes",
+    _op: "broadcast",
+    _params: {
+      _app_id: "wormholes-test-app",
+      _payload: {},
+    },
+  });
+  assert.equal(missing_event_res._ok, false);
+  assert.equal(missing_event_res._result._code, "E_WH_INVALID_EVENT");
+
+  const zero_subscribers_res = await _x.execute({
+    _module: "wormholes",
+    _op: "broadcast",
+    _params: {
+      _app_id: "wormholes-zero-subscribers",
+      _env: "test",
+      _event: "wormholes:test:zero",
+      _payload: {
+        _ok: true,
+      },
+    },
+  });
+  assert.equal(zero_subscribers_res._ok, true);
+  assert.equal(zero_subscribers_res._result._delivered, 0);
+  assert.equal(zero_subscribers_res._result._app_id, "wormholes-zero-subscribers");
+  assert.equal(zero_subscribers_res._result._env, "test");
+  assert.equal(zero_subscribers_res._result._event, "wormholes:test:zero");
+
+  const server = http.createServer();
+  const port = await listen_on_ephemeral_port(server);
+  const wss = createWormholesWSServer(server, {
+    _path: "/wh/v2",
+    _require_auth: false,
+    _log_connect: false,
+  });
+  const known_wids = new Set(
+    wsGetConnections()
+      .map((conn) => conn._ctx._meta?._wid)
+      .filter((wid): wid is string => typeof wid === "string"),
+  );
+  const client = new WebSocket(`ws://127.0.0.1:${port}/wh/v2`);
+
+  try {
+    await wait_for_ws_open_for_test(client);
+    const conn = await wait_for_test_condition(
+      () =>
+        wsGetConnections().find((candidate) => {
+          const wid = candidate._ctx._meta?._wid;
+          return typeof wid === "string" && !known_wids.has(wid);
+        }),
+      "new Wormholes connection",
+    );
+    const wid = conn._ctx._meta?._wid;
+    assert.equal(typeof wid, "string");
+    assert.equal(
+      wsSetScope(wid!, {
+        _app_id: "wormholes-test-app",
+        _env: "default",
+      }),
+      true,
+    );
+
+    const event_payload_promise =
+      wait_for_wormholes_evt_for_test(client, "wormholes:test:broadcast");
+
+    const broadcast_res = await _x.execute({
+      _module: "wormholes",
+      _op: "broadcast",
+      _params: {
+        _app_id: "wormholes-test-app",
+        _event: "wormholes:test:broadcast",
+        _payload: {
+          _ok: true,
+        },
+      },
+    });
+    assert.equal(broadcast_res._ok, true);
+    assert.equal(broadcast_res._result._delivered, 1);
+    assert.equal(broadcast_res._result._app_id, "wormholes-test-app");
+    assert.equal(broadcast_res._result._env, "default");
+    assert.equal(broadcast_res._result._event, "wormholes:test:broadcast");
+
+    const event_payload = await event_payload_promise;
+    assert.deepEqual(event_payload._args, [{ _ok: true }]);
+
+    const wrong_env_res = await _x.execute({
+      _module: "wormholes",
+      _op: "broadcast",
+      _params: {
+        _app_id: "wormholes-test-app",
+        _env: "other",
+        _event: "wormholes:test:wrong-env",
+        _payload: {
+          _ok: true,
+        },
+      },
+    });
+    assert.equal(wrong_env_res._ok, true);
+    assert.equal(wrong_env_res._result._delivered, 0);
+  } finally {
+    await close_ws_for_test(client);
+    await close_wss_for_test(wss);
+    await close_http_server_for_test(server);
+  }
+}
+
+await run_wormholes_xmodule_facade_tests();
 
 function create_fake_xdbobject_connection_for_test(opts?: {
   _fail_model_creation?: boolean;
@@ -22762,7 +22982,7 @@ try {
 
   const dist_xvibe_module_source =
     await readFile(
-      path.join(process.cwd(), "dist", "XVIBE", "XVibeModule.js"),
+      path.join(process.cwd(), "..", "xvibe", "dist", "XVIBE", "XVibeModule.js"),
       "utf-8",
     ).catch(() => "");
   assert.ok(
@@ -22770,6 +22990,8 @@ try {
   );
 
   const built_entry: any = await import("./index.js");
+  const built_vibe_entry: any = await import("@xpell/vibe");
+  assert.equal(built_entry.XVibeModule, built_vibe_entry.XVibeModule);
   const built_work_folder =
     await mkdtemp(path.join(tmpdir(), "xvibe-built-entry-mutation-plan-"));
   const built_server_xvm =

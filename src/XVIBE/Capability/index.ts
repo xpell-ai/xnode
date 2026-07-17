@@ -1,10 +1,1 @@
-export {
-  XVibeCapabilityRegistry,
-  type XVibeCapabilityCategory,
-  type XVibeCapabilityDefinition,
-  type XVibeCapabilityGuidanceArtifact,
-  type XVibeCapabilityGuidanceItem,
-  type XVibeCapabilityGuidanceSection,
-  type XVibeCapabilityMode,
-  type XVibeCapabilityStatus,
-} from "./CapabilityRegistry.js";
+export * from "@xpell/vibe/XVIBE/Capability/index.js";

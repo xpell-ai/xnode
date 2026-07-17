@@ -29,6 +29,13 @@ export * from "./wh.errors.js";
 export { handleEnvelope } from "./wh.gateway.js";
 export type { WHGatewayOptions } from "./wh.gateway.js";
 
+export {
+  WormholesModule,
+  WORMHOLES_OPS,
+  WORMHOLES_SKILL,
+  default as WormholesXModule,
+} from "./WormholesModule.js";
+
 /* -------------------------------------------------------------------------- */
 /* Session                                                                    */
 /* -------------------------------------------------------------------------- */

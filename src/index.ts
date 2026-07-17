@@ -133,7 +133,7 @@ export * from "./Wormholes/wh.index.js";
 export * from "./XAI/index.js"
 
 /***** XVIBE   */
-export * from "./XVIBE/index.js"
+export * from "@xpell/vibe"
 
 /***** XMUTATOR   */
 export * from "./XMutator/index.js"
