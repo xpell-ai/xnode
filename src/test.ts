@@ -211,6 +211,234 @@ async function run_node_core_compatibility_tests() {
 
 await run_node_core_compatibility_tests();
 
+class XNodeCompositionTestModule extends XModule {
+  constructor(name: string) {
+    super({ _name: name });
+  }
+}
+
+function create_fake_xnode_web_server_for_test() {
+  return {
+    onSetup() { },
+    init() { },
+    load() { },
+    async start() {
+      return "test web server started";
+    },
+  };
+}
+
+async function run_xnode_optional_module_composition_tests() {
+  const original_load_module_async = (_x as any).loadModuleAsync;
+  const original_start = (_x as any).start;
+  const loaded_modules: string[] = [];
+
+  (_x as any).loadModuleAsync = async (mod: XModule) => {
+    loaded_modules.push(mod._name);
+  };
+  (_x as any).start = () => { };
+
+  async function start_xnode_for_composition_test(options: {
+    _modules?: XModule[];
+    _load_vibe?: boolean;
+  } = {}) {
+    loaded_modules.length = 0;
+    const work_folder =
+      await mkdtemp(path.join(tmpdir(), "xnode-composition-"));
+    const node =
+      new NodePackage.XNode();
+    (node as any)._web_server =
+      create_fake_xnode_web_server_for_test();
+
+    try {
+      await node.start({
+        _work_folder: work_folder,
+        _modules: options._modules,
+        _load_vibe: options._load_vibe,
+      });
+      return {
+        _work_folder: work_folder,
+        _loaded_modules: [...loaded_modules],
+      };
+    } catch (err) {
+      NodeCorePackage._xs.close();
+      await rm(work_folder, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  try {
+    const current_startup =
+      await start_xnode_for_composition_test();
+    try {
+      assert.ok(current_startup._loaded_modules.includes("xvibe"));
+      assert.equal(
+        current_startup._loaded_modules.filter((name) => name === "xvibe").length,
+        1,
+      );
+      assert.deepEqual(
+        current_startup._loaded_modules.slice(0, 8),
+        [
+          "xdb",
+          "ping",
+          "wormholes",
+          "xauth",
+          "xai",
+          "module-creator",
+          "xmutator",
+          "xvibe",
+        ],
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(current_startup._work_folder, { recursive: true, force: true });
+    }
+
+    const load_vibe_true_startup =
+      await start_xnode_for_composition_test({ _load_vibe: true });
+    try {
+      assert.equal(
+        load_vibe_true_startup._loaded_modules.filter((name) => name === "xvibe").length,
+        1,
+      );
+      assert.equal(
+        load_vibe_true_startup._loaded_modules.indexOf("xvibe"),
+        7,
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(load_vibe_true_startup._work_folder, { recursive: true, force: true });
+    }
+
+    const custom_module =
+      new XNodeCompositionTestModule("custom-app-module");
+    const custom_startup =
+      await start_xnode_for_composition_test({ _modules: [custom_module] });
+    try {
+      assert.ok(custom_startup._loaded_modules.includes("custom-app-module"));
+      assert.equal(
+        custom_startup._loaded_modules.indexOf("custom-app-module"),
+        7,
+      );
+      assert.equal(
+        custom_startup._loaded_modules.indexOf("xvibe"),
+        8,
+      );
+      assert.equal(
+        custom_startup._loaded_modules.filter((name) => name === "xvibe").length,
+        1,
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(custom_startup._work_folder, { recursive: true, force: true });
+    }
+
+    const explicit_xvibe =
+      new XNodeCompositionTestModule("xvibe");
+    const explicit_xvibe_startup =
+      await start_xnode_for_composition_test({ _modules: [explicit_xvibe] });
+    try {
+      assert.equal(
+        explicit_xvibe_startup._loaded_modules.filter((name) => name === "xvibe").length,
+        1,
+      );
+      assert.equal(
+        explicit_xvibe_startup._loaded_modules.indexOf("xvibe"),
+        7,
+      );
+      assert.equal(
+        explicit_xvibe_startup._loaded_modules[8],
+        "flow",
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(explicit_xvibe_startup._work_folder, { recursive: true, force: true });
+    }
+
+    const no_vibe_startup =
+      await start_xnode_for_composition_test({ _load_vibe: false });
+    try {
+      assert.equal(no_vibe_startup._loaded_modules.includes("xvibe"), false);
+      assert.deepEqual(
+        no_vibe_startup._loaded_modules,
+        [
+          "xdb",
+          "ping",
+          "wormholes",
+          "xauth",
+          "xai",
+          "module-creator",
+          "xmutator",
+          "flow",
+          "entity-manager",
+          "studio",
+          "server-xvm",
+        ],
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(no_vibe_startup._work_folder, { recursive: true, force: true });
+    }
+
+    const no_vibe_with_explicit_xvibe =
+      await start_xnode_for_composition_test({
+        _load_vibe: false,
+        _modules: [new XNodeCompositionTestModule("xvibe")],
+      });
+    try {
+      assert.equal(
+        no_vibe_with_explicit_xvibe._loaded_modules.filter((name) => name === "xvibe").length,
+        1,
+      );
+      assert.equal(
+        no_vibe_with_explicit_xvibe._loaded_modules.indexOf("xvibe"),
+        7,
+      );
+      assert.equal(
+        no_vibe_with_explicit_xvibe._loaded_modules[8],
+        "flow",
+      );
+    } finally {
+      NodeCorePackage._xs.close();
+      await rm(no_vibe_with_explicit_xvibe._work_folder, { recursive: true, force: true });
+    }
+
+    await assert.rejects(
+      async () => {
+        await start_xnode_for_composition_test({
+          _modules: [
+            new XNodeCompositionTestModule("duplicate-app-module"),
+            new XNodeCompositionTestModule("duplicate-app-module"),
+          ],
+        });
+      },
+      (err: any) => {
+        assert.equal(err?._ok, false);
+        assert.equal(err?._code, "E_XNODE_DUPLICATE_MODULES");
+        assert.deepEqual(err?._details?._duplicates, ["duplicate-app-module"]);
+        assert.deepEqual(err?.toXData?.(), {
+          _ok: false,
+          _error: {
+            _code: "E_XNODE_DUPLICATE_MODULES",
+            _message: "XNode.start option '_modules' contains duplicate module names.",
+            _details: {
+              _duplicates: ["duplicate-app-module"],
+            },
+          },
+        });
+        return true;
+      },
+    );
+
+    assert.equal(loaded_modules.length, 0);
+  } finally {
+    (_x as any).loadModuleAsync = original_load_module_async;
+    (_x as any).start = original_start;
+  }
+}
+
+await run_xnode_optional_module_composition_tests();
+
 async function listen_on_ephemeral_port(server: http.Server): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);

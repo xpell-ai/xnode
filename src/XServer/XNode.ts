@@ -1,7 +1,7 @@
 
 import path from "path";
 import fs from "fs";
-import { _x, _xlog } from "@xpell/core";
+import { _x, _xlog, type XModule } from "@xpell/core";
 import { _xs } from "@xpell/node-core";
 import { _xu } from "@xpell/node-core";
 import { XWebServer } from "./XWebServer.js";
@@ -34,7 +34,37 @@ type XNodeOptions = {
     _port?: number;
     _host?: string;
     _xdb?: XDBOptions;
+    _modules?: XModule[];
+    _load_vibe?: boolean;
 };
+
+class XNodeStartupError extends Error {
+    _ok = false;
+    _code: string;
+    _details: Record<string, unknown>;
+
+    constructor(
+        code: string,
+        message: string,
+        details: Record<string, unknown> = {}
+    ) {
+        super(message);
+        this.name = "XNodeStartupError";
+        this._code = code;
+        this._details = details;
+    }
+
+    toXData() {
+        return {
+            _ok: false,
+            _error: {
+                _code: this._code,
+                _message: this.message,
+                _details: this._details
+            }
+        };
+    }
+}
 
 /**
  * Lightweight Xpell Node server bootstrapper.
@@ -113,7 +143,44 @@ export class XNode {
 
         const current = _xs.get("xweb");
         const merged = { ...(current ?? {}), ...overrides };
-        _xs.ensureDefaults("xweb", merged);
+        _xs.set("xweb", merged);
+    }
+
+    private validateApplicationModules(modules: XModule[] = []) {
+        const seen = new Set<string>();
+        const duplicates = new Set<string>();
+
+        for (const mod of modules) {
+            const module_name = mod?._name;
+            if (typeof module_name !== "string" || module_name.trim() === "") {
+                throw new XNodeStartupError(
+                    "E_XNODE_INVALID_MODULE",
+                    "XNode.start option '_modules' must contain XModule instances with a non-empty '_name'.",
+                    {
+                        _module: module_name ?? null
+                    }
+                );
+            }
+
+            if (seen.has(module_name)) {
+                duplicates.add(module_name);
+            }
+            seen.add(module_name);
+        }
+
+        if (duplicates.size > 0) {
+            throw new XNodeStartupError(
+                "E_XNODE_DUPLICATE_MODULES",
+                "XNode.start option '_modules' contains duplicate module names.",
+                {
+                    _duplicates: Array.from(duplicates)
+                }
+            );
+        }
+
+        return {
+            _has_xvibe: seen.has("xvibe")
+        };
     }
 
 
@@ -124,6 +191,9 @@ export class XNode {
     async start(options: XNodeOptions = {}): Promise<void> {
         if (this._started) return;
         const work_folder = options._work_folder ?? "./work";
+        const application_modules = options._modules ?? [];
+        const application_module_state =
+            this.validateApplicationModules(application_modules);
 
         if (!this._settings_events_bound) {
             this.bindSettingsEvents();
@@ -175,7 +245,15 @@ export class XNode {
         }));
 
         await _x.loadModuleAsync(new XMutatorModule());
-        await _x.loadModuleAsync(new XVibeModule());
+
+        for (const mod of application_modules) {
+            await _x.loadModuleAsync(mod);
+        }
+
+        if (options._load_vibe !== false && !application_module_state._has_xvibe) {
+            await _x.loadModuleAsync(new XVibeModule());
+        }
+
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());
         await _x.loadModuleAsync(new XStudioModule());
