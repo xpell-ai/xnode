@@ -4,6 +4,14 @@ export type XVMProjectMemoryMilestoneItem = {
   _id: string;
   _title: string;
   _completed: boolean;
+  _semantic_type?: string;
+  _artifact_type?: string;
+  _entity_id?: string;
+  _entity_name?: string;
+  _view_id?: string;
+  _flow_id?: string;
+  _module_id?: string;
+  _capability_id?: string;
 };
 
 export type XVMProjectMemoryMilestone = {
@@ -58,6 +66,16 @@ function normalize_id(value: unknown): string | undefined {
   return _xu.normalize_id(value) || undefined;
 }
 
+function normalize_runtime_ref_id(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/gu, "_")
+    .replace(/_+/gu, "_")
+    .replace(/-+/gu, "-")
+    .replace(/^[_-]+|[_-]+$/gu, "");
+}
+
 function title_case(value: string): string {
   return value
     .split(" ")
@@ -88,6 +106,30 @@ function milestone_item(id: string, title: string): XVMProjectMemoryMilestoneIte
     _title: title,
     _completed: false,
   };
+}
+
+function milestone_item_metadata(raw_item: Record<string, unknown>): Partial<XVMProjectMemoryMilestoneItem> {
+  const metadata: Partial<XVMProjectMemoryMilestoneItem> = {};
+  for (const key of [
+    "_semantic_type",
+    "_artifact_type",
+    "_entity_id",
+    "_entity_name",
+    "_view_id",
+    "_flow_id",
+    "_module_id",
+    "_capability_id",
+  ] as const) {
+    const value = read_string(raw_item[key]);
+    if (!value) continue;
+
+    metadata[key] =
+      key.endsWith("_id") || key === "_entity_name"
+        ? normalize_runtime_ref_id(value) || value
+        : value;
+  }
+
+  return metadata;
 }
 
 function clone_milestone(
@@ -271,6 +313,7 @@ export function normalize_project_memory_milestones(
         _id: item_id,
         _title: item_title,
         _completed: raw_item._completed === true,
+        ...milestone_item_metadata(raw_item),
       });
     }
 

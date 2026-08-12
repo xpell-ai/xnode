@@ -20,11 +20,11 @@ import { XAuthModule } from "../XAuth/index.js";
 import { MongoConnections } from "../XEntityManager/MongoConnectionManager.js";
 
 import type { IXDBEmbeddingProvider, IXDBVectorQueryProvider, XDBOptions } from "../XDB/index.js";
-import { XVibeModule } from "@xpell/vibe";
 import { XModuleCreatorModule } from "../XGenerative/index.js";
 import { XMutatorModule } from "../XMutator/XMutatorModule.js";
 import { XStudioModule } from "../XStudio/index.js";
 import { WormholesModule } from "../Wormholes/wh.index.js";
+import { XPlanningModule } from "../XPlanning/index.js";
 
 type XNodeOptions = {
     _settings_path?: string;
@@ -35,7 +35,6 @@ type XNodeOptions = {
     _host?: string;
     _xdb?: XDBOptions;
     _modules?: XModule[];
-    _load_vibe?: boolean;
 };
 
 class XNodeStartupError extends Error {
@@ -178,9 +177,6 @@ export class XNode {
             );
         }
 
-        return {
-            _has_xvibe: seen.has("xvibe")
-        };
     }
 
 
@@ -192,8 +188,7 @@ export class XNode {
         if (this._started) return;
         const work_folder = options._work_folder ?? "./work";
         const application_modules = options._modules ?? [];
-        const application_module_state =
-            this.validateApplicationModules(application_modules);
+        this.validateApplicationModules(application_modules);
 
         if (!this._settings_events_bound) {
             this.bindSettingsEvents();
@@ -250,12 +245,9 @@ export class XNode {
             await _x.loadModuleAsync(mod);
         }
 
-        if (options._load_vibe !== false && !application_module_state._has_xvibe) {
-            await _x.loadModuleAsync(new XVibeModule());
-        }
-
         await _x.loadModuleAsync(new FlowManagerModule());
         await _x.loadModuleAsync(new XEntityManager());
+        await _x.loadModuleAsync(new XPlanningModule());
         await _x.loadModuleAsync(new XStudioModule());
         const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path });
         await _x.loadModuleAsync(server_xvm);

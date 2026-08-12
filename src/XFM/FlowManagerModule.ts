@@ -6,6 +6,7 @@ import {
   _xlog,
   XResponseOK,
   XResponseError,
+  XError,
   type XpellSkillCommand,
   type XpellSkill
 } from "@xpell/core";
@@ -47,6 +48,8 @@ type XFlow = {
   _meta?: Record<string, any>;
   _steps: XFlowStep[];
 };
+
+const SAFE_RUNTIME_SCOPE_SEGMENT_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/u;
 
 /* -------------------------------------------------------------------------- */
 export const XAUTH_OPS: Record<string, XpellSkillCommand> = {
@@ -271,12 +274,33 @@ export class FlowManagerModule extends XModule {
       /* ---------------- resolve input ------------ */
 
       const resolved_params: Record<string, any> = {};
+      const raw_has_app_id =
+        !!raw_params &&
+        Object.prototype.hasOwnProperty.call(raw_params, "_app_id");
+      const raw_has_env =
+        !!raw_params &&
+        Object.prototype.hasOwnProperty.call(raw_params, "_env");
 
       for (const key of Object.keys(raw_params || {})) {
         resolved_params[key] = this.resolve_any(raw_params![key], ctx);
       }
 
       Object.assign(resolved_params, this.resolve_input(step._input, ctx));
+      if (!raw_has_app_id && resolved_params._app_id === undefined) resolved_params._app_id = app_id;
+      if (!raw_has_env && resolved_params._env === undefined) resolved_params._env = env;
+
+      const target_validation_error = this.validate_resolved_command_scope({
+        _module: step._command._module,
+        _op: step._command._op,
+        _step_id: step._id ?? `step_${i}`,
+        _flow_id: flow_id,
+        _app_id: app_id,
+        _env: env,
+        _params: resolved_params,
+      });
+      if (target_validation_error) {
+        return target_validation_error;
+      }
 
 
       /* ---------------- execute ------------------ */
@@ -418,6 +442,99 @@ export class FlowManagerModule extends XModule {
     }
 
     return val;
+  }
+
+  private validate_resolved_command_scope(input: {
+    _module: string;
+    _op: string;
+    _step_id: string;
+    _flow_id: string;
+    _app_id: string;
+    _env: string;
+    _params: Record<string, any>;
+  }) {
+    const app_error = this.validate_resolved_scope_segment({
+      _value: input._params._app_id,
+      _field: "_app_id",
+      _code: "E_FLOW_INVALID_TARGET_APP_ID",
+      _module: input._module,
+      _op: input._op,
+      _flow_id: input._flow_id,
+      _step_id: input._step_id,
+    });
+    if (app_error) return app_error;
+    input._params._app_id = String(input._params._app_id).trim();
+
+    const env_error = this.validate_resolved_scope_segment({
+      _value: input._params._env,
+      _field: "_env",
+      _code: "E_FLOW_INVALID_TARGET_ENV",
+      _module: input._module,
+      _op: input._op,
+      _flow_id: input._flow_id,
+      _step_id: input._step_id,
+    });
+    if (env_error) return env_error;
+    input._params._env = String(input._params._env).trim();
+
+    return null;
+  }
+
+  private validate_resolved_scope_segment(input: {
+    _value: unknown;
+    _field: "_app_id" | "_env";
+    _code: string;
+    _module: string;
+    _op: string;
+    _flow_id: string;
+    _step_id: string;
+  }) {
+    if (typeof input._value !== "string" || input._value.trim().length === 0) {
+      return new XResponseError(
+        new XError(input._code, `Resolved ${input._field} must be a non-empty string`, {
+          _meta: {
+            _field: input._field,
+            _module: input._module,
+            _op: input._op,
+            _flow_id: input._flow_id,
+            _step_id: input._step_id,
+          },
+        }),
+      ).toXData();
+    }
+
+    const value = input._value.trim();
+    if (value.startsWith("$")) {
+      return new XResponseError(
+        new XError(input._code, `Resolved ${input._field} is still a dynamic expression`, {
+          _meta: {
+            _field: input._field,
+            _value: value,
+            _module: input._module,
+            _op: input._op,
+            _flow_id: input._flow_id,
+            _step_id: input._step_id,
+          },
+        }),
+      ).toXData();
+    }
+
+    if (!SAFE_RUNTIME_SCOPE_SEGMENT_PATTERN.test(value)) {
+      return new XResponseError(
+        new XError(input._code, `Resolved ${input._field} is not a valid runtime identifier`, {
+          _meta: {
+            _field: input._field,
+            _value: value,
+            _module: input._module,
+            _op: input._op,
+            _flow_id: input._flow_id,
+            _step_id: input._step_id,
+          },
+        }),
+      ).toXData();
+    }
+
+    return null;
   }
 
   private resolve_input(input: XFlowStep["_input"] | undefined, ctx: any) {

@@ -23,6 +23,10 @@ import {
     createEntityProvider,
     resolveEntityProviderType
 } from "./EntityProviderRegistry.js";
+import {
+    resolve_entity_scope_identity,
+    type EntityScopeIdentity
+} from "./EntityScope.js";
 
 type EntityRegistryEntry = {
     _app_id: string;
@@ -31,9 +35,21 @@ type EntityRegistryEntry = {
     _provider_type: string;
     _provider: EntityProvider;
     _physical_identity: EntityPhysicalIdentity;
+    _scope_identity: EntityScopeIdentity;
+    _legacy_global_scope?: EntityLegacyGlobalScopeState;
 };
 
 type EntityMigrationMode = "dry-run" | "copy" | "move";
+
+type EntityLegacyGlobalScopeState = {
+    _detected: boolean;
+    _unresolved: boolean;
+    _global_entity_name: string;
+    _target_physical_entity_name: string;
+    _global_record_count: number;
+    _target_record_count: number;
+    _message?: string;
+};
 
 type EntityMigrationResources = {
     _files: Record<string, any>;
@@ -45,106 +61,106 @@ type EntityMigrationResources = {
 };
 
 const XENTITY_MANAGER_OPS = {
-        _register: {
-            _name: "_register",
-            _scope: "module",
-            _description: "Register runtime entity definition."
-        },
+    _register: {
+        _name: "_register",
+        _scope: "module",
+        _description: "Register runtime entity definition."
+    },
 
-        _unregister: {
-            _name: "_unregister",
-            _scope: "module",
-            _description: "Remove entity registration."
-        },
+    _unregister: {
+        _name: "_unregister",
+        _scope: "module",
+        _description: "Remove entity registration."
+    },
 
-        _has: {
-            _name: "_has",
-            _scope: "module",
-            _description: "Check if entity exists."
-        },
+    _has: {
+        _name: "_has",
+        _scope: "module",
+        _description: "Check if entity exists."
+    },
 
-        _get_schema: {
-            _name: "_get_schema",
-            _scope: "module",
-            _description: "Get entity schema."
-        },
+    _get_schema: {
+        _name: "_get_schema",
+        _scope: "module",
+        _description: "Get entity schema."
+    },
 
-        _get_entity: {
-            _name: "_get_entity",
-            _scope: "module",
-            _description: "Get provider runtime entity handle."
-        },
+    _get_entity: {
+        _name: "_get_entity",
+        _scope: "module",
+        _description: "Get provider runtime entity handle."
+    },
 
-        _storage_diagnostics: {
-            _name: "_storage_diagnostics",
-            _scope: "module",
-            _description: "Internal diagnostic report for logical entity scope and physical XDB storage identity."
-        },
+    _storage_diagnostics: {
+        _name: "_storage_diagnostics",
+        _scope: "module",
+        _description: "Internal diagnostic report for logical entity scope and physical XDB storage identity."
+    },
 
-        _storage_migration_dry_run: {
-            _name: "_storage_migration_dry_run",
-            _scope: "module",
-            _description: "Build an explicit dry-run report for migrating a legacy global XDB entity into scoped storage."
-        },
+    _storage_migration_dry_run: {
+        _name: "_storage_migration_dry_run",
+        _scope: "module",
+        _description: "Build an explicit dry-run report for migrating a legacy global XDB entity into scoped storage."
+    },
 
-        _storage_migrate: {
-            _name: "_storage_migrate",
-            _scope: "module",
-            _description: "Explicitly copy or move a legacy global XDB entity into scoped storage."
-        },
+    _storage_migrate: {
+        _name: "_storage_migrate",
+        _scope: "module",
+        _description: "Explicitly copy or move a legacy global XDB entity into scoped storage."
+    },
 
-        _storage_migration_diagnostics: {
-            _name: "_storage_migration_diagnostics",
-            _scope: "module",
-            _description: "List legacy global XDB entities, scoped XDB entities, and migration status."
-        },
+    _storage_migration_diagnostics: {
+        _name: "_storage_migration_diagnostics",
+        _scope: "module",
+        _description: "List legacy global XDB entities, scoped XDB entities, and migration status."
+    },
 
-        _add: {
-            _name: "_add",
-            _scope: "module",
-            _description: "Create record."
-        },
+    _add: {
+        _name: "_add",
+        _scope: "module",
+        _description: "Create record."
+    },
 
-        _get: {
-            _name: "_get",
-            _scope: "module",
-            _description: "Get record."
-        },
+    _get: {
+        _name: "_get",
+        _scope: "module",
+        _description: "Get record."
+    },
 
-        _find: {
-            _name: "_find",
-            _scope: "module",
-            _description: "Query records.",
-            _params: {
-                _filter: "Normal XDB equality/query filter.",
-                _hash_filter: "Optional explicit Hash field verification map: { [hash_field_name]: plain_text_value }."
-            }
-        },
-
-        _aggregate: {
-            _name: "_aggregate",
-            _scope: "module",
-            _description: "Aggregate records."
-        },
-
-        _update: {
-            _name: "_update",
-            _scope: "module",
-            _description: "Update record."
-        },
-
-        _delete: {
-            _name: "_delete",
-            _scope: "module",
-            _description: "Delete record."
-        },
-
-        _list: {
-            _name: "_list",
-            _scope: "module",
-            _description: "List records."
+    _find: {
+        _name: "_find",
+        _scope: "module",
+        _description: "Query records.",
+        _params: {
+            _filter: "Normal XDB equality/query filter.",
+            _hash_filter: "Optional explicit Hash field verification map: { [hash_field_name]: plain_text_value }."
         }
-    };
+    },
+
+    _aggregate: {
+        _name: "_aggregate",
+        _scope: "module",
+        _description: "Aggregate records."
+    },
+
+    _update: {
+        _name: "_update",
+        _scope: "module",
+        _description: "Update record."
+    },
+
+    _delete: {
+        _name: "_delete",
+        _scope: "module",
+        _description: "Delete record."
+    },
+
+    _list: {
+        _name: "_list",
+        _scope: "module",
+        _description: "List records."
+    }
+};
 
 export class XEntityManager extends XModule {
 
@@ -195,44 +211,39 @@ export class XEntityManager extends XModule {
     /* HELPERS                                            */
     /* -------------------------------------------------- */
 
-    private getEntityKey(
-        app_id: string,
-        env: string,
-        entity_id: string
-    ) {
-        return `${env}::${app_id}::${entity_id}`;
-    }
-
-    private getStoredEntity(params: any): EntityRegistryEntry {
-
-        const app_id =
-            params._app_id;
-
-        const env =
-            params._env ?? "default";
-
-        const entity_id =
+    private readEntityId(params: any) {
+        return (
             params._entity ||
             params.entity ||
-            params._entity_id;
+            params._entity_id ||
+            params._entity_name
+        );
+    }
 
-        if (!entity_id) {
-            throw new Error("missing entity id");
-        }
+    private getStoredEntity(
+        params: any,
+        opts: { _allow_legacy_unresolved?: boolean } = {}
+    ): EntityRegistryEntry {
 
-        const key =
-            this.getEntityKey(
-                app_id,
-                env,
-                entity_id
-            );
+        const scope_identity =
+            this.resolveEntityScopeIdentityFromParams(params);
 
         const stored =
-            this._entities.get(key);
+            this._entities.get(scope_identity._registry_key);
 
         if (!stored) {
             throw new Error(
-                `entity not found: ${entity_id}`
+                `entity not found: ${scope_identity._logical_entity_id}`
+            );
+        }
+
+        if (
+            opts._allow_legacy_unresolved !== true &&
+            stored._legacy_global_scope?._unresolved === true
+        ) {
+            throw new Error(
+                stored._legacy_global_scope._message ??
+                `legacy global entity requires explicit migration: ${scope_identity._logical_entity_id}`
             );
         }
 
@@ -259,7 +270,7 @@ export class XEntityManager extends XModule {
         const scope =
             String(
                 entity?._storage?._scope ??
-                "global"
+                "app"
             )
                 .trim()
                 .toLowerCase();
@@ -277,75 +288,73 @@ export class XEntityManager extends XModule {
         );
     }
 
-    private encodePhysicalEntityName(physical_identity: string) {
-        if (/^[A-Za-z0-9._-]+$/.test(physical_identity)) {
-            return {
-                _physical_entity_name:
-                    physical_identity,
-                _physical_entity_encoding:
-                    "plain"
-            };
-        }
-
-        return {
-            _physical_entity_name:
-                `xent_${Buffer.from(physical_identity, "utf8").toString("base64url")}`,
-            _physical_entity_encoding:
-                "base64url"
-        };
-    }
-
     private resolveEntityPhysicalIdentity(
-        app_id: string,
-        env: string,
+        app_id: unknown,
+        env: unknown,
         entity_id: string,
         entity: any
     ): EntityPhysicalIdentity {
         const provider =
             this.resolveStorageProvider(entity);
 
-        const storage_scope =
-            this.resolveStorageScope(entity);
+        return this.resolveEntityScopeIdentity({
+            _app_id:
+                app_id,
+            _env:
+                env,
+            _entity_id:
+                entity_id,
+            _provider:
+                provider,
+            _storage_scope:
+                this.resolveStorageScope(entity),
+            _require_app_scope:
+                entity?._runtime_owner === "app" ||
+                entity?._app_owned === true
+        });
+    }
 
-        if (
-            storage_scope === "app" &&
-            !app_id
-        ) {
+    private resolveEntityScopeIdentity(input: {
+        _app_id?: unknown;
+        _env?: unknown;
+        _entity_id?: unknown;
+        _provider: EntityProviderType;
+        _storage_scope?: unknown;
+        _require_app_scope?: boolean;
+    }): EntityScopeIdentity {
+        return resolve_entity_scope_identity(input);
+    }
+
+    private resolveEntityScopeIdentityFromParams(params: any): EntityScopeIdentity {
+        const storage_scope =
+            params._entity_scope ??
+            params._storage_scope ??
+            params._scope ??
+            (
+                params._app_id !== undefined ||
+                    params._env !== undefined
+                    ? "app"
+                    : undefined
+            );
+
+        if (!storage_scope) {
             throw new Error(
-                "app-scoped entity storage requires _app_id"
+                "app-owned entity commands require _app_id, _env, and _entity; use _entity_scope='global' only for explicitly global entities"
             );
         }
 
-        const physical_identity =
-            storage_scope === "global"
-                ? entity_id
-                : storage_scope === "app"
-                    ? `${env}::${app_id}::${entity_id}`
-                    : `server::${entity_id}`;
-
-        const encoded =
-            this.encodePhysicalEntityName(physical_identity);
-
-        return {
-            _logical_entity_id:
-                entity_id,
-            _physical_identity:
-                physical_identity,
-            _physical_entity_name:
-                encoded._physical_entity_name,
-            _physical_entity_encoding:
-                encoded._physical_entity_encoding,
+        return this.resolveEntityScopeIdentity({
+            _app_id:
+                params._app_id,
+            _env:
+                params._env,
+            _entity_id:
+                this.readEntityId(params),
             _provider:
-                provider,
-            _provider_type:
-                provider,
+                resolveEntityProviderType(params._storage_provider),
             _storage_scope:
-                storage_scope,
-            _is_global_storage:
-                storage_scope === "global",
-            _is_scoped_storage:
-                storage_scope !== "global"
-        };
+                storage_scope
+        });
     }
 
     private getEntityStorageDiagnostic(stored: EntityRegistryEntry) {
@@ -388,7 +397,19 @@ export class XEntityManager extends XModule {
             _is_global_storage:
                 physical_identity._is_global_storage,
             _is_scoped_storage:
-                physical_identity._is_scoped_storage
+                physical_identity._is_scoped_storage,
+            _registry_key:
+                stored._scope_identity._registry_key,
+            _legacy_global_scope:
+                stored._legacy_global_scope ?? {
+                    _detected: false,
+                    _unresolved: false,
+                    _global_entity_name: logical_entity_id,
+                    _target_physical_entity_name:
+                        physical_identity._physical_entity_name,
+                    _global_record_count: 0,
+                    _target_record_count: 0
+                }
         };
     }
 
@@ -774,6 +795,79 @@ export class XEntityManager extends XModule {
                     _records: records.length
                 }
             } as XDBEntityPersisted
+        };
+    }
+
+    private async resolveLegacyGlobalScopeState(
+        physical_identity: EntityPhysicalIdentity
+    ): Promise<EntityLegacyGlobalScopeState> {
+        const logical_entity_id =
+            String(physical_identity._logical_entity_id ?? "");
+
+        const empty_state = {
+            _detected:
+                false,
+            _unresolved:
+                false,
+            _global_entity_name:
+                logical_entity_id,
+            _target_physical_entity_name:
+                physical_identity._physical_entity_name,
+            _global_record_count:
+                0,
+            _target_record_count:
+                0
+        };
+
+        if (
+            physical_identity._provider !== "xdb" ||
+            physical_identity._storage_scope !== "app"
+        ) {
+            return empty_state;
+        }
+
+        if (
+            XDB._engine?._xdb_data?._entities?.includes(logical_entity_id) !== true
+        ) {
+            return empty_state;
+        }
+
+        const global_state =
+            await this.loadPhysicalEntityState(logical_entity_id);
+
+        const target_state =
+            await this.loadPhysicalEntityState(
+                physical_identity._physical_entity_name
+            );
+
+        const target_migrated_from_legacy =
+            target_state?._payload?._meta?._migrated_from?._physical_entity_name ===
+            logical_entity_id;
+
+        const unresolved =
+            global_state._exists &&
+            target_migrated_from_legacy !== true &&
+            target_state._record_count === 0;
+
+        return {
+            _detected:
+                true,
+            _unresolved:
+                unresolved,
+            _global_entity_name:
+                logical_entity_id,
+            _target_physical_entity_name:
+                physical_identity._physical_entity_name,
+            _global_record_count:
+                global_state._record_count,
+            _target_record_count:
+                target_state._record_count,
+            ...(unresolved
+                ? {
+                    _message:
+                        `legacy global entity '${logical_entity_id}' exists; run entity-manager.storage_migration_dry_run and storage_migrate with a specific _target_app_id/_target_env before CRUD`
+                }
+                : {})
         };
     }
 
@@ -1185,10 +1279,10 @@ export class XEntityManager extends XModule {
                 !source_state._exists && target_migrated_from_source
                     ? true
                     : target_records.length > 0 &&
-                        this.recordsEqualById(
-                            source_records,
-                            target_records
-                        );
+                    this.recordsEqualById(
+                        source_records,
+                        target_records
+                    );
 
             source_missing_after_move =
                 !source_state._exists &&
@@ -1778,6 +1872,11 @@ export class XEntityManager extends XModule {
                 await XDB._engine.deleteEntity(source_entity_name);
             }
 
+            target_entry._stored._legacy_global_scope =
+                await this.resolveLegacyGlobalScopeState(
+                    target_entry._stored._physical_identity
+                );
+
             return {
                 ...report,
                 _status:
@@ -1866,10 +1965,6 @@ export class XEntityManager extends XModule {
             const params =
                 xcmd?._params || {};
 
-            const app_id = String(params._app_id ?? "");
-
-            const env = String(params._env ?? "default");
-
             const entity: any =
                 params.entity ||
                 params._entity;
@@ -1890,20 +1985,19 @@ export class XEntityManager extends XModule {
                 );
             }
 
-            const key =
-                this.getEntityKey(
-                    app_id,
-                    env,
-                    entity_id
-                );
-
             const physical_identity =
                 this.resolveEntityPhysicalIdentity(
-                    app_id,
-                    env,
+                    params._app_id,
+                    params._env,
                     entity_id,
                     entity
                 );
+
+            const scope_identity =
+                physical_identity as EntityScopeIdentity;
+
+            const key =
+                scope_identity._registry_key;
 
             const existing =
                 this._entities.get(key);
@@ -1933,13 +2027,22 @@ export class XEntityManager extends XModule {
                     existing._provider = replacement_provider;
                     existing._physical_identity =
                         replacement_provider.getPhysicalIdentity();
+                    existing._scope_identity =
+                        replacement_provider.getPhysicalIdentity() as EntityScopeIdentity;
                 } else {
                     await existing._provider.syncSchema(entity);
 
                     existing._definition = entity;
                     existing._physical_identity =
                         existing._provider.getPhysicalIdentity();
+                    existing._scope_identity =
+                        existing._provider.getPhysicalIdentity() as EntityScopeIdentity;
                 }
+
+                existing._legacy_global_scope =
+                    await this.resolveLegacyGlobalScopeState(
+                        existing._physical_identity
+                    );
 
                 _xlog.log(
                     `[entity-manager] updated '${entity_id}'`
@@ -1947,7 +2050,8 @@ export class XEntityManager extends XModule {
 
                 return new XResponseOK({
                     _entity: entity_id,
-                    _action: "update",
+                    _action: "already_exists",
+                    _already_exists: true,
                     _registered: true
                 }).toXData();
             }
@@ -1962,9 +2066,9 @@ export class XEntityManager extends XModule {
 
             this._entities.set(key, {
 
-                _app_id: app_id,
+                _app_id: scope_identity._app_id,
 
-                _env: env,
+                _env: scope_identity._env,
 
                 _definition: entity,
 
@@ -1972,7 +2076,14 @@ export class XEntityManager extends XModule {
 
                 _provider: provider,
 
-                _physical_identity: provider.getPhysicalIdentity()
+                _physical_identity: provider.getPhysicalIdentity(),
+
+                _scope_identity: provider.getPhysicalIdentity() as EntityScopeIdentity,
+
+                _legacy_global_scope:
+                    await this.resolveLegacyGlobalScopeState(
+                        provider.getPhysicalIdentity()
+                    )
             });
 
             _xlog.log(
@@ -2003,18 +2114,14 @@ export class XEntityManager extends XModule {
             const params =
                 xcmd?._params || {};
 
-            const app_id = String(params._app_id ?? "");
+            const scope_identity =
+                this.resolveEntityScopeIdentityFromParams(params);
 
-            const env = String(params._env ?? "default");
-
-            const entity_id = String(params._entity_id ?? "");
+            const entity_id =
+                scope_identity._logical_entity_id;
 
             const key =
-                this.getEntityKey(
-                    app_id,
-                    env,
-                    entity_id
-                );
+                scope_identity._registry_key;
 
             const stored =
                 this._entities.get(key);
@@ -2058,22 +2165,11 @@ export class XEntityManager extends XModule {
             const params =
                 xcmd?._params || {};
 
-            const app_id = String(params._app_id ?? "");
-
-            const env = String(params._env ?? "default");
-
-            const entity_id = String(
-                params._entity ||
-                params.entity ||
-                params._entity_id
-            );
+            const scope_identity =
+                this.resolveEntityScopeIdentityFromParams(params);
 
             const key =
-                this.getEntityKey(
-                    app_id,
-                    env,
-                    entity_id
-                );
+                scope_identity._registry_key;
 
             return new XResponseOK({
                 _exists:
@@ -2154,7 +2250,12 @@ export class XEntityManager extends XModule {
                 params._entity_id
             ) {
                 const stored =
-                    this.getStoredEntity(params);
+                    this.getStoredEntity(
+                        params,
+                        {
+                            _allow_legacy_unresolved: true
+                        }
+                    );
 
                 return new XResponseOK({
                     _diagnostic:
@@ -2163,10 +2264,14 @@ export class XEntityManager extends XModule {
             }
 
             const app_id =
-                params._app_id;
+                params._app_id !== undefined
+                    ? String(params._app_id)
+                    : undefined;
 
             const env =
-                params._env ?? "default";
+                params._env !== undefined
+                    ? String(params._env).toLowerCase()
+                    : undefined;
 
             const diagnostics: any[] = [];
 
@@ -2410,7 +2515,7 @@ export class XEntityManager extends XModule {
                 params.skip;
             const skip =
                 typeof rawSkip === "number" &&
-                Number.isInteger(rawSkip)
+                    Number.isInteger(rawSkip)
                     ? Math.max(0, rawSkip)
                     : 0;
 
@@ -2419,7 +2524,7 @@ export class XEntityManager extends XModule {
                 params.limit;
             const limit =
                 typeof rawLimit === "number" &&
-                Number.isInteger(rawLimit)
+                    Number.isInteger(rawLimit)
                     ? Math.max(0, rawLimit)
                     : 100000;
 
@@ -2437,27 +2542,30 @@ export class XEntityManager extends XModule {
                     ? params._xdata_destination
                     : undefined;
 
-            _xlog.log("[entity-manager] find query", {
-                _app_id:
-                    params._app_id,
-                _env:
-                    params._env,
-                _entity:
-                    params._entity ??
-                    params._entity_id,
-                _filter:
-                    filter,
-                _sort:
-                    sortInput,
-                _skip:
-                    skip,
-                _limit:
-                    limit,
-                _reverse_order:
-                    reverseOrder,
-                _xdata_destination:
-                    xdataDestination,
-            });
+            if (params._debug) {
+
+                _xlog.log("[entity-manager] find query", {
+                    _app_id:
+                        params._app_id,
+                    _env:
+                        params._env,
+                    _entity:
+                        params._entity ??
+                        params._entity_id,
+                    _filter:
+                        filter,
+                    _sort:
+                        sortInput,
+                    _skip:
+                        skip,
+                    _limit:
+                        limit,
+                    _reverse_order:
+                        reverseOrder,
+                    _xdata_destination:
+                        xdataDestination,
+                });
+            }
 
             const result =
                 await stored
@@ -2478,19 +2586,21 @@ export class XEntityManager extends XModule {
                 params._hash_filter
             );
 
-            _xlog.log("[entity-manager] find result", {
-                _app_id:
-                    params._app_id,
-                _env:
-                    params._env,
-                _entity:
-                    params._entity ??
-                    params._entity_id,
-                _records:
-                    stored._provider.getRecordCount(result),
-                _xdata_destination:
-                    xdataDestination,
-            });
+            if (params._debug) {
+                _xlog.log("[entity-manager] find result", {
+                    _app_id:
+                        params._app_id,
+                    _env:
+                        params._env,
+                    _entity:
+                        params._entity ??
+                        params._entity_id,
+                    _records:
+                        stored._provider.getRecordCount(result),
+                    _xdata_destination:
+                        xdataDestination,
+                });
+            }
 
             return new XResponseOK({
                 _records: result
@@ -2516,8 +2626,8 @@ export class XEntityManager extends XModule {
 
             const aggregation =
                 params._aggregation &&
-                typeof params._aggregation === "object" &&
-                !Array.isArray(params._aggregation)
+                    typeof params._aggregation === "object" &&
+                    !Array.isArray(params._aggregation)
                     ? params._aggregation as Record<string, any>
                     : (
                         params.aggregation &&
@@ -2656,8 +2766,8 @@ export class XEntityManager extends XModule {
                     Array.isArray(response._result) ? "array" : typeof response._result,
                 _result_keys:
                     response._result &&
-                    typeof response._result === "object" &&
-                    !Array.isArray(response._result)
+                        typeof response._result === "object" &&
+                        !Array.isArray(response._result)
                         ? Object.keys(response._result)
                         : undefined,
                 _value_type:
@@ -2795,14 +2905,20 @@ export class XEntityManager extends XModule {
                 xcmd?._params || {};
 
             const app_id =
-                params._app_id;
+                String(params._app_id ?? "");
 
             const env =
-                params._env ?? "default";
+                String(params._env ?? "");
+
+            if (!app_id || !env) {
+                throw new Error(
+                    "list requires _app_id and _env"
+                );
+            }
 
             const entities: string[] = [];
 
-            for (const [key, value] of this._entities) {
+            for (const value of this._entities.values()) {
 
                 if (
                     value._app_id === app_id &&

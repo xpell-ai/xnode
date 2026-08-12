@@ -1,14 +1,12 @@
 {
   "name": "@xpell/node",
-  "version": "2.0.4",
+  "version": "2.0.7",
   "publishConfig": {
     "access": "public"
   },
   "description": "XNode  Server for Node.js (Xpell-Node)",
   "files": [
     "dist",
-    "src",
-    "types",
     "docs",
     "system-xapps"
   ],
@@ -16,6 +14,7 @@
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
+  "sideEffects": false,
   "scripts": {
     "build": "tsc -p .&& npm run copy-assets",
     "test": "npm run build && node ./dist/test.js",
@@ -23,31 +22,85 @@
     "copy-assets": "cp -R ./public/assets ./dist/assets",
     "publish-alpha-next": "pnpm version prerelease --preid=alpha  && pnpm publish --tag alpha"
   },
-  "author": "Tamir Fridman <tamir@aimeverse.com> (https://github.com/fridman-tamir)",
+  "xpell": {
+    "_tests": [
+      {
+        "_id": "xpell-node.script.build",
+        "_title": "@xpell/node build script",
+        "_owner": "@xpell/node",
+        "_suite": "xpell-node.package",
+        "_scope": "package",
+        "_runtime": "node",
+        "_description": "Runs the existing @xpell/node build script.",
+        "_profiles": ["xpell-node.package"],
+        "_tags": ["package", "build"],
+        "_entry": {
+          "_type": "build",
+          "_script": "build"
+        }
+      },
+      {
+        "_id": "xpell-node.script.test",
+        "_title": "@xpell/node test script",
+        "_owner": "@xpell/node",
+        "_suite": "xpell-node.package",
+        "_scope": "package",
+        "_runtime": "node",
+        "_description": "Runs the existing @xpell/node test script, which builds and executes dist/test.js.",
+        "_profiles": ["xpell-node.package"],
+        "_tags": ["package", "script"],
+        "_entry": {
+          "_type": "script",
+          "_script": "test"
+        }
+      },
+      {
+        "_id": "xpell-node.package.check",
+        "_title": "@xpell/node package metadata check",
+        "_owner": "@xpell/node",
+        "_suite": "xpell-node.package",
+        "_scope": "package",
+        "_runtime": "node",
+        "_description": "Verifies package metadata and declared local entries without publishing or network checks.",
+        "_profiles": ["xpell-node.package"],
+        "_tags": ["package-check"],
+        "_entry": {
+          "_type": "package-check",
+          "_check": "package"
+        }
+      }
+    ],
+    "_test_profiles": [
+      {
+        "_id": "xpell-node.package",
+        "_title": "@xpell/node package verification",
+        "_includes": ["xpell-node.*"],
+        "_tags": ["package", "node"]
+      }
+    ]
+  },
+  "author": "Tamir Fridman <fridman.tamir@gmail.com> (https://github.com/fridman-tamir)",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AimeVerse/xpell-node"
-  },
-  "peerDependencies": {
-    "@xpell/core": "^2.0.3"
+    "url": "git+https://github.com/xpell-ai/xpell-node"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/express-sslify": "^1.2.5",
-    "@types/node": "^14.18.63",
+    "@types/node": "^22.0.0",
     "@types/ws": "^8.18.1",
-    "@xpell/core": "^2.0.4",
-    "typescript": "^4.9.5"
+    "typescript": "^5.9.3"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
-    "@xpell/node-core": "workspace:*",
-    "@xpell/vibe": "workspace:*",
+    "@xpell/core": "^2.0.7",
+    "@xpell/node-core": "^2.0.7",
+    "@xpell/vibe": "^2.0.7",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^12.10.1",
     "cors": "^2.8.6",

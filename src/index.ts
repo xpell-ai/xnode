@@ -86,6 +86,11 @@ export {
 export {
   XUtils,
   _xu,
+  _XNUtils,
+  type XNodeUtils,
+} from "./XNUtils/XUtils.js";
+
+export {
   XEventManager,
   XEventManager as _xem,
   type XEventListenerOptions,
@@ -132,8 +137,8 @@ export * from "./Wormholes/wh.index.js";
 /***** XAI */
 export * from "./XAI/index.js"
 
-/***** XVIBE   */
-export * from "@xpell/vibe"
-
 /***** XMUTATOR   */
 export * from "./XMutator/index.js"
+
+/***** XPLANNING   */
+export * from "./XPlanning/index.js"

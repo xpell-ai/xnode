@@ -21,7 +21,13 @@
           "class": "dashboard-sidebar",
           "_title": "Xpell Dashboard Starter",
           "_subtitle": "Canonical XUI shell",
-          "_logo": "assets/logo.svg",
+          "_logo": {
+            "_id": "dashboard-sidebar-logo",
+            "_type": "image",
+            "class": "dash-sidebar__logo",
+            "src": "assets/logo.svg",
+            "alt": "Xpell Dashboard Starter logo"
+          },
           "_scroll": true,
           "_dividers": true,
           "_nav": {
@@ -414,7 +420,13 @@
                       "_type": "card",
                       "class": "dashboard-settings-card",
                       "_hide_image": false,
-                      "_image": "assets/placeholder-record.svg",
+                      "_image": {
+                        "_id": "dashboard-settings-card-image",
+                        "_type": "image",
+                        "class": "xcard__image",
+                        "src": "assets/placeholder-record.svg",
+                        "alt": "Dashboard placeholder"
+                      },
                       "_image_alt": "Dashboard placeholder",
                       "_title": "Workspace preferences",
                       "_text": "Use field wrappers and dashboard selects for mutable view settings.",

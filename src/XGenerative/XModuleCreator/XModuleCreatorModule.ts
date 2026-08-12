@@ -3239,7 +3239,10 @@ export class XModuleCreatorModule extends XModule {
     const specs: XGeneratedModuleSpec[] =
       [];
 
-    let entries: Awaited<ReturnType<typeof readdir>>;
+    let entries: Array<{
+      isDirectory(): boolean;
+      name: string;
+    }>;
 
     try {
       entries =
