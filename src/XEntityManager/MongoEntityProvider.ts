@@ -8,6 +8,7 @@ import type {
     EntityProvider,
     EntityProviderCapability,
     EntityProviderCapabilityName,
+    EntityProviderConstructionOptions,
     EntityProviderDisposeResult,
     EntityProviderFindOptions,
     EntityPhysicalIdentity,
@@ -21,10 +22,7 @@ import { MongoConnections } from "./MongoConnectionManager.js";
 
 const MONGO_HASH_FILTER_MAX_RECORDS = 25;
 
-export type MongoEntityProviderOptions = {
-    _definition: any;
-    _physical_identity: EntityPhysicalIdentity;
-};
+export type MongoEntityProviderOptions = EntityProviderConstructionOptions;
 
 export class MongoEntityProvider implements EntityProvider {
     readonly _provider: EntityProviderType = "mongo";
@@ -384,6 +382,24 @@ export class MongoEntityProvider implements EntityProvider {
                                             ? "$in"
                                             : "";
 
+                    if (
+                        operator === "_in" &&
+                        !Array.isArray(operand)
+                    ) {
+                        throw new XError(
+                            "E_ENTITY_MONGO_QUERY_UNSUPPORTED",
+                            "_in requires an array",
+                            {
+                                _meta: {
+                                    _field:
+                                        fieldName,
+                                    _operator:
+                                        operator
+                                }
+                            }
+                        );
+                    }
+
                     if (!mongoOperator) {
                         throw new XError(
                             "E_ENTITY_MONGO_QUERY_UNSUPPORTED",
@@ -593,14 +609,21 @@ export class MongoEntityProvider implements EntityProvider {
 
     async update(filter: any, updates: any) {
         try {
-            return await this._xdb_object.updateManyRaw(
+            const result =
+                await this._xdb_object.updateManyRaw(
                 this.translateFilter(filter),
                 updates,
                 {
                     _no_ignore:
-                        true
+                    true
                 }
             );
+
+            return {
+                ...result,
+                _updated:
+                    Number(result?._modified ?? 0)
+            };
         } catch (err) {
             throw this.normalizeMongoError(err);
         }
@@ -747,9 +770,29 @@ export class MongoEntityProvider implements EntityProvider {
                 _reason: "MongoEntityProvider V1 does not expose transaction boundaries."
             },
             {
+                _name: "operation-atomic-writes",
+                _supported: false,
+                _reason: "Mongo multi-record writes do not expose an operation-level atomicity guarantee."
+            },
+            {
                 _name: "persistent-storage",
                 _supported: true,
                 _description: "Persist records through a named Mongoose connection."
+            },
+            {
+                _name: "server-side-pagination",
+                _supported: true,
+                _description: "Push sort, skip, and limit into the Mongo query."
+            },
+            {
+                _name: "exact-count",
+                _supported: true,
+                _description: "Use countDocuments independently of find page limits."
+            },
+            {
+                _name: "unique-scalar-indexes",
+                _supported: true,
+                _description: "Translate schema-declared unique scalar indexes to Mongo indexes."
             },
             {
                 _name: "query-operators",

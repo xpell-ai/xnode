@@ -193,7 +193,9 @@ export type WHAuthState = {
   _authenticated: boolean;
   _clearance_level?: number;
   _user_id?: string;
+  _account_id?: string;
   _agent_id?: string;
+  _auth_type?: string;
 };
 
 /**
@@ -204,6 +206,11 @@ export type WHConnMeta = {
   _user_agent?: string;
   _ip?: string;
   _token?: string;
+  _host?: string;
+  _protocol?: string;
+  _origin?: string;
+  _x_forwarded_host?: string;
+  _x_forwarded_proto?: string;
 
   // 🔥 NEW (for scoped broadcast)
   _app_id?: string;

@@ -84,7 +84,7 @@ Entity definitions may optionally choose a storage provider and scope:
 Defaults preserve existing behavior:
 
 - Missing `_storage._provider` resolves to `xdb`.
-- Missing `_storage._scope` resolves to `global`.
+- Missing `_storage._scope` resolves to `app`.
 
 Supported providers:
 
@@ -112,7 +112,7 @@ All XDB resources for an EntityManager-backed entity use the same resolved physi
 - temp storage
 - metadata
 
-Backward compatibility is intentional: existing global XDB records are not automatically migrated or used as fallback records for app-scoped or server-scoped entities. Apps that omit `_storage._scope` continue to read and write the current global physical entity name.
+Backward compatibility is intentional: existing global XDB records are not automatically migrated or used as fallback records for app-scoped or server-scoped entities. Current artifacts that omit `_storage._scope` continue to resolve to app-scoped storage, as enforced by source and regression tests. Legacy global data requires the explicit migration operations described below.
 
 Normal CRUD responses intentionally do not expose this implementation detail. Use the internal `entity-manager` operation `storage-diagnostics` when debugging the current logical-to-physical mapping.
 
@@ -143,7 +143,7 @@ SQLite provider foundation support currently includes:
 - SQL-backed `find` over `_id` and indexed fields
 - `count` without loading records
 - `sum` aggregation through the generic EntityManager aggregation contract
-- unique indexes and SQLite transactions for writes
+- unique indexes and operation-local SQLite transactions for writes
 
 Supported SQLite query matrix:
 
@@ -162,7 +162,11 @@ SQLite provider capability metadata reports:
 
 - `hash-verification`: supported with bounded result sets only.
 - `aggregation`: supported for `sum` over caller-provided record arrays.
-- `transactions`: supported for writes.
+- `transactions`: unsupported because EntityProvider does not expose application-controlled transaction boundaries.
+- `operation-atomic-writes`: supported; each SQLite provider write is wrapped in an internal transaction.
+- `server-side-pagination`: supported through SQL `LIMIT` and `OFFSET`.
+- `exact-count`: supported through SQL `COUNT(*)` independently of page limits.
+- `unique-scalar-indexes`: supported through SQLite unique constraints.
 - `persistent-storage`: supported.
 - `query-operators`: supported for the matrix above.
 - `runtime-entity-handle`: supported for diagnostics.

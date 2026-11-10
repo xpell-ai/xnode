@@ -5,6 +5,7 @@ import type {
     EntityAggregationResult,
     EntityProviderCapability,
     EntityProviderCapabilityName,
+    EntityProviderConstructionOptions,
     EntityProviderDisposeResult,
     EntityPhysicalIdentity,
     EntityProvider,
@@ -13,13 +14,50 @@ import type {
 } from "./EntityProvider.js";
 import {
     aggregateEntityRecords,
+    assertEntityProviderQueryOperators,
     unsupportedEntityProviderCapabilityError
 } from "./EntityProvider.js";
 
-export type XDBEntityProviderOptions = {
-    _definition: any;
-    _physical_identity: EntityPhysicalIdentity;
-};
+export type XDBEntityProviderOptions = EntityProviderConstructionOptions;
+
+const XDB_QUERY_OPERATORS = [
+    "_starts_with",
+    "_starts",
+    "_ends_with",
+    "_ends",
+    "_contains",
+    "_is_empty",
+    "_empty",
+    "_equals",
+    "_eq",
+    "_in",
+    "=",
+    ">",
+    ">=",
+    "_gt",
+    "_gte",
+    "<",
+    "<=",
+    "_lte",
+    "_lt",
+    "_includes",
+    "_object_search",
+    "_object_array_search",
+    "_year",
+    "_month",
+    "_day",
+    "_second",
+    "_date_eq",
+    "_date_gt",
+    "_date_gte",
+    "_date_lt",
+    "_date_lte",
+    "_date_ignore_time_eq",
+    "_date_ignore_time_gt",
+    "_date_ignore_time_gte",
+    "_date_ignore_time_lt",
+    "_date_ignore_time_lte"
+] as const;
 
 export class XDBEntityProvider implements EntityProvider {
     readonly _provider: EntityProviderType = "xdb";
@@ -105,10 +143,20 @@ export class XDBEntityProvider implements EntityProvider {
         this._xdb_entity.indexAll();
     }
 
+    private normalizeRecord(record: any) {
+        if (record === null || record === undefined) {
+            return record;
+        }
+
+        return JSON.parse(JSON.stringify(record));
+    }
+
     async add(data: any) {
         await this.refreshPhysicalData();
 
-        return await this._xdb_entity.add(data);
+        return this.normalizeRecord(
+            await this._xdb_entity.add(data)
+        );
     }
 
     async get(id: string) {
@@ -118,14 +166,24 @@ export class XDBEntityProvider implements EntityProvider {
             (this._xdb_entity as any).get;
 
         if (typeof native_get === "function") {
-            return await native_get.call(this._xdb_entity, id);
+            return this.normalizeRecord(
+                await native_get.call(this._xdb_entity, id)
+            );
         }
 
-        return this._xdb_entity.findById(id);
+        return this.normalizeRecord(
+            this._xdb_entity.findById(id)
+        );
     }
 
     async find(query: any = {}, options: EntityProviderFindOptions = {}) {
         await this.refreshPhysicalData();
+
+        assertEntityProviderQueryOperators(
+            this,
+            query,
+            XDB_QUERY_OPERATORS
+        );
 
         const result =
             this._xdb_entity.find(
@@ -142,6 +200,13 @@ export class XDBEntityProvider implements EntityProvider {
                 this._physical_identity._logical_entity_id;
         }
 
+        if (Array.isArray(result?._data)) {
+            result._data =
+                result._data.map((record: any) =>
+                    this.normalizeRecord(record)
+                );
+        }
+
         return result;
     }
 
@@ -151,15 +216,31 @@ export class XDBEntityProvider implements EntityProvider {
                 query,
                 {
                     _skip: 0,
-                    _limit: 100000
+                    _limit: 0
                 }
             );
 
-        return this.getRecordCount(result);
+        const total =
+            Number(result?._meta?._total_records);
+
+        return Number.isFinite(total)
+            ? total
+            : this.getRecordCount(result);
     }
 
     async update(filter: any, updates: any) {
         await this.refreshPhysicalData();
+
+        assertEntityProviderQueryOperators(
+            this,
+            filter,
+            XDB_QUERY_OPERATORS
+        );
+
+        this.assertUniqueScalarUpdate(
+            filter,
+            updates
+        );
 
         return await this._xdb_entity.update(filter, updates);
     }
@@ -167,7 +248,107 @@ export class XDBEntityProvider implements EntityProvider {
     async delete(filter: any) {
         await this.refreshPhysicalData();
 
+        assertEntityProviderQueryOperators(
+            this,
+            filter,
+            XDB_QUERY_OPERATORS
+        );
+
         return await this._xdb_entity.delete(filter);
+    }
+
+    private uniqueScalarFields() {
+        const scalarTypes =
+            new Set([
+                "string",
+                "number",
+                "boolean",
+                "bool",
+                "date",
+                "hash",
+                "objectid"
+            ]);
+
+        return Object.entries(this._definition?._schema ?? {})
+            .filter(([, field]: [string, any]) =>
+                field?._index?._unique === true &&
+                scalarTypes.has(String(field?._type ?? "").toLowerCase())
+            )
+            .map(([fieldName]) => fieldName);
+    }
+
+    private uniqueValueKey(value: any) {
+        if (value instanceof Date) {
+            return value.toISOString();
+        }
+
+        if (value && typeof value === "object") {
+            return JSON.stringify(value);
+        }
+
+        return String(value);
+    }
+
+    private assertUniqueScalarUpdate(filter: any, updates: any) {
+        const uniqueFields =
+            this.uniqueScalarFields()
+                .filter((fieldName) =>
+                    Object.prototype.hasOwnProperty.call(updates ?? {}, fieldName)
+                );
+
+        if (uniqueFields.length === 0) {
+            return;
+        }
+
+        const runtimeEntity =
+            this._xdb_entity as any;
+        const allRecords =
+            Array.isArray(runtimeEntity?._data)
+                ? runtimeEntity._data
+                : [];
+        const selected =
+            XDB._engine.filterData(
+                allRecords,
+                filter,
+                runtimeEntity?._schema ?? {}
+            );
+        const selectedIds =
+            new Set(selected.map((record: any) => record?._id));
+
+        if (selected.length === 0) {
+            return;
+        }
+
+        for (const fieldName of uniqueFields) {
+            const value =
+                updates[fieldName];
+
+            if (value === undefined || value === null) {
+                continue;
+            }
+
+            if (selected.length > 1) {
+                throw new Error(
+                    `duplicate value for unique field '${fieldName}'`
+                );
+            }
+
+            const key =
+                this.uniqueValueKey(value);
+            const conflict =
+                allRecords.some((record: any) =>
+                    !selectedIds.has(record?._id) &&
+                    record?.[fieldName] !== undefined &&
+                    record?.[fieldName] !== null &&
+                    this.uniqueValueKey(record[fieldName]) === key
+                );
+
+            if (conflict) {
+                throw new Error(
+                    `duplicate value for unique field '${fieldName}'`
+                );
+            }
+        }
     }
 
     getSchema() {
@@ -284,9 +465,29 @@ export class XDBEntityProvider implements EntityProvider {
                 _reason: "XDBEntity does not expose transaction boundaries."
             },
             {
+                _name: "operation-atomic-writes",
+                _supported: false,
+                _reason: "Atomicity depends on the configured XDB storage adapter and is not part of the EntityProvider contract."
+            },
+            {
                 _name: "persistent-storage",
                 _supported: true,
                 _description: "Persist records through the configured XDB storage adapter."
+            },
+            {
+                _name: "server-side-pagination",
+                _supported: true,
+                _description: "Apply skip and limit inside the server-side XDB provider after in-memory filtering."
+            },
+            {
+                _name: "exact-count",
+                _supported: true,
+                _description: "Return the complete filtered total independently of find page limits."
+            },
+            {
+                _name: "unique-scalar-indexes",
+                _supported: true,
+                _description: "Enforce schema-declared uniqueness for indexed scalar fields through the provider boundary."
             },
             {
                 _name: "query-operators",

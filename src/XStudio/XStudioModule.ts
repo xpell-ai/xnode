@@ -54,6 +54,34 @@ import type {
 } from "./XStudio.types.js";
 
 const DEFAULT_ENV = "default";
+const RUNTIME_SKILL_MAX_APP_ID_LENGTH = 120;
+const RUNTIME_SKILL_MAX_ENV_LENGTH = 120;
+const RUNTIME_SKILL_MAX_JSON_BYTES = 2_000_000;
+const RUNTIME_SKILL_MAX_MODULES = 128;
+const RUNTIME_SKILL_MAX_SKILLS = 512;
+const RUNTIME_SKILL_MAX_OBJECTS = 1024;
+const RUNTIME_SKILL_MAX_TOTAL_OBJECTS = 1024;
+const RUNTIME_SKILL_MAX_TOTAL_RECORDS = 16_384;
+const RUNTIME_SKILL_MAX_DEPTH = 12;
+const RUNTIME_SKILL_MAX_ARRAY_LENGTH = 2_048;
+const RUNTIME_SKILL_MAX_STRING_LENGTH = 16_384;
+const RUNTIME_SKILL_BLOCKED_KEYS = new Set([
+  "_auth",
+  "auth",
+  "_token",
+  "token",
+  "authorization",
+  "cookie",
+  "cookies",
+  "_clearance_level",
+  "clearance_level",
+  "_user_id",
+  "user_id",
+  "_account_id",
+  "account_id",
+  "_agent_id",
+  "agent_id",
+]);
 const SUPPORTED_ARTIFACT_TYPES = new Set<XStudioArtifactType>([
   "view",
   "entity",
@@ -87,6 +115,332 @@ type XStudioArtifactSummary = {
 
 function is_plain_object(_value: unknown): _value is Record<string, unknown> {
   return typeof _value === "object" && _value !== null && !Array.isArray(_value);
+}
+
+function bounded_error_message(_value: unknown): string {
+  if (_value instanceof Error) return _value.message;
+  if (is_plain_object(_value)) {
+    const message = _value._message ?? _value.message ?? _value._reason;
+    if (typeof message === "string" && message.trim()) return message.trim();
+    const code = _value._code ?? _value.code;
+    if (typeof code === "string" && code.trim()) return code.trim();
+  }
+  if (typeof _value === "string" && _value.trim()) return _value.trim();
+  return "Runtime skill storage failed.";
+}
+
+function bounded_xvibe_failure(_value: unknown): Record<string, unknown> {
+  const result = is_plain_object(_value) && is_plain_object(_value._result)
+    ? _value._result
+    : is_plain_object(_value)
+      ? _value
+      : {};
+
+  const code = typeof result._code === "string" && result._code.trim()
+    ? result._code.trim()
+    : typeof result.code === "string" && result.code.trim()
+      ? result.code.trim()
+      : "E_XVIBE_SYNC_SKILLS_FAILED";
+
+  return {
+    _code: code,
+    _message: bounded_error_message(result),
+  };
+}
+
+function runtime_skill_object_count(skills: unknown): number {
+  if (!is_plain_object(skills)) return 0;
+  let count = Array.isArray(skills._objects) ? skills._objects.length : 0;
+  if (Array.isArray(skills._modules)) {
+    for (const module_skill of skills._modules) {
+      if (is_plain_object(module_skill) && Array.isArray(module_skill._objects)) {
+        count += module_skill._objects.length;
+      }
+    }
+  }
+  return count;
+}
+
+type RuntimeSkillPayloadMetrics = {
+  _payload_bytes: number;
+  _root_object_count: number;
+  _module_object_count: number;
+  _object_count: number;
+  _module_count: number;
+  _root_skill_count: number;
+};
+
+function safe_json_stringify(value: unknown): string {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return "";
+  }
+}
+
+function runtime_skill_payload_metrics(
+  skills: unknown,
+  json?: string,
+): RuntimeSkillPayloadMetrics {
+  const payload = is_plain_object(skills) ? skills : {};
+  const modules = Array.isArray(payload._modules) ? payload._modules : [];
+  const root_objects = Array.isArray(payload._objects) ? payload._objects : [];
+  const root_skills = Array.isArray(payload._skills) ? payload._skills : [];
+  let module_object_count = 0;
+
+  for (const module_item of modules) {
+    if (is_plain_object(module_item) && Array.isArray(module_item._objects)) {
+      module_object_count += module_item._objects.length;
+    }
+  }
+
+  const serialized = json ?? safe_json_stringify(skills);
+  return {
+    _payload_bytes: serialized ? Buffer.byteLength(serialized, "utf8") : 0,
+    _root_object_count: root_objects.length,
+    _module_object_count: module_object_count,
+    _object_count: root_objects.length + module_object_count,
+    _module_count: modules.length,
+    _root_skill_count: root_skills.length,
+  };
+}
+
+function runtime_skill_limit_details(
+  metrics: RuntimeSkillPayloadMetrics & { _record_count?: number },
+  limit_name: string,
+  configured_limit: number,
+  extra: Record<string, unknown> = {},
+) {
+  return {
+    ...metrics,
+    _limit: limit_name,
+    _configured_limit: configured_limit,
+    ...extra,
+  };
+}
+
+function read_bounded_runtime_skill_string(
+  value: unknown,
+  field_name: string,
+  max_length: number,
+): string {
+  if (typeof value !== "string") {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      `Invalid '${field_name}': expected bounded string`,
+    );
+  }
+  const out = value.trim();
+  if (!out || out.length > max_length) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      `Invalid '${field_name}': expected bounded string`,
+    );
+  }
+  return out;
+}
+
+function validate_runtime_skill_json_value(
+  value: unknown,
+  state: {
+    _depth: number;
+    _records: number;
+    _metrics: RuntimeSkillPayloadMetrics;
+  },
+): { _records: number } {
+  if (state._depth > RUNTIME_SKILL_MAX_DEPTH) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too deep",
+      runtime_skill_limit_details(
+        state._metrics,
+        "max_depth",
+        RUNTIME_SKILL_MAX_DEPTH,
+        { _depth: state._depth },
+      ),
+    );
+  }
+
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      throw create_error_result(
+        "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+        "Runtime skill payload contains invalid numeric value",
+        runtime_skill_limit_details(state._metrics, "json_value", 0),
+      );
+    }
+    return { _records: state._records };
+  }
+
+  if (typeof value === "string") {
+    if (value.length > RUNTIME_SKILL_MAX_STRING_LENGTH) {
+      throw create_error_result(
+        "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+        "Runtime skill payload string is too large",
+        runtime_skill_limit_details(
+          state._metrics,
+          "max_string_length",
+          RUNTIME_SKILL_MAX_STRING_LENGTH,
+          { _string_length: value.length },
+        ),
+      );
+    }
+    return { _records: state._records };
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length > RUNTIME_SKILL_MAX_ARRAY_LENGTH) {
+      throw create_error_result(
+        "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+        "Runtime skill payload array is too large",
+        runtime_skill_limit_details(
+          state._metrics,
+          "max_array_length",
+          RUNTIME_SKILL_MAX_ARRAY_LENGTH,
+          { _array_length: value.length },
+        ),
+      );
+    }
+    let records = state._records;
+    for (const item of value) {
+      records = validate_runtime_skill_json_value(item, {
+        _depth: state._depth + 1,
+        _records: records,
+        _metrics: state._metrics,
+      })._records;
+    }
+    return { _records: records };
+  }
+
+  if (!is_plain_object(value)) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload must be JSON-compatible metadata",
+      runtime_skill_limit_details(state._metrics, "json_value", 0),
+    );
+  }
+
+  let records = state._records + 1;
+  for (const [key, nested] of Object.entries(value)) {
+    if (RUNTIME_SKILL_BLOCKED_KEYS.has(key.toLowerCase())) {
+      throw create_error_result(
+        "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+        "Runtime skill payload contains disallowed auth field",
+        runtime_skill_limit_details(
+          state._metrics,
+          "blocked_key",
+          0,
+          { _field: key },
+        ),
+      );
+    }
+    records = validate_runtime_skill_json_value(nested, {
+      _depth: state._depth + 1,
+      _records: records,
+      _metrics: state._metrics,
+    })._records;
+    if (records > RUNTIME_SKILL_MAX_TOTAL_RECORDS) break;
+  }
+  return { _records: records };
+}
+
+function validate_runtime_skill_sync_params(params: Record<string, unknown>) {
+  const app_id = read_bounded_runtime_skill_string(
+    params._app_id,
+    "_app_id",
+    RUNTIME_SKILL_MAX_APP_ID_LENGTH,
+  );
+  const env = read_bounded_runtime_skill_string(
+    params._env,
+    "_env",
+    RUNTIME_SKILL_MAX_ENV_LENGTH,
+  );
+  if (params._mode !== "runtime") {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill sync requires _mode runtime",
+    );
+  }
+  const skills = params._skills;
+  if (!is_plain_object(skills)) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill sync requires compact _skills object",
+    );
+  }
+  const json = safe_json_stringify(skills);
+  const metrics = runtime_skill_payload_metrics(skills, json);
+  if (!json || metrics._payload_bytes > RUNTIME_SKILL_MAX_JSON_BYTES) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(
+        metrics,
+        "max_json_bytes",
+        RUNTIME_SKILL_MAX_JSON_BYTES,
+      ),
+    );
+  }
+  if (!Array.isArray(skills._modules) || !Array.isArray(skills._skills) || !Array.isArray(skills._objects)) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill sync requires compact metadata arrays",
+    );
+  }
+  if (skills._modules.length > RUNTIME_SKILL_MAX_MODULES) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(metrics, "max_modules", RUNTIME_SKILL_MAX_MODULES),
+    );
+  }
+  if (skills._skills.length > RUNTIME_SKILL_MAX_SKILLS) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(metrics, "max_root_skills", RUNTIME_SKILL_MAX_SKILLS),
+    );
+  }
+  if (skills._objects.length > RUNTIME_SKILL_MAX_OBJECTS) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(metrics, "max_root_objects", RUNTIME_SKILL_MAX_OBJECTS),
+    );
+  }
+  if (metrics._object_count > RUNTIME_SKILL_MAX_TOTAL_OBJECTS) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(
+        metrics,
+        "max_total_objects",
+        RUNTIME_SKILL_MAX_TOTAL_OBJECTS,
+      ),
+    );
+  }
+  const counts = validate_runtime_skill_json_value(skills, {
+    _depth: 0,
+    _records: 0,
+    _metrics: metrics,
+  });
+  if (counts._records > RUNTIME_SKILL_MAX_TOTAL_RECORDS) {
+    throw create_error_result(
+      "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+      "Runtime skill payload is too large",
+      runtime_skill_limit_details(
+        { ...metrics, _record_count: counts._records },
+        "max_total_records",
+        RUNTIME_SKILL_MAX_TOTAL_RECORDS,
+      ),
+    );
+  }
+  return {
+    _app_id: app_id,
+    _env: env,
+    _mode: "runtime",
+    _skills: skills,
+  };
 }
 
 function is_failed_generation_result(_value: unknown): boolean {
@@ -402,7 +756,7 @@ export const XSTUDIO_OPS: Record<string, XpellSkillCommand> = {
       _app_id: "Target app id.",
       _env: "Optional environment.",
       _client_id: "Client/session id.",
-      _mode: "Must be build or system.",
+      _mode: "Must be runtime.",
       _skills_hash: "Optional hash of the client skill snapshot.",
       _skills: "Client _x.getSkills() runtime skill snapshot."
     }
@@ -501,24 +855,129 @@ export class XStudioModule extends XModule {
   }
 
   async _sync_client_skills(xcmd: XCommand) {
-    const params = is_plain_object(xcmd?._params) ? xcmd._params : {};
+    const raw_params = is_plain_object(xcmd?._params) ? xcmd._params : {};
+    let params: ReturnType<typeof validate_runtime_skill_sync_params>;
+    try {
+      params = validate_runtime_skill_sync_params(raw_params);
+    } catch (error) {
+      const validation_error = is_error_result(error)
+        ? error._error
+        : {
+          _code: "E_STUDIO_INVALID_RUNTIME_SKILL_SYNC",
+          _message: bounded_error_message(error),
+        };
+      _xlog.warn("[studio] sync-client-skills rejected", {
+        _app_id: raw_params._app_id,
+        _env: raw_params._env,
+        _mode: raw_params._mode,
+        _error: validation_error,
+      });
+      return {
+        _ok: false,
+        _result: {
+          _synced: false,
+          _forwarded_to_xvibe: false,
+          _mode: raw_params._mode,
+          _app_id: raw_params._app_id,
+          _env: raw_params._env,
+          _skills_count: 0,
+          _object_count: 0,
+          _error: validation_error,
+        }
+      };
+    }
 
     const skills_count = Array.isArray((params._skills as any)?._modules)
       ? (params._skills as any)._modules.length
       : 0;
+    const object_count = runtime_skill_object_count(params._skills);
 
     _xlog.log("[studio] sync-client-skills received", {
       _app_id: params._app_id,
       _env: params._env,
       _mode: params._mode,
-      _skills_count: skills_count
+      _skills_count: skills_count,
+      _object_count: object_count
     });
 
-    const xvibe_result = await _x.execute({
-      _module: "xvibe",
-      _op: "sync-skills",
-      _params: params
-    } as any);
+    let xvibe_result: unknown;
+    try {
+      xvibe_result = await _x.execute({
+        _module: "xvibe",
+        _op: "sync-skills",
+        _params: params
+      } as any);
+    } catch (error) {
+      const failure = bounded_xvibe_failure(error);
+      _xlog.error("[studio] sync-client-skills failed", {
+        _app_id: params._app_id,
+        _env: params._env,
+        _mode: params._mode,
+        _skills_count: skills_count,
+        _object_count: object_count,
+        _error: failure
+      });
+      return {
+        _ok: false,
+        _result: {
+          _synced: false,
+          _forwarded_to_xvibe: true,
+          _mode: params._mode,
+          _app_id: params._app_id,
+          _env: params._env,
+          _skills_count: skills_count,
+          _object_count: object_count,
+          _error: {
+            _code: "E_STUDIO_SYNC_CLIENT_SKILLS_FAILED",
+            _message: "Runtime skill storage failed.",
+            _xvibe: failure
+          }
+        }
+      };
+    }
+
+    const xvibe_synced =
+      is_plain_object(xvibe_result) &&
+      xvibe_result._ok === true &&
+      is_plain_object(xvibe_result._result) &&
+      xvibe_result._result._synced === true;
+
+    if (!xvibe_synced) {
+      const failure = bounded_xvibe_failure(xvibe_result);
+      _xlog.error("[studio] sync-client-skills failed", {
+        _app_id: params._app_id,
+        _env: params._env,
+        _mode: params._mode,
+        _skills_count: skills_count,
+        _object_count: object_count,
+        _error: failure
+      });
+      return {
+        _ok: false,
+        _result: {
+          _synced: false,
+          _forwarded_to_xvibe: true,
+          _mode: params._mode,
+          _app_id: params._app_id,
+          _env: params._env,
+          _skills_count: skills_count,
+          _object_count: object_count,
+          _error: {
+            _code: "E_STUDIO_SYNC_CLIENT_SKILLS_FAILED",
+            _message: "Runtime skill storage failed.",
+            _xvibe: failure
+          }
+        }
+      };
+    }
+
+    _xlog.log("[studio] sync-client-skills confirmed", {
+      _app_id: params._app_id,
+      _env: params._env,
+      _mode: params._mode,
+      _skills_count: skills_count,
+      _object_count: object_count
+    });
 
     return {
       _ok: true,
@@ -529,7 +988,8 @@ export class XStudioModule extends XModule {
         _mode: params._mode,
         _app_id: params._app_id,
         _env: params._env,
-        _skills_count: skills_count
+        _skills_count: skills_count,
+        _object_count: object_count
       }
     };
   }

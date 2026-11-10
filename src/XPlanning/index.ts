@@ -7,6 +7,7 @@ export {
   extract_xvibe_planning_state,
   normalize_xvibe_planning_state,
   resolve_xnode_confirmed_runtime_lifecycle,
+  resolve_xnode_manual_runtime_lifecycle,
   resolve_xnode_planning_runtime_lifecycle,
   resolve_xnode_project_memory_runtime_lifecycle,
   validate_xvibe_planning_readiness,

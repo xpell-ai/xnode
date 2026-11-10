@@ -1,7 +1,9 @@
 import {
   create_xvibe_initial_planning_from_project_plan,
   evaluate_xvibe_initial_planning_confirmation_readiness,
+  normalize_xvibe_planner_version,
   XVIBE_INITIAL_PLANNING_CONTRACT_VERSION,
+  type XVibePlannerVersion,
   type XVibeInitialPlanningConfirmationReadiness,
   type XVibeInitialPlanningConfirmationSummary,
   type XVibeInitialPlanningDecisionEffect,
@@ -61,13 +63,15 @@ export type XNodePlanningReadiness = {
 export type XNodeRuntimeLifecycleStatus =
   | "planning"
   | "confirmed"
-  | "executing";
+  | "executing"
+  | "completed";
 
 export type XNodeRuntimeLifecyclePhase =
   | "collecting-decisions"
   | "ready-for-confirmation"
   | "confirmed"
-  | "building";
+  | "building"
+  | "manual";
 
 export type XNodeRuntimeLifecycleState = {
   _status: XNodeRuntimeLifecycleStatus;
@@ -92,6 +96,7 @@ export type XNodePlanningQuestion = {
 
 export type XNodePlanningState = Record<string, unknown> & {
   _contract_version: typeof XNODE_XVIBE_PLANNING_CONTRACT_VERSION;
+  _planner_version: XVibePlannerVersion;
   _type: "project-plan";
   _stage: "planning";
   _status: string;
@@ -549,6 +554,42 @@ export function resolve_xnode_confirmed_runtime_lifecycle(
   };
 }
 
+function read_manual_lifecycle(value: unknown): Record<string, unknown> | undefined {
+  if (!is_plain_object(value)) return undefined;
+  const status =
+    read_normalized_string(value._status) ??
+    read_normalized_string(value._lifecycle_status);
+  const phase =
+    read_normalized_string(value._phase) ??
+    read_normalized_string(value._lifecycle_phase);
+  return status === "completed" && phase === "manual" ? value : undefined;
+}
+
+function read_manual_planning_lifecycle(value: unknown): Record<string, unknown> | undefined {
+  if (!is_plain_object(value)) return undefined;
+  return read_manual_lifecycle(value._runtime_lifecycle) ??
+    read_manual_lifecycle(value._initial_planning_lifecycle) ??
+    read_manual_lifecycle(value);
+}
+
+export function resolve_xnode_manual_runtime_lifecycle(input: {
+  _planning_status?: string;
+  _project_stage?: string;
+} = {}): XNodeRuntimeLifecycleState {
+  return {
+    _status: "completed",
+    _phase: "manual",
+    ...(input._planning_status
+      ? { _planning_status: input._planning_status }
+      : {}),
+    ...(input._project_stage ? { _project_stage: input._project_stage } : {}),
+    _plan_ready: false,
+    _confirmed: false,
+    _guide_available: false,
+    _executable_guide_actions_available: false,
+  };
+}
+
 export function resolve_xnode_project_memory_runtime_lifecycle(
   project_memory: unknown,
 ): XNodeRuntimeLifecycleState {
@@ -567,6 +608,12 @@ export function resolve_xnode_project_memory_runtime_lifecycle(
       _guide_available: true,
       _executable_guide_actions_available: true,
     };
+  }
+
+  if (read_manual_planning_lifecycle(memory)) {
+    return resolve_xnode_manual_runtime_lifecycle({
+      _project_stage: project_stage,
+    });
   }
 
   return {
@@ -1001,6 +1048,13 @@ export function extract_xvibe_planning_state(value: unknown): unknown {
     return value._conversation._planning_draft;
   }
 
+  if (
+    is_plain_object(value._result) &&
+    is_plain_object(value._result._planning)
+  ) {
+    return value._result._planning;
+  }
+
   if (is_plain_object(value._planning_draft)) return value._planning_draft;
   if (is_plain_object(value._planning)) return value._planning;
 
@@ -1079,14 +1133,17 @@ export function normalize_xvibe_planning_state(
   );
   const status = normalize_status(semantic_plan._status);
   const proposed = normalize_proposed(semantic_plan._proposed);
+  const manual_lifecycle = read_manual_planning_lifecycle(raw_plan);
 
-  validate_lifecycle({
-    status,
-    current_question,
-    unanswered,
-    answers,
-    questions,
-  });
+  if (!manual_lifecycle) {
+    validate_lifecycle({
+      status,
+      current_question,
+      unanswered,
+      answers,
+      questions,
+    });
+  }
 
   const mapped_fields: string[] = [];
   for (const question of raw_plan._questions) {
@@ -1101,22 +1158,31 @@ export function normalize_xvibe_planning_state(
   }
   if (is_legacy) mapped_fields.push("missing _contract_version->1");
 
-  const runtime_lifecycle = resolve_xnode_planning_runtime_lifecycle({
-    _planning_status: status,
-    _ready: readiness._ready,
-  });
+  const runtime_lifecycle = manual_lifecycle
+    ? resolve_xnode_manual_runtime_lifecycle({
+      _planning_status: status,
+      _project_stage: read_project_stage(raw_plan._stage),
+    })
+    : resolve_xnode_planning_runtime_lifecycle({
+      _planning_status: status,
+      _ready: readiness._ready,
+    });
 
   return {
     ...clone_json(semantic_plan),
     _contract_version: XNODE_XVIBE_PLANNING_CONTRACT_VERSION,
+    _planner_version: normalize_xvibe_planner_version(raw_plan._planner_version),
     _type: "project-plan",
     _stage: "planning",
-    _status: status,
+    _status: manual_lifecycle ? "manual" : status,
+    ...(manual_lifecycle
+      ? { _lifecycle_status: "completed", _lifecycle_phase: "manual" }
+      : {}),
     ...(typeof raw_plan._domain !== "string" ? { _domain: undefined } : {}),
     _questions: questions,
     _answers: answers,
     _unanswered: unanswered,
-    _current_question: current_question,
+    _current_question: manual_lifecycle ? null : current_question,
     _proposed: proposed,
     _metadata: is_plain_object(raw_plan._metadata)
       ? clone_json(raw_plan._metadata)

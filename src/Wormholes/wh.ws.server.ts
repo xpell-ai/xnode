@@ -68,10 +68,75 @@ function getBearerToken(header: unknown): string | undefined {
   return match?.[1];
 }
 
+function getCookieToken(header: unknown, name: string | undefined): string | undefined {
+  if (!name) return undefined;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== "string" || !value.trim()) return undefined;
+
+  for (const part of value.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+
+    const key = part.slice(0, separator).trim();
+    if (key !== name) continue;
+
+    const raw = part.slice(separator + 1).trim();
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  return undefined;
+}
+
+function getHeaderValue(header: unknown): string | undefined {
+  const value = Array.isArray(header) ? header[0] : header;
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function getForwardedFirst(value: string | undefined): string | undefined {
+  return value?.split(",")[0]?.trim() || undefined;
+}
+
+function requestProtocol(req: http.IncomingMessage): string {
+  const forwarded = getForwardedFirst(getHeaderValue(req.headers["x-forwarded-proto"]));
+  if (forwarded === "https" || forwarded === "http") return forwarded;
+  return (req.socket as any)?.encrypted ? "https" : "http";
+}
+
 function safeMetaForLog(meta: WHContext["_meta"]): WHContext["_meta"] {
   if (!meta) return meta;
   const { _token, ...safe_meta } = meta;
   return safe_meta;
+}
+
+async function resolveReqAuth(env: WHEnvelope<any>, ctx: WHContext, opts: WHGatewayOptions): Promise<void> {
+  if (!opts._auth) return;
+
+  const env_token = typeof env._token === "string" && env._token.trim()
+    ? env._token.trim()
+    : undefined;
+  const token = env_token ?? ctx._meta?._token;
+  if (!token) return;
+
+  try {
+    const auth = await opts._auth({ _token: token }, ctx);
+    ctx._auth = auth?._authenticated === true
+      ? {
+        _authenticated: true,
+        _clearance_level: auth._clearance_level,
+        _user_id: auth._user_id,
+        _account_id: auth._account_id,
+        _agent_id: auth._agent_id,
+        _auth_type: auth._auth_type,
+      }
+      : { _authenticated: false };
+    if (auth?._sid) ctx._sid = auth._sid;
+  } catch {
+    ctx._auth = { _authenticated: false };
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -97,7 +162,12 @@ export function createWormholesWSServer(
     const wid = _xu.guid();
     const sid_local = _xu.guid();
     const session = new WHSession(sid_local);
-    const token = getBearerToken(req?.headers?.authorization);
+    const token =
+      getBearerToken(req?.headers?.authorization) ??
+      getCookieToken(req?.headers?.cookie, opts._auth_cookie_name);
+    const host = getHeaderValue(req?.headers?.host);
+    const forwarded_host = getForwardedFirst(getHeaderValue(req?.headers?.["x-forwarded-host"]));
+    const forwarded_proto = getForwardedFirst(getHeaderValue(req?.headers?.["x-forwarded-proto"]));
 
     const ctx: WHContext = {
       _sid: session._sid,
@@ -106,6 +176,11 @@ export function createWormholesWSServer(
         _wid: wid,
         _user_agent: req?.headers?.["user-agent"] as string | undefined,
         _ip: (req?.socket?.remoteAddress as string | undefined) ?? undefined,
+        _host: host,
+        _protocol: requestProtocol(req),
+        _origin: getHeaderValue(req?.headers?.origin),
+        _x_forwarded_host: forwarded_host,
+        _x_forwarded_proto: forwarded_proto,
         ...(token ? { _token: token } : {}),
       },
       _route: {
@@ -153,6 +228,7 @@ export function createWormholesWSServer(
         const env = parseEnvelope(raw);
 
         if (session._sid) ctx._sid = session._sid;
+        await resolveReqAuth(env, ctx, opts);
 
         const out = await handleEnvelope(env, ctx, opts);
 

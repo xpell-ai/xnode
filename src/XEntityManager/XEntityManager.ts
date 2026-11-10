@@ -1,5 +1,7 @@
 import {
     XModule,
+    XError,
+    _x,
     XResponseOK,
     XResponseError,
     type XCommand,
@@ -15,10 +17,16 @@ import type {
     EntityAggregationRequest,
     EntityPhysicalIdentity,
     EntityProvider,
+    EntityProviderRuntimeContext,
     EntityProviderType,
     EntityStorageScope
 } from "./EntityProvider.js";
 import { aggregateEntityRecords } from "./EntityProvider.js";
+import { randomUUID } from "node:crypto";
+import { SQLiteEntityProvider } from "./SQLiteEntityProvider.js";
+import { aliasHistoricalOwner } from "./EntityHistoricalOwner.js";
+import { openEntityHistoricalImport, type EntityHistoricalImportBinding, type BoundEntityHistoricalImport } from "./EntityHistoricalImport.js";
+import { localUnitError, localUnitHash, resolveLocalUnitCapacity, resolveLocalUnitHashPolicy, validateLocalUnit, type EntityLocalUnitBinding, type BoundEntityLocalUnit, type EntityLocalUnitCapacity, type EntityLocalUnitHashAcknowledgement } from "./EntityLocalUnit.js";
 import {
     createEntityProvider,
     resolveEntityProviderType
@@ -27,6 +35,20 @@ import {
     resolve_entity_scope_identity,
     type EntityScopeIdentity
 } from "./EntityScope.js";
+
+/** Compose after entity registration. No remote operation provisions this authority. */
+export async function bindEntityLocalUnit(options: EntityLocalUnitBinding): Promise<BoundEntityLocalUnit> {
+    const manager = _x.getModule("entity-manager");
+    if (!(manager instanceof XEntityManager)) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAVAILABLE");
+    return manager.bindLocalUnit(options);
+}
+
+/** Separate trusted bootstrap authority; never provisioned by a command or transport. */
+export async function bindEntityHistoricalImport(options: EntityHistoricalImportBinding): Promise<BoundEntityHistoricalImport> {
+    const manager = _x.getModule("entity-manager");
+    if (!(manager instanceof XEntityManager)) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_UNAVAILABLE");
+    return manager.bindHistoricalImport(options);
+}
 
 type EntityRegistryEntry = {
     _app_id: string;
@@ -199,12 +221,123 @@ export class XEntityManager extends XModule {
     static _ops = XENTITY_MANAGER_OPS;
 
     private _entities: Map<string, EntityRegistryEntry> = new Map();
+    private readonly _provider_runtime_context: EntityProviderRuntimeContext;
+    private readonly _historical_imports = new Map<string, BoundEntityHistoricalImport>();
+
+    async bindHistoricalImport(options: EntityHistoricalImportBinding): Promise<BoundEntityHistoricalImport> {
+        const handle = await openEntityHistoricalImport(options), key = randomUUID();
+        this._historical_imports.set(key, handle);
+        const bound: BoundEntityHistoricalImport = Object.freeze({ _import: handle._import, _capacity: handle._capacity,
+            commit: async unit => _x.execute({ _module: this._name, _op: "commit-historical-import", _params: { _historical_import_key: key, _unit: unit } }),
+            reconcile: handle.reconcile,
+            close: async () => { this._historical_imports.delete(key); await handle.close(); } });
+        aliasHistoricalOwner(bound, handle);
+        return bound;
+    }
+
+    /** Private capability operation, absent from the public/model operation catalogue. */
+    async _commit_historical_import(command: XCommand) {
+        try {
+            const params = command._params ?? {};
+            if ((command as any)._ctx || Object.keys(params).some(k => !["_historical_import_key", "_unit"].includes(k))) throw localUnitError();
+            const handle = this._historical_imports.get(String(params._historical_import_key));
+            if (!handle) throw localUnitError();
+            return await handle.commit(params._unit as any);
+        } catch { return new XResponseError(localUnitError("E_ENTITY_HISTORICAL_IMPORT_UNAUTHORIZED")).toXData(); }
+    }
+    private readonly _local_units = new Map<string, {
+        _binding: EntityLocalUnitBinding;
+        _capacity: EntityLocalUnitCapacity;
+        _hash?: EntityLocalUnitHashAcknowledgement;
+        _acknowledge_capacity: boolean;
+        _entries: Map<string, { _stored: EntityRegistryEntry; _schema_hash: string; _write: boolean }>;
+    }>();
+
+    /** Trusted bootstrap only. Not an underscore op and never callable by a transport command. */
+    async bindLocalUnit(options: EntityLocalUnitBinding): Promise<BoundEntityLocalUnit> {
+        const capacity = resolveLocalUnitCapacity(options._capacity_profile);
+        const hash = resolveLocalUnitHashPolicy(options._hash_policy);
+        const acknowledge_capacity = options._capacity_profile !== undefined;
+        if (!options._app_id || !options._env || options._entities.length < 1 || options._entities.length > capacity._limits._entities) throw localUnitError();
+        const binding = Object.freeze({ ...options, _capacity_profile: capacity._profile, _hash_policy: hash?._policy,
+            _entities: Object.freeze(options._entities.map(e => Object.freeze({ ...e }))) });
+        const entries = new Map<string, { _stored: EntityRegistryEntry; _schema_hash: string; _write: boolean }>();
+        for (const entry of binding._entities) {
+            if (entries.has(entry._entity) || typeof entry._write !== "boolean") throw localUnitError();
+            const stored = this.getStoredEntity({ _env: binding._env, _app_id: binding._app_id, _entity: entry._entity });
+            if (!(stored._provider instanceof SQLiteEntityProvider) || stored._physical_identity._storage_scope !== "app" ||
+                stored._app_id !== binding._app_id || stored._env !== binding._env) throw localUnitError("E_ENTITY_LOCAL_UNIT_STORAGE");
+            entries.set(entry._entity, { _stored: stored, _schema_hash: localUnitHash(stored._definition), _write: entry._write });
+        }
+        const providers = new Map([...entries].map(([name, entry]) => [name, entry._stored._provider as SQLiteEntityProvider]));
+        // Verify the real writer's storage profile at readiness, before allowing work.
+        await SQLiteEntityProvider.commitLocalUnit(providers, { _unit_id: randomUUID(),
+            _records: [{ _entity: binding._entities[0]._entity, _id: randomUUID() }] }, binding._clock ?? Date.now);
+        const key = randomUUID();
+        this._local_units.set(key, { _binding: binding, _capacity: capacity, _hash: hash, _acknowledge_capacity: acknowledge_capacity, _entries: entries });
+        return Object.freeze({ _app_id: binding._app_id, _env: binding._env,
+            ...(acknowledge_capacity ? { _capacity: capacity } : {}),
+            ...(hash ? { _hash: hash } : {}),
+            commit: async (unit) => _x.execute({ _module: this._name, _op: "commit-local-unit", _params: { _local_unit_key: key, _unit: unit } }) });
+    }
+
+    /** Private capability operation: deliberately absent from the general/model skill catalogue. */
+    async _commit_local_unit(command: XCommand) {
+        try {
+            const params = command._params ?? {};
+            if ((command as any)._ctx || Object.keys(params).some(k => !["_local_unit_key", "_unit"].includes(k))) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
+            const owned = this._local_units.get(String(params._local_unit_key));
+            if (!owned) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
+            const unit = validateLocalUnit(params._unit, owned._capacity._limits);
+            const { _binding: binding, _entries: entries } = owned;
+            const revalidate = () => {
+                for (const [name, entry] of entries) {
+                    const current = this.getStoredEntity({ _app_id: binding._app_id, _env: binding._env, _entity: name });
+                    if (current !== entry._stored || localUnitHash(current._definition) !== entry._schema_hash) throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+                }
+            };
+            revalidate();
+            for (const op of unit._records) {
+                const entry = entries.get(op._entity);
+                if (!entry || (!entry._write && (op._create || op._update))) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
+            }
+            const result = await SQLiteEntityProvider.commitLocalUnit(
+                new Map([...entries].map(([name, e]) => [name, e._stored._provider as SQLiteEntityProvider])),
+                unit, binding._clock ?? Date.now, binding._fault, owned._hash?._policy, owned._capacity._limits, revalidate);
+            for (const changed of result._changed) {
+                const stored = entries.get(changed._entity)!._stored;
+                const record = owned._hash ? { ...changed._record } : changed._record;
+                if (owned._hash) for (const [key, field] of Object.entries(stored._definition._schema ?? {})) {
+                    if (String((field as any)?._type).toLowerCase() === "hash") delete record[key];
+                }
+                this.broadcastEntityMutation(changed._event, stored, record);
+            }
+            if (result._changed.length) binding._fault?.("after_commit");
+            return new XResponseOK({ _records: result._records, _durability: result._durability,
+                ...(owned._acknowledge_capacity ? { _capacity: owned._capacity } : {}),
+                ...(owned._hash ? { _hash: owned._hash } : {}) }).toXData();
+        } catch (error) {
+            return new XResponseError(error instanceof XError ? error : localUnitError("E_ENTITY_LOCAL_UNIT_FAILED")).toXData();
+        }
+    }
 
     constructor(opts: any = {}) {
 
         super({
             _name: XEntityManager._name
         });
+
+        const work_folder =
+            opts?._provider_runtime_context?._work_folder ??
+            opts?._work_folder ??
+            process.cwd();
+
+        this._provider_runtime_context = {
+            _work_folder:
+                String(work_folder),
+            _sqlite_require_full_durability:
+                opts?._provider_runtime_context?._sqlite_require_full_durability === true
+        };
     }
 
     /* -------------------------------------------------- */
@@ -256,7 +389,8 @@ export class XEntityManager extends XModule {
     ): EntityProvider {
         return createEntityProvider(
             entity,
-            physical_identity
+            physical_identity,
+            this._provider_runtime_context
         );
     }
 
@@ -386,6 +520,8 @@ export class XEntityManager extends XModule {
                 physical_identity._physical_identity,
             _physical_entity_encoding:
                 physical_identity._physical_entity_encoding,
+            ...(stored._provider instanceof SQLiteEntityProvider
+                ? { _sqlite_pragmas: stored._provider.getDebugStats()._sqlite_pragmas } : {}),
             _storage_provider:
                 physical_identity._provider,
             _provider:

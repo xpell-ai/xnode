@@ -10,6 +10,8 @@ import type {
 
 const DEFAULT_DEV_SECRET = "xauth-local-dev-secret";
 const DEFAULT_EXPIRES_IN = "1h";
+const DEFAULT_MCP_TOKEN_EXPIRES_IN = "4h";
+const DEFAULT_MCP_OAUTH_ACCESS_TOKEN_EXPIRES_IN = "15m";
 const DEFAULT_ISSUER = "xpell-node";
 const API_KEY_RANDOM_BYTES = 32;
 const SCRYPT_KEY_LENGTH = 32;
@@ -52,6 +54,32 @@ export function get_jwt_config(): XAuthJWTConfig {
     _issuer: process.env.XAUTH_JWT_ISSUER ?? DEFAULT_ISSUER,
     _expires_in: process.env.XAUTH_JWT_EXPIRES_IN ?? DEFAULT_EXPIRES_IN,
     _is_dev_secret: !raw_secret
+  };
+}
+
+export function get_mcp_token_jwt_config(
+  expires_in?: string,
+): XAuthJWTConfig {
+  const base = get_jwt_config();
+  return {
+    ...base,
+    _expires_in: expires_in?.trim()
+      || process.env.XAUTH_MCP_TOKEN_EXPIRES_IN
+      || DEFAULT_MCP_TOKEN_EXPIRES_IN,
+  };
+}
+
+export function get_oauth_mcp_access_token_jwt_config(
+  issuer: string,
+  expires_in?: string,
+): XAuthJWTConfig {
+  const base = get_jwt_config();
+  return {
+    ...base,
+    _issuer: issuer.trim() || base._issuer,
+    _expires_in: expires_in?.trim()
+      || process.env.XAUTH_MCP_OAUTH_ACCESS_TOKEN_EXPIRES_IN
+      || DEFAULT_MCP_OAUTH_ACCESS_TOKEN_EXPIRES_IN,
   };
 }
 
@@ -171,10 +199,30 @@ export function pick_safe_jwt_claims(
   const email = read_optional_string_claim(claims._email);
   const role = read_optional_string_claim(claims._role);
   const roles = read_optional_string_array_claim(claims._roles);
+  const token_purpose = read_optional_token_purpose_claim(claims._token_purpose);
+  const audience = read_optional_audience_claim(claims._audience);
+  const aud = read_optional_string_claim(claims.aud);
+  const resource = read_optional_string_claim(claims.resource);
+  const scope = read_optional_string_claim(claims.scope);
+  const client_id = read_optional_string_claim(claims.client_id);
+  const jti = read_optional_string_claim(claims.jti);
+  const sub = read_optional_string_claim(claims.sub);
+  const grant_id = read_optional_string_claim(claims.grant_id);
+  const family_id = read_optional_string_claim(claims.family_id);
 
   if (email) safe_claims._email = email;
   if (role) safe_claims._role = role;
   if (roles) safe_claims._roles = roles;
+  if (token_purpose) safe_claims._token_purpose = token_purpose;
+  if (audience) safe_claims._audience = audience;
+  if (aud) safe_claims.aud = aud;
+  if (resource) safe_claims.resource = resource;
+  if (scope) safe_claims.scope = scope;
+  if (client_id) safe_claims.client_id = client_id;
+  if (jti) safe_claims.jti = jti;
+  if (sub) safe_claims.sub = sub;
+  if (grant_id) safe_claims.grant_id = grant_id;
+  if (family_id) safe_claims.family_id = family_id;
 
   return safe_claims;
 }
@@ -311,6 +359,16 @@ function read_optional_string_array_claim(value: unknown): string[] | undefined 
     .filter((item) => item.length > 0);
 
   return items.length ? items : undefined;
+}
+
+function read_optional_token_purpose_claim(value: unknown): "session" | "mcp" | undefined {
+  if (value === "session" || value === "mcp") return value;
+  return undefined;
+}
+
+function read_optional_audience_claim(value: unknown): "browser" | "mcp" | undefined {
+  if (value === "browser" || value === "mcp") return value;
+  return undefined;
 }
 
 function sign(unsigned: string, secret: string): string {

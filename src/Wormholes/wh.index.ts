@@ -27,7 +27,7 @@ export * from "./wh.errors.js";
 /* -------------------------------------------------------------------------- */
 
 export { handleEnvelope } from "./wh.gateway.js";
-export type { WHGatewayOptions } from "./wh.gateway.js";
+export type { WHAuthResult, WHGatewayOptions } from "./wh.gateway.js";
 
 export {
   WormholesModule,

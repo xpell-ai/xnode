@@ -100,10 +100,47 @@ export {
   XSettings,
 } from "@xpell/node-core";
 
-export { XWebServer } from "./XServer/XWebServer.js";
-export { XNode } from "./XServer/XNode.js";
+export {
+  XWebServer,
+  type XWebRequest,
+  type XWebRouteContributor,
+} from "./XServer/XWebServer.js";
+export { XNode, type XNodeOptions } from "./XServer/XNode.js";
+export { bindEntityLocalUnit } from "./XEntityManager/XEntityManager.js";
+export { bindEntityHistoricalImport } from "./XEntityManager/XEntityManager.js";
+export { ENTITY_HISTORICAL_IMPORT_CAPABILITIES, ENTITY_HISTORICAL_IMPORT_RUNTIME } from "./XEntityManager/EntityHistoricalImport.js";
+export type { EntityHistoricalImportManifest, EntityHistoricalImportBinding, EntityHistoricalImportUnit, BoundEntityHistoricalImport } from "./XEntityManager/EntityHistoricalImport.js";
+export { ENTITY_HISTORICAL_IMPORT_BACKUP_CAPABILITIES, ENTITY_HISTORICAL_IMPORT_BACKUP_RUNTIME,
+    backupEntityHistoricalImport, restoreEntityHistoricalImport, resumeEntityHistoricalImportRestore } from "./XEntityManager/EntityHistoricalBackup.js";
+export type { EntityHistoricalBackupOptions, EntityHistoricalRestoreOptions, BoundEntityHistoricalRestore } from "./XEntityManager/EntityHistoricalBackup.js";
+export { ENTITY_LOCAL_UNIT_CAPABILITIES, ENTITY_LOCAL_UNIT_HASH_CAPABILITIES } from "./XEntityManager/EntityLocalUnit.js";
+export { ENTITY_LOCAL_UNIT_HASH_INPUT_CAPABILITIES, assertEntityLocalUnitHashCreateInput } from "./XEntityManager/EntityLocalUnit.js";
+export type { EntityLocalUnit, EntityLocalUnitBinding, BoundEntityLocalUnit, EntityLocalUnitCapacityProfile, EntityLocalUnitCapacityLimits, EntityLocalUnitCapacity, EntityLocalUnitHashPolicy, EntityLocalUnitHashAcknowledgement } from "./XEntityManager/EntityLocalUnit.js";
 export { ServerXVMModule } from "./XVM/ServerXVMModule.js";
 export { default as ServerXVMModuleDefault } from "./XVM/ServerXVMModule.js";
+export { XAppPackageService } from "./XAppPackage/XAppPackageService.js";
+export {
+  DEFAULT_XAPP_DOWNLOAD_CORS_ORIGINS,
+  DEFAULT_XAPP_UPLOAD_MAX_BYTES,
+  XAPP_CONTENT_TYPE,
+  XAPP_DOWNLOAD_ROUTE,
+  XAPP_UPLOAD_ROUTE,
+  createXAppPackageTransferRouter,
+  createXAppDownloadRouter,
+} from "./XAppPackage/XAppDownloadTransfer.js";
+export type {
+  XAppDownloadTransfer,
+  XAppPackageRefResolution,
+  XAppPackageTransferRouterOptions,
+  XAppUploadTransfer,
+} from "./XAppPackage/XAppDownloadTransfer.js";
+export type {
+  XAppManifest,
+  XAppManifestFile,
+  XAppPackageFileKind,
+  XAppPackageLimits,
+  XAppValidationIssue,
+} from "./XAppPackage/XAppManifest.js";
 export {
   resolveProjectStage,
   type XVMProjectMemoryStage,
@@ -142,3 +179,11 @@ export * from "./XMutator/index.js"
 
 /***** XPLANNING   */
 export * from "./XPlanning/index.js"
+
+export { createFileServiceModule, FileServiceModule } from "@xpell/file-service/server";
+export type {
+  XpellFileRefV1,
+  XpellFileResolveRequirements,
+  XpellFileScopeContext,
+} from "@xpell/file-service/server";
+export type { XpellResolvedFileV1 } from "@xpell/file-service/server";

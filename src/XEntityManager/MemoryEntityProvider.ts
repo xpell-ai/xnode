@@ -6,6 +6,7 @@ import type {
     EntityProvider,
     EntityProviderCapability,
     EntityProviderCapabilityName,
+    EntityProviderConstructionOptions,
     EntityProviderDisposeResult,
     EntityProviderFindOptions,
     EntityPhysicalIdentity,
@@ -13,6 +14,7 @@ import type {
 } from "./EntityProvider.js";
 import {
     aggregateEntityRecords,
+    assertEntityProviderQueryOperators,
     unsupportedEntityProviderCapabilityError
 } from "./EntityProvider.js";
 
@@ -26,10 +28,41 @@ type MemoryIndex = {
     _data: Record<string, any>;
 };
 
-export type MemoryEntityProviderOptions = {
-    _definition: any;
-    _physical_identity: EntityPhysicalIdentity;
-};
+export type MemoryEntityProviderOptions = EntityProviderConstructionOptions;
+
+const MEMORY_QUERY_OPERATORS = [
+    "_starts_with",
+    "_starts",
+    "_ends_with",
+    "_ends",
+    "_contains",
+    "_is_empty",
+    "_empty",
+    "_equals",
+    "_eq",
+    "_in",
+    "=",
+    ">",
+    ">=",
+    "_gt",
+    "_gte",
+    "<",
+    "<=",
+    "_lte",
+    "_lt",
+    "_includes",
+    "_object_search",
+    "_object_array_search",
+    "_year",
+    "_month",
+    "_day",
+    "_second",
+    "_date_eq",
+    "_date_gt",
+    "_date_gte",
+    "_date_lt",
+    "_date_lte"
+] as const;
 
 export class MemoryEntityProvider implements EntityProvider {
     readonly _provider: EntityProviderType = "memory";
@@ -676,6 +709,12 @@ export class MemoryEntityProvider implements EntityProvider {
     }
 
     async find(query: any = {}, options: EntityProviderFindOptions = {}) {
+        assertEntityProviderQueryOperators(
+            this,
+            query,
+            MEMORY_QUERY_OPERATORS
+        );
+
         let outData =
             this._data.filter((record) => this.recordMatches(record, query));
 
@@ -785,12 +824,24 @@ export class MemoryEntityProvider implements EntityProvider {
     }
 
     async count(query: any = {}) {
+        assertEntityProviderQueryOperators(
+            this,
+            query,
+            MEMORY_QUERY_OPERATORS
+        );
+
         return this._data
             .filter((record) => this.recordMatches(record, query))
             .length;
     }
 
     async update(filter: any, updates: any) {
+        assertEntityProviderQueryOperators(
+            this,
+            filter,
+            MEMORY_QUERY_OPERATORS
+        );
+
         if (
             !filter ||
             typeof filter !== "object" ||
@@ -860,6 +911,12 @@ export class MemoryEntityProvider implements EntityProvider {
     }
 
     async delete(filter: any) {
+        assertEntityProviderQueryOperators(
+            this,
+            filter,
+            MEMORY_QUERY_OPERATORS
+        );
+
         if (
             !filter ||
             typeof filter !== "object" ||
@@ -1009,9 +1066,29 @@ export class MemoryEntityProvider implements EntityProvider {
                 _reason: "Memory entity storage does not expose transaction boundaries."
             },
             {
+                _name: "operation-atomic-writes",
+                _supported: false,
+                _reason: "Memory provider multi-record updates do not expose an operation-level atomicity guarantee."
+            },
+            {
                 _name: "persistent-storage",
                 _supported: false,
                 _reason: "Memory entity storage is process-local and intentionally volatile."
+            },
+            {
+                _name: "server-side-pagination",
+                _supported: true,
+                _description: "Apply skip and limit inside the server-side in-memory provider."
+            },
+            {
+                _name: "exact-count",
+                _supported: true,
+                _description: "Count every matching in-memory record without applying find page limits."
+            },
+            {
+                _name: "unique-scalar-indexes",
+                _supported: true,
+                _description: "Enforce schema-declared uniqueness for indexed scalar fields."
             },
             {
                 _name: "query-operators",

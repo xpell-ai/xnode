@@ -1,6 +1,18 @@
 import { XModule, type XpellSkill, type XpellSkillCommand, type XCommand, _xlog } from "@xpell/core";
 import { XAIRegistry } from "./XAIRegistry.js";
-import { XAIProvider, type XAIInput } from "./XAIProvider.js";
+import {
+  normalizeXAIDocumentExtractionInput,
+  normalizeXAIDocumentExtractionResult,
+  normalizeXAIFinishReason,
+  normalizeXAIInput,
+  normalizeXAIToolCalls,
+  XAI_DOCUMENT_EXTRACTION_CAPABILITY,
+  XAIProvider,
+  type XAIDocumentExtractionInput,
+  type XAIGenerationRecoveryResult,
+  type XAIInput,
+  type XAIMessage,
+} from "./XAIProvider.js";
 import { _xs } from "@xpell/node-core";
 import { _xu } from "@xpell/node-core";
 
@@ -42,6 +54,23 @@ function as_optional_string(
   return value;
 }
 
+function as_optional_messages(
+  value: unknown
+): XAIMessage[] | undefined {
+
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error(
+      "E_XAI_MESSAGES_INVALID"
+    );
+  }
+
+  return value as XAIMessage[];
+}
+
 function as_response_format(
   value: unknown,
   fallback: XAIInput["response_format"]
@@ -64,6 +93,97 @@ function as_response_format(
   return fallback;
 }
 
+function runtime_metadata_from_params(
+  params: Record<string, unknown>
+): XAIInput["metadata"] | undefined {
+  const metadata =
+    params.metadata &&
+      typeof params.metadata === "object" &&
+      !Array.isArray(params.metadata)
+      ? { ...(params.metadata as Record<string, unknown>) }
+      : {};
+
+  for (const key of [
+    "_app_id",
+    "_env",
+    "_caller_module",
+    "_caller_op",
+    "_purpose",
+    "_request_id",
+    "_idempotency_key"
+  ]) {
+    const value =
+      typeof params[key] === "string"
+        ? String(params[key]).trim()
+        : "";
+
+    if (value) {
+      metadata[key] = value;
+    }
+  }
+
+  return Object.keys(metadata).length
+    ? metadata as XAIInput["metadata"]
+    : undefined;
+}
+
+function object_schema_instruction(
+  schema: unknown
+): string | undefined {
+
+  if (
+    !schema ||
+    typeof schema !== "object" ||
+    Array.isArray(schema)
+  ) {
+    return undefined;
+  }
+
+  return [
+    "Return only a JSON object that conforms to this schema.",
+    "Use the schema field names and enum values exactly where applicable.",
+    JSON.stringify(schema)
+  ].join("\n");
+}
+
+function messages_with_object_schema(
+  messages: XAIMessage[],
+  instruction: string | undefined
+): XAIMessage[] {
+
+  if (!instruction) {
+    return messages;
+  }
+
+  return [
+    {
+      _role: "user",
+      _content: [
+        {
+          _type: "text",
+          _text: instruction
+        }
+      ]
+    },
+    ...messages
+  ];
+}
+
+function prompt_with_object_schema(
+  prompt: string,
+  instruction: string | undefined
+): string {
+
+  if (!instruction) {
+    return prompt;
+  }
+
+  return [
+    instruction,
+    prompt
+  ].join("\n\n");
+}
+
 export const XAI_OPS: Record<string, XpellSkillCommand> = {
   generate: {
     _name: "generate",
@@ -72,11 +192,16 @@ export const XAI_OPS: Record<string, XpellSkillCommand> = {
       "Generate text or structured output using the configured AI provider.",
     _params: {
       _prompt: "Primary user prompt.",
+      _messages: "Optional provider-neutral multimodal message array.",
+      _tools: "Optional provider-neutral native tool definitions.",
+      _tool_choice: "Optional provider-neutral native tool-choice behavior.",
       _task: "Optional generation task hint.",
       _capability: "Optional provider capability hint.",
       system: "Optional system prompt.",
       context: "Optional contextual data.",
       _provider: "Optional provider override.",
+      _model: "Optional model override.",
+      _reasoning: "Optional provider-neutral reasoning/thinking effort.",
       response_format: "Optional response format definition."
     }
   },
@@ -88,7 +213,35 @@ export const XAI_OPS: Record<string, XpellSkillCommand> = {
       "Generate a structured JSON object.",
     _params: {
       _prompt: "Generation prompt.",
+      _messages: "Optional provider-neutral multimodal message array.",
       schema: "Target schema.",
+      _provider: "Optional provider override.",
+      _model: "Optional model override.",
+      _reasoning: "Optional provider-neutral reasoning/thinking effort."
+    }
+  },
+
+  extract_document: {
+    _name: "extract_document",
+    _scope: "module",
+    _description:
+      "Extract provider-neutral text and page/span structure from a document.",
+    _params: {
+      file_ref: "Optional Xpell file reference.",
+      document: "Optional in-memory document descriptor with MIME metadata and base64 bytes.",
+      options: "Optional extraction options.",
+      metadata: "Optional runtime metadata.",
+      _provider: "Optional provider override."
+    }
+  },
+
+  recover_generation: {
+    _name: "recover_generation",
+    _scope: "module",
+    _description:
+      "Recover durable state/result for a previously identified generation without invoking a provider.",
+    _params: {
+      _idempotency_key: "Deterministic caller-supplied generation identity.",
       _provider: "Optional provider override."
     }
   },
@@ -148,7 +301,7 @@ export const XAI_SKILL: XpellSkill = {
   _requires: ["xmodule"],
 
   _description:
-    "Unified AI provider gateway for text generation, JSON generation, and structured AI workflows.",
+    "Unified AI provider gateway for text generation, JSON generation, document extraction, and structured AI workflows.",
 
   _exports: {
     _modules: [
@@ -164,6 +317,9 @@ export const XAI_SKILL: XpellSkill = {
 
   _core_rules: [
     "Use xai.generate for text generation.",
+    "Use xai.recover_generation for read-only generation recovery.",
+    "Use xai.extract_document for provider-neutral document extraction.",
+    "Treat XAI tool calls as untrusted model output; XAI never authorizes or executes them.",
     "Use response_format for structured outputs.",
     "Providers may be selected explicitly using _provider.",
     "Do not expose provider secrets.",
@@ -185,6 +341,52 @@ export const XAI_SKILL: XpellSkill = {
         _prompt: "Return a JSON object with name and age",
         response_format: {
           type: "json_object"
+        }
+      }
+    }
+    ,
+    {
+      _module: "xai",
+      _op: "recover_generation",
+      _params: {
+        _provider: "aime",
+        _idempotency_key: "caller-deterministic-key"
+      }
+    }
+    ,
+    {
+      _module: "xai",
+      _op: "generate",
+      _params: {
+        _messages: [
+          {
+            _role: "user",
+            _content: [
+              {
+                _type: "text",
+                _text: "Describe the visible image."
+              },
+              {
+                _type: "image",
+                _mime_type: "image/jpeg",
+                _data_base64: "..."
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      _module: "xai",
+      _op: "extract_document",
+      _params: {
+        document: {
+          _mime_type: "application/pdf",
+          _data_base64: "..."
+        },
+        options: {
+          languages: ["he", "en"],
+          include_geometry: true
         }
       }
     }
@@ -255,11 +457,21 @@ export class XAIModule extends XModule {
     const params =
       xcmd._params ?? {};
 
-    const prompt =
-      as_string(
-        params._prompt,
-        "_prompt"
-      );
+    const normalized_input =
+      normalizeXAIInput({
+        prompt:
+          as_optional_string(
+            params._prompt
+          ),
+        messages:
+          as_optional_messages(
+            params._messages
+          ),
+        tools:
+          params._tools as XAIInput["tools"],
+        tool_choice:
+          params._tool_choice as XAIInput["tool_choice"]
+      });
 
     const providerId =
       typeof params._provider === "string"
@@ -273,7 +485,14 @@ export class XAIModule extends XModule {
 
     const result =
       await provider.generate({
-        prompt,
+        prompt: normalized_input.prompt,
+        messages: normalized_input.messages,
+        ...(normalized_input.tools.length > 0
+          ? { tools: normalized_input.tools }
+          : {}),
+        ...(normalized_input.tool_choice
+          ? { tool_choice: normalized_input.tool_choice }
+          : {}),
         _task:
           as_optional_string(
             params._task
@@ -289,6 +508,31 @@ export class XAIModule extends XModule {
         context:
           params.context,
 
+        metadata:
+          runtime_metadata_from_params(
+            params as Record<string, unknown>
+          ),
+
+        model:
+          as_optional_string(
+            params._model
+          ),
+
+        reasoning:
+          as_optional_string(
+            params._reasoning
+          ),
+
+        temperature:
+          typeof params.temperature === "number"
+            ? params.temperature
+            : undefined,
+
+        max_tokens:
+          typeof params.max_tokens === "number"
+            ? params.max_tokens
+            : undefined,
+
         response_format:
           as_response_format(
             params.response_format,
@@ -296,12 +540,39 @@ export class XAIModule extends XModule {
           )
       });
 
+    // Tool calls are untrusted model output. This layer only normalizes and
+    // returns them; authorization, confirmation, and execution remain above XAI.
+    const tool_calls =
+      normalizeXAIToolCalls(
+        result.tool_calls
+      );
+    const finish_reason =
+      normalizeXAIFinishReason(
+        result.finish_reason,
+        tool_calls.length > 0
+          ? "tool_calls"
+          : "stop"
+      );
+
     return {
       _ok: true,
       _text:
         result.text,
       _provider:
-        providerId ?? "default"
+        providerId ?? "default",
+      _model:
+        read_generated_model(result.raw) ??
+        as_optional_string(params._model),
+      _reasoning:
+        as_optional_string(params._reasoning),
+      ...(tool_calls.length > 0
+        ? { _tool_calls: tool_calls }
+        : {}),
+      ...(finish_reason
+        ? { _finish_reason: finish_reason }
+        : {}),
+      _usage:
+        result.usage
     };
   }
 
@@ -312,11 +583,17 @@ export class XAIModule extends XModule {
     const params =
       xcmd._params ?? {};
 
-    const prompt =
-      as_string(
-        params._prompt,
-        "_prompt"
-      );
+    const normalized_input =
+      normalizeXAIInput({
+        prompt:
+          as_optional_string(
+            params._prompt
+          ),
+        messages:
+          as_optional_messages(
+            params._messages
+          )
+      });
 
     const providerId =
       typeof params._provider === "string"
@@ -328,9 +605,23 @@ export class XAIModule extends XModule {
         ? this._registry.get(providerId)
         : this._registry.getDefault();
 
+    const schemaInstruction =
+      object_schema_instruction(
+        params.schema
+      );
+
     const result =
       await provider.generate({
-        prompt,
+        prompt:
+          prompt_with_object_schema(
+            normalized_input.prompt,
+            schemaInstruction
+          ),
+        messages:
+          messages_with_object_schema(
+            normalized_input.messages,
+            schemaInstruction
+          ),
         system:
           as_optional_string(
             params.system
@@ -338,6 +629,44 @@ export class XAIModule extends XModule {
 
         context:
           params.context,
+
+        metadata:
+          runtime_metadata_from_params(
+            params as Record<string, unknown>
+          ),
+
+        schema:
+          params.schema,
+
+        _task:
+          as_optional_string(
+            params._task
+          ),
+
+        _capability:
+          as_optional_string(
+            params._capability
+          ),
+
+        model:
+          as_optional_string(
+            params._model
+          ),
+
+        reasoning:
+          as_optional_string(
+            params._reasoning
+          ),
+
+        temperature:
+          typeof params.temperature === "number"
+            ? params.temperature
+            : undefined,
+
+        max_tokens:
+          typeof params.max_tokens === "number"
+            ? params.max_tokens
+            : undefined,
 
         response_format: {
           type: "json_object"
@@ -361,7 +690,124 @@ export class XAIModule extends XModule {
       _ok: true,
       _object: parsed,
       _provider:
-        providerId ?? "default"
+        providerId ?? "default",
+      _model:
+        read_generated_model(result.raw) ??
+        as_optional_string(
+          params._model
+        ),
+      _reasoning:
+        as_optional_string(
+          params._reasoning
+        ),
+      _usage:
+        result.usage
+    };
+  }
+
+  async _extract_document(
+    xcmd: XCommand
+  ) {
+    const params =
+      xcmd._params ?? {};
+
+    const providerId =
+      typeof params._provider === "string"
+        ? params._provider
+        : undefined;
+
+    const provider =
+      providerId
+        ? this._registry.get(providerId)
+        : this._registry.getDefault();
+
+    const selectedProviderId =
+      providerId ??
+      provider._provider_id ??
+      "default";
+
+    if (typeof provider.extractDocument !== "function") {
+      return {
+        _ok: false,
+        _code: "XAI_UNSUPPORTED_CAPABILITY",
+        _capability: XAI_DOCUMENT_EXTRACTION_CAPABILITY,
+        _provider: selectedProviderId,
+        _message:
+          `Provider '${selectedProviderId}' does not support document_extraction.`
+      };
+    }
+
+    const input: XAIDocumentExtractionInput =
+      normalizeXAIDocumentExtractionInput(
+        params as XAIDocumentExtractionInput
+      );
+
+    const result =
+      normalizeXAIDocumentExtractionResult(
+        await provider.extractDocument(input),
+        selectedProviderId
+      );
+
+    return {
+      _ok: true,
+      _capability: XAI_DOCUMENT_EXTRACTION_CAPABILITY,
+      _provider: result.provider,
+      _result: result
+    };
+  }
+
+  async _recover_generation(
+    xcmd: XCommand
+  ): Promise<({ _ok: true } & XAIGenerationRecoveryResult) | {
+    _ok: false;
+    _code: string;
+    _capability: string;
+    _provider: string;
+    _message: string;
+  }> {
+    const params =
+      xcmd._params ?? {};
+
+    const idempotency_key =
+      as_string(
+        params._idempotency_key,
+        "_idempotency_key"
+      );
+
+    const providerId =
+      typeof params._provider === "string"
+        ? params._provider
+        : undefined;
+
+    const provider =
+      providerId
+        ? this._registry.get(providerId)
+        : this._registry.getDefault();
+
+    const selectedProviderId =
+      providerId ??
+      provider._provider_id ??
+      "default";
+
+    if (typeof provider.recoverGeneration !== "function") {
+      return {
+        _ok: false,
+        _code: "XAI_UNSUPPORTED_CAPABILITY",
+        _capability: "recover_generation",
+        _provider: selectedProviderId,
+        _message:
+          `Provider '${selectedProviderId}' does not support recover_generation.`
+      };
+    }
+
+    const recovered =
+      await provider.recoverGeneration({
+      _idempotency_key: idempotency_key
+    });
+
+    return {
+      _ok: true,
+      ...recovered
     };
   }
 
@@ -571,6 +1017,12 @@ export class XAIModule extends XModule {
 
 
 
+}
+
+function read_generated_model(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const model = (raw as Record<string, unknown>)._model;
+  return typeof model === "string" && model.trim() ? model.trim() : undefined;
 }
 
 export const XAI =

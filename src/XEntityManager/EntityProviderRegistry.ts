@@ -1,6 +1,8 @@
 import type {
+    EntityProviderConstructionOptions,
     EntityPhysicalIdentity,
     EntityProvider,
+    EntityProviderRuntimeContext,
     EntityProviderType
 } from "./EntityProvider.js";
 import { MemoryEntityProvider } from "./MemoryEntityProvider.js";
@@ -8,10 +10,9 @@ import { MongoEntityProvider } from "./MongoEntityProvider.js";
 import { SQLiteEntityProvider } from "./SQLiteEntityProvider.js";
 import { XDBEntityProvider } from "./XDBEntityProvider.js";
 
-type EntityProviderConstructor = new (opts: {
-    _definition: any;
-    _physical_identity: EntityPhysicalIdentity;
-}) => EntityProvider;
+type EntityProviderConstructor = new (
+    opts: EntityProviderConstructionOptions
+) => EntityProvider;
 
 const ENTITY_PROVIDER_TYPES: EntityProviderType[] = [
     "xdb",
@@ -48,7 +49,8 @@ export function resolveEntityProviderType(raw_provider: any): EntityProviderType
 
 export function createEntityProvider(
     definition: any,
-    physical_identity: EntityPhysicalIdentity
+    physical_identity: EntityPhysicalIdentity,
+    runtime_context?: EntityProviderRuntimeContext
 ): EntityProvider {
     const Provider =
         ENTITY_PROVIDER_REGISTRY[physical_identity._provider];
@@ -63,6 +65,8 @@ export function createEntityProvider(
         _definition:
             definition,
         _physical_identity:
-            physical_identity
+            physical_identity,
+        _runtime_context:
+            runtime_context
     });
 }

@@ -20,6 +20,7 @@ import {
   resolveProjectStage,
   type XVMProjectMemoryStage,
 } from "./ProjectMemoryStage.js";
+import { XAppPackageService } from "../XAppPackage/XAppPackageService.js";
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -60,6 +61,9 @@ export type XVMAppBundle = {
 
 export type XVMProjectMemory = {
   _version: number;
+  _planner_version?: "v1" | "v2";
+  _initial_planner_version?: "v1" | "v2";
+  _confirmed_planner_version?: "v1" | "v2";
   _stage: XVMProjectMemoryStage;
   _vision: string;
   _goal: string;
@@ -71,6 +75,8 @@ export type XVMProjectMemory = {
     _server_modules?: unknown[];
   };
   _confirmed_initial_plan?: Record<string, any>;
+  _confirmed_application_plan_v2?: Record<string, any>;
+  _initial_planning_lifecycle?: Record<string, any>;
   _semantic_generation_plan?: Record<string, any>;
   _current_focus: string;
   _completed: unknown[];
@@ -133,8 +139,10 @@ type XVMDeterministicViewEditPreflight = {
 const DEFAULT_ENV = "default";
 const DEFAULT_WORK_FOLDER = "./work";
 const XVM_FOLDER = "xvm/apps";
+const XVM_TRASH_FOLDER = "trash";
 const GENERATED_MODULE_REGISTRY_FILE = "generated/xmodules/registry.json";
 const ACTIVE_APPS_SETTINGS_KEY = "_active_apps";
+const DEFAULT_APPS_SETTINGS_KEY = "_default_apps";
 const XVM_VISIBILITY_PROPERTY = "_visible";
 const XNODE_PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const ALLOWED_VIEW_STARTER_TEMPLATES = new Set(["blank", "page", "component"]);
@@ -382,10 +390,47 @@ export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
     _scope: "module",
     _description: "Get active application."
   },
+
+  get_default_app: {
+    _name: "get-default-app",
+    _scope: "module",
+    _description: "Get the server-owned production default application for an environment."
+  },
+
+  set_default_app: {
+    _name: "set-default-app",
+    _scope: "module",
+    _description: "Persist the server-owned production default application for an environment."
+  },
+
+  clear_default_app: {
+    _name: "clear-default-app",
+    _scope: "module",
+    _description: "Clear the server-owned production default application for an environment."
+  },
+
   list_apps: {
     _name: "list_apps",
     _scope: "module",
     _description: "List loaded runtime applications."
+  },
+
+  list_trashed_apps: {
+    _name: "list-trashed-apps",
+    _scope: "module",
+    _description: "List recoverable trashed user applications."
+  },
+
+  trash_app: {
+    _name: "trash-app",
+    _scope: "module",
+    _description: "Move a user application to recoverable server-controlled trash."
+  },
+
+  restore_app: {
+    _name: "restore-app",
+    _scope: "module",
+    _description: "Restore a user application from recoverable server-controlled trash."
   },
 
   load_app_from_disk: {
@@ -428,6 +473,36 @@ export const SERVER_XVM_OPS: Record<string, XpellSkillCommand> = {
     _name: "save_view_json",
     _scope: "module",
     _description: "Persist a view JSON artifact."
+  },
+
+  export_app: {
+    _name: "export_app",
+    _scope: "module",
+    _description: "Export a portable .xapp package."
+  },
+
+  upload_app_package: {
+    _name: "upload-app-package",
+    _scope: "module",
+    _description: "Upload a browser-selected .xapp package into temporary server storage."
+  },
+
+  inspect_app_package: {
+    _name: "inspect_app_package",
+    _scope: "module",
+    _description: "Inspect and validate a portable .xapp package without modifying runtime state."
+  },
+
+  preview_app_import: {
+    _name: "preview_app_import",
+    _scope: "module",
+    _description: "Validate and preview a .xapp import without activation."
+  },
+
+  import_app: {
+    _name: "import_app",
+    _scope: "module",
+    _description: "Import and activate a portable .xapp package."
   }
 };
 
@@ -579,6 +654,87 @@ export class ServerXVMModule extends XModule {
     };
   }
 
+  async _get_default_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const env = this.resolve_env(params);
+    const app_id = this.read_default_apps_setting()[env] ?? null;
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env,
+        _has_default: typeof app_id === "string" && app_id.length > 0
+      }
+    };
+  }
+
+  async _set_default_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const app_id = this.resolve_safe_segment(params._app_id, "_app_id", "E_XVM_INVALID_APP_ID");
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+
+    const key = app_scope_key(app_id, env);
+    const bundle = this._apps.get(key);
+    if (!bundle) {
+      if (fs.existsSync(path.join(this.resolve_trash_app_dir(env, app_id), "app.json"))) {
+        throw new XError("E_XVM_DEFAULT_APP_TRASHED", `Default app target is trashed: ${app_id}`);
+      }
+      throw new XError("E_XVM_APP_NOT_FOUND", `App not found: ${app_id}`);
+    }
+
+    if (bundle._app?._system === true) {
+      throw new XError("E_XVM_DEFAULT_SYSTEM_APP_FORBIDDEN", `System app cannot be the production default: ${app_id}`);
+    }
+
+    this.persist_default_app(env, app_id);
+
+    _xlog.log("[server-xvm] default app set", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env,
+        _persisted: true
+      }
+    };
+  }
+
+  async _clear_default_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const previous_app_id = this.read_default_apps_setting()[env] ?? null;
+
+    this.clear_default_app(env);
+
+    _xlog.log("[server-xvm] default app cleared", {
+      _app_id: previous_app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: null,
+        _previous_app_id: previous_app_id,
+        _env: env,
+        _cleared: previous_app_id !== null
+      }
+    };
+  }
+
   /* ------------------------------------------------------------------------ */
   /* GET APP                                                                  */
   /* ------------------------------------------------------------------------ */
@@ -627,6 +783,188 @@ export class ServerXVMModule extends XModule {
     };
   }
 
+  async _list_trashed_apps(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const env = typeof params._env === "string" && params._env.trim()
+      ? this.resolve_safe_segment(params._env, "_env", "E_XVM_INVALID_ENV")
+      : undefined;
+
+    const trash_root = this.resolve_trash_root();
+    const apps: Array<Record<string, any>> = [];
+
+    if (fs.existsSync(trash_root)) {
+      const env_entries = env
+        ? [env]
+        : fs.readdirSync(trash_root, { withFileTypes: true })
+          .filter(entry => entry.isDirectory())
+          .map(entry => entry.name);
+
+      for (const env_id of env_entries) {
+        const env_dir = path.join(trash_root, env_id);
+        if (!fs.existsSync(env_dir)) continue;
+        for (const entry of fs.readdirSync(env_dir, { withFileTypes: true })) {
+          if (!entry.isDirectory()) continue;
+          const app_id = entry.name;
+          const app_file = path.join(env_dir, app_id, "app.json");
+          if (!fs.existsSync(app_file)) continue;
+          apps.push({
+            _app_id: app_id,
+            _env: env_id,
+            _status: "trashed"
+          });
+        }
+      }
+    }
+
+    apps.sort((a, b) =>
+      String(a._env).localeCompare(String(b._env)) ||
+      String(a._app_id).localeCompare(String(b._app_id))
+    );
+
+    return {
+      _ok: true,
+      _result: {
+        _app_ids: apps.map(app => app._app_id),
+        _apps: apps
+      }
+    };
+  }
+
+  async _trash_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const app_id = this.resolve_safe_segment(params._app_id, "_app_id", "E_XVM_INVALID_APP_ID");
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const key = app_scope_key(app_id, env);
+    const app_dir = this.resolve_user_app_dir(env, app_id);
+    const trash_dir = this.resolve_trash_app_dir(env, app_id);
+    const bundle = this._apps.get(key);
+
+    if (bundle?._app?._system === true) {
+      throw new XError("E_XVM_SYSTEM_APP_TRASH_FORBIDDEN", `System app cannot be moved to trash: ${app_id}`);
+    }
+
+    if (!fs.existsSync(path.join(app_dir, "app.json"))) {
+      if (fs.existsSync(path.join(trash_dir, "app.json"))) {
+        throw new XError("E_XVM_APP_ALREADY_TRASHED", `App is already trashed: ${app_id}`);
+      }
+      throw new XError("E_XVM_APP_NOT_FOUND", `App not found: ${app_id}`);
+    }
+
+    if (fs.existsSync(trash_dir)) {
+      throw new XError("E_XVM_APP_ALREADY_TRASHED", `App is already trashed: ${app_id}`);
+    }
+
+    const was_active = this._active_app_by_env.get(env) === app_id || this.read_active_apps_setting()[env] === app_id;
+    const was_default = this.read_default_apps_setting()[env] === app_id;
+    fs.mkdirSync(path.dirname(trash_dir), { recursive: true });
+    fs.renameSync(app_dir, trash_dir);
+
+    try {
+      await this.unregister_bundle_entities(bundle);
+      this._apps.delete(key);
+      this.clear_active_app_if_matches(env, app_id);
+      this.clear_default_app_if_matches(env, app_id);
+    } catch (err) {
+      try {
+        fs.renameSync(trash_dir, app_dir);
+        if (bundle) this._apps.set(key, bundle);
+        if (was_active) {
+          try {
+            this.persist_active_app(env, app_id);
+            this._active_app_by_env.set(env, app_id);
+          } catch {
+          }
+        }
+        if (was_default) {
+          try {
+            this.persist_default_app(env, app_id);
+          } catch {
+          }
+        }
+      } catch {
+      }
+      throw err;
+    }
+
+    _xlog.log("[server-xvm] app moved to trash", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env,
+        _status: "trashed"
+      }
+    };
+  }
+
+  async _restore_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const app_id = this.resolve_safe_segment(params._app_id, "_app_id", "E_XVM_INVALID_APP_ID");
+    const env = this.resolve_safe_segment(
+      typeof params._env === "string" ? params._env : DEFAULT_ENV,
+      "_env",
+      "E_XVM_INVALID_ENV"
+    );
+    const key = app_scope_key(app_id, env);
+    const app_dir = this.resolve_user_app_dir(env, app_id);
+    const trash_dir = this.resolve_trash_app_dir(env, app_id);
+
+    if (this._apps.has(key) || fs.existsSync(path.join(app_dir, "app.json"))) {
+      throw new XError("E_XVM_APP_RESTORE_COLLISION", `Active app already exists: ${app_id}`);
+    }
+
+    if (!fs.existsSync(path.join(trash_dir, "app.json"))) {
+      throw new XError("E_XVM_TRASHED_APP_NOT_FOUND", `Trashed app not found: ${app_id}`);
+    }
+
+    const raw_app = this.read_json_file(path.join(trash_dir, "app.json"));
+    if (
+      (typeof raw_app._app_id === "string" && raw_app._app_id !== app_id) ||
+      (typeof raw_app._env === "string" && raw_app._env !== env)
+    ) {
+      throw new XError("E_XVM_TRASHED_APP_MISMATCH", "Trashed app metadata does not match restore target");
+    }
+
+    fs.mkdirSync(path.dirname(app_dir), { recursive: true });
+    fs.renameSync(trash_dir, app_dir);
+
+    try {
+      const loaded = await this.loadAppFromDir(app_dir, env, false);
+      if (loaded._apps < 1 || !this._apps.has(key)) {
+        throw new XError("E_XVM_APP_RESTORE_LOAD_FAILED", `Failed to reload restored app: ${app_id}`);
+      }
+    } catch (err) {
+      this._apps.delete(key);
+      try {
+        fs.renameSync(app_dir, trash_dir);
+      } catch {
+      }
+      throw err;
+    }
+
+    _xlog.log("[server-xvm] app restored from trash", {
+      _app_id: app_id,
+      _env: env
+    });
+
+    return {
+      _ok: true,
+      _result: {
+        _app_id: app_id,
+        _env: env,
+        _status: "restored"
+      }
+    };
+  }
+
   async _load_app_from_disk(xcmd: XCommand) {
     const params = _xu.ensure_params(xcmd?._params);
     const app_id = this.resolve_safe_segment(params._app_id, "_app_id", "E_XVM_INVALID_APP_ID");
@@ -641,7 +979,9 @@ export class ServerXVMModule extends XModule {
       throw new XError("E_XVM_APP_NOT_FOUND", `App not found on disk: ${app_id}`);
     }
 
-    const loaded = await this.loadAppFromDir(app_dir, env, false);
+    const loaded = await this.loadAppFromDir(app_dir, env, false, {
+      _expected_replace: params._expected_replace === true
+    });
 
     if (loaded._apps < 1) {
       throw new XError("E_XVM_APP_LOAD_FAILED", `Failed to load app from disk: ${app_id}`);
@@ -2225,6 +2565,18 @@ export class ServerXVMModule extends XModule {
       read_non_empty_string(params._set_default_view_id) === operation._target._view_id;
   }
 
+  private bundle_default_view_matches(bundle: XVMAppBundle, view_id: string): boolean {
+    const meta_view_id = read_non_empty_string(bundle._app?._meta?._entry_view_id);
+    const config = _xu.is_plain_object(bundle._app?._config)
+      ? bundle._app._config
+      : {};
+    const start = _xu.is_plain_object(config._start)
+      ? config._start
+      : {};
+    const start_view_id = read_non_empty_string(start._view_id);
+    return meta_view_id === view_id && start_view_id === view_id;
+  }
+
   private apply_default_view_request(input: {
     bundle: XVMAppBundle;
     view_id: string;
@@ -2422,6 +2774,24 @@ export class ServerXVMModule extends XModule {
     const current_view = bundle._views[view_id];
     const next_view = clone_json(operation._artifact._view);
     if (current_view && JSON.stringify(current_view) === JSON.stringify(next_view)) {
+      let default_view_changed = false;
+      if (
+        this.generated_operation_sets_default_view(operation, input.params) &&
+        !this.bundle_default_view_matches(bundle, view_id)
+      ) {
+        const snapshot = this.snapshot_bundle(app_id, env);
+        try {
+          this.apply_default_view_request({
+            bundle,
+            view_id,
+          });
+          this.persist_bundle(bundle);
+          default_view_changed = true;
+        } catch (error) {
+          this.restore_bundle_snapshot(snapshot);
+          throw error;
+        }
+      }
       const memory =
         input.defer_project_memory_refresh
           ? undefined
@@ -2444,7 +2814,8 @@ export class ServerXVMModule extends XModule {
           _kind: operation._kind,
           _view_id: view_id,
           _already_completed: true,
-          _changed: false,
+          _changed: default_view_changed,
+          _default_view_changed: default_view_changed,
           _refresh: this.refreshed_change_plan_state(app_id, env),
           ...(memory ? { _project_memory: memory } : {}),
         },
@@ -3215,6 +3586,40 @@ export class ServerXVMModule extends XModule {
     } as unknown as XCommand);
   }
 
+  async _export_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const download_base_url = this.resolve_xapp_download_base_url((xcmd as any)?._ctx);
+    return this.create_xapp_package_service().export_app({
+      ...params,
+      ...(download_base_url ? { _download_base_url: download_base_url } : {}),
+    });
+  }
+
+  async _upload_app_package(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    const result = this.create_xapp_package_service().upload_app_package(params);
+    _xlog.log("[server-xvm] xapp upload requested", {
+      _filename: result._result._filename,
+      _size: result._result._size,
+    });
+    return result;
+  }
+
+  async _inspect_app_package(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    return this.create_xapp_package_service().inspect_app_package(params);
+  }
+
+  async _preview_app_import(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    return this.create_xapp_package_service().preview_app_import(params);
+  }
+
+  async _import_app(xcmd: XCommand) {
+    const params = _xu.ensure_params(xcmd?._params);
+    return this.create_xapp_package_service().import_app(params);
+  }
+
   override async onLoad() {
     await super.onLoad();
     await this.init_on_boot();
@@ -3310,7 +3715,12 @@ export class ServerXVMModule extends XModule {
     return stats;
   }
 
-  private async loadAppFromDir(app_dir: string, env: string, system: boolean) {
+  private async loadAppFromDir(
+    app_dir: string,
+    env: string,
+    system: boolean,
+    options: { _expected_replace?: boolean } = {}
+  ) {
     const app_file_path = path.join(app_dir, "app.json");
     const stats = { _apps: 0, _views: 0, _flows: 0, _entities: 0 };
     if (!fs.existsSync(app_file_path)) return stats;
@@ -3378,10 +3788,15 @@ export class ServerXVMModule extends XModule {
 
     const key = app_scope_key(app_file._app_id, app_file._env);
     if (this._apps.has(key)) {
-      _xlog.warn("[server-xvm] app id collision", {
+      const log_payload = {
         _app_id: app_file._app_id,
         _env: app_file._env
-      });
+      };
+      if (options._expected_replace) {
+        _xlog.log("[server-xvm] app package replace reload", log_payload);
+      } else {
+        _xlog.warn("[server-xvm] app id collision", log_payload);
+      }
     }
 
     this._apps.set(key, loaded_bundle);
@@ -3403,6 +3818,79 @@ export class ServerXVMModule extends XModule {
     const bundle = this._apps.get(app_scope_key(app_id, env));
     if (!bundle) throw new XError("E_XVM_APP_NOT_FOUND", `App not found: ${app_id}`);
     return bundle;
+  }
+
+  private create_xapp_package_service(): XAppPackageService {
+    return new XAppPackageService({
+      _work_folder: this._work_folder,
+      _apps_root: this._apps_root,
+      _server: {
+        _work_folder: this._work_folder,
+        _apps_root: this._apps_root,
+        _get_bundle: (app_id, env) => this.get_bundle(app_id, env),
+        _read_loaded_bundle: (app_id, env) => this.get_bundle(app_id, env),
+        _resolve_user_app_dir: (env, app_id) => this.resolve_user_app_dir(env, app_id),
+        _validate_bundle: (bundle) => this.validate_bundle_runtime_contract(bundle),
+        _load_app_from_disk: async (app_id, env, options) => this._load_app_from_disk({
+          _params: {
+            _app_id: app_id,
+            _env: env,
+            ...(options?._expected_replace ? { _expected_replace: true } : {})
+          }
+        } as unknown as XCommand),
+      }
+    });
+  }
+
+  private async unregister_bundle_entities(bundle: XVMAppBundle | undefined) {
+    if (!bundle) return;
+    const entities = Object.keys(bundle._entities || {});
+    for (const entity_id of entities) {
+      const response = await _x.execute({
+        _module: "entity-manager",
+        _op: "unregister",
+        _params: {
+          _app_id: bundle._app._app_id,
+          _env: bundle._app._env,
+          _entity_id: entity_id
+        }
+      });
+
+      if (!response?._ok) {
+        throw new XError("E_XVM_ENTITY_SYNC_FAILED", "Failed to unregister entity runtime schema", {
+          _meta: {
+            _app_id: bundle._app._app_id,
+            _env: bundle._app._env,
+            _entity_id: entity_id,
+            _error: response?._result
+          }
+        });
+      }
+    }
+  }
+
+  private resolve_xapp_download_base_url(ctx: any): string | undefined {
+    const meta = ctx && typeof ctx === "object" && ctx._meta && typeof ctx._meta === "object"
+      ? ctx._meta
+      : {};
+    const host = this.safe_xapp_transfer_host(meta._x_forwarded_host ?? meta._host);
+    if (!host) return undefined;
+    const protocol = meta._x_forwarded_proto === "https" || meta._protocol === "https"
+      ? "https"
+      : "http";
+    return `${protocol}://${host}`;
+  }
+
+  private safe_xapp_transfer_host(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const host = value.split(",")[0]?.trim();
+    if (!host || host.length > 255) return undefined;
+    if (!/^[a-zA-Z0-9.:-]+$/u.test(host)) return undefined;
+    try {
+      return new URL(`http://${host}`).host;
+    } catch {
+      return undefined;
+    }
   }
 
   private resolve_default_app_id(env: string): string {
@@ -3466,6 +3954,31 @@ export class ServerXVMModule extends XModule {
     return active_apps;
   }
 
+  private read_default_apps_setting(): Record<string, string> {
+    if (!this.prepare_server_settings()) {
+      return {};
+    }
+
+    const raw = _xs.get(DEFAULT_APPS_SETTINGS_KEY);
+    if (!_xu.is_plain_object(raw)) {
+      return {};
+    }
+
+    const default_apps: Record<string, string> = {};
+    for (const [env, app_id] of Object.entries(raw)) {
+      if (
+        typeof env === "string" &&
+        env.trim().length > 0 &&
+        typeof app_id === "string" &&
+        app_id.trim().length > 0
+      ) {
+        default_apps[env.trim()] = app_id.trim();
+      }
+    }
+
+    return default_apps;
+  }
+
   private persist_active_app(env: string, app_id: string) {
     if (!this.prepare_server_settings()) {
       throw new XError("E_XVM_SETTINGS_LOAD_FAILED", "Failed to load server settings");
@@ -3489,6 +4002,103 @@ export class ServerXVMModule extends XModule {
     if (!persisted) {
       throw new XError("E_XVM_SETTINGS_SAVE_FAILED", "Failed to persist active app setting");
     }
+  }
+
+  private persist_default_app(env: string, app_id: string) {
+    if (!this.prepare_server_settings()) {
+      throw new XError("E_XVM_SETTINGS_LOAD_FAILED", "Failed to load server settings");
+    }
+
+    _xs.set(DEFAULT_APPS_SETTINGS_KEY, {
+      ...this.read_default_apps_setting(),
+      [env]: app_id,
+    });
+
+    let persisted = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.resolve_server_settings_file(), "utf-8"));
+      persisted =
+        _xu.is_plain_object(saved?._default_apps) &&
+        saved._default_apps[env] === app_id;
+    } catch {
+      persisted = false;
+    }
+
+    if (!persisted) {
+      throw new XError("E_XVM_SETTINGS_SAVE_FAILED", "Failed to persist default app setting");
+    }
+  }
+
+  private clear_active_app_if_matches(env: string, app_id: string) {
+    const active_apps = this.read_active_apps_setting();
+    if (this._active_app_by_env.get(env) !== app_id && active_apps[env] !== app_id) {
+      return;
+    }
+
+    if (!this.prepare_server_settings()) {
+      throw new XError("E_XVM_SETTINGS_LOAD_FAILED", "Failed to load server settings");
+    }
+
+    delete active_apps[env];
+    _xs.set(ACTIVE_APPS_SETTINGS_KEY, active_apps);
+    this._active_app_by_env.delete(env);
+
+    let cleared = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.resolve_server_settings_file(), "utf-8"));
+      cleared =
+        !_xu.is_plain_object(saved?._active_apps) ||
+        saved._active_apps[env] !== app_id;
+    } catch {
+      cleared = false;
+    }
+
+    if (!cleared) {
+      throw new XError("E_XVM_SETTINGS_SAVE_FAILED", "Failed to clear active app setting");
+    }
+  }
+
+  private clear_default_app(env: string): string | null {
+    const default_apps = this.read_default_apps_setting();
+    const previous_app_id = default_apps[env] ?? null;
+
+    if (!this.prepare_server_settings()) {
+      throw new XError("E_XVM_SETTINGS_LOAD_FAILED", "Failed to load server settings");
+    }
+
+    delete default_apps[env];
+    _xs.set(DEFAULT_APPS_SETTINGS_KEY, default_apps);
+
+    let cleared = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(this.resolve_server_settings_file(), "utf-8"));
+      cleared =
+        !_xu.is_plain_object(saved?._default_apps) ||
+        saved._default_apps[env] === undefined;
+    } catch {
+      cleared = false;
+    }
+
+    if (!cleared) {
+      throw new XError("E_XVM_SETTINGS_SAVE_FAILED", "Failed to clear default app setting");
+    }
+
+    return previous_app_id;
+  }
+
+  private clear_default_app_if_matches(env: string, app_id: string) {
+    const default_apps = this.read_default_apps_setting();
+    if (default_apps[env] !== app_id) {
+      return;
+    }
+
+    this.clear_default_app(env);
+
+    _xlog.log("[server-xvm] default app cleared", {
+      _app_id: app_id,
+      _env: env,
+      _reason: "trashed"
+    });
   }
 
   private restore_active_apps_from_settings(): number {
@@ -3704,6 +4314,15 @@ export class ServerXVMModule extends XModule {
       _vision: typeof raw._vision === "string" ? raw._vision : current._vision,
       _goal: typeof raw._goal === "string" ? raw._goal : current._goal,
       ...(typeof raw._summary === "string" ? { _summary: raw._summary } : {}),
+      ...(raw._planner_version === "v1" || raw._planner_version === "v2"
+        ? { _planner_version: raw._planner_version }
+        : {}),
+      ...(raw._initial_planner_version === "v1" || raw._initial_planner_version === "v2"
+        ? { _initial_planner_version: raw._initial_planner_version }
+        : {}),
+      ...(raw._confirmed_planner_version === "v1" || raw._confirmed_planner_version === "v2"
+        ? { _confirmed_planner_version: raw._confirmed_planner_version }
+        : {}),
       ...(_xu.is_plain_object(raw._proposed)
         ? {
           _proposed: {
@@ -3724,6 +4343,12 @@ export class ServerXVMModule extends XModule {
         : {}),
       ...(_xu.is_plain_object(raw._confirmed_initial_plan)
         ? { _confirmed_initial_plan: clone_json(raw._confirmed_initial_plan) }
+        : {}),
+      ...(_xu.is_plain_object(raw._confirmed_application_plan_v2)
+        ? { _confirmed_application_plan_v2: clone_json(raw._confirmed_application_plan_v2) }
+        : {}),
+      ...(_xu.is_plain_object(raw._initial_planning_lifecycle)
+        ? { _initial_planning_lifecycle: clone_json(raw._initial_planning_lifecycle) }
         : {}),
       ...(_xu.is_plain_object(raw._semantic_generation_plan)
         ? { _semantic_generation_plan: clone_json(raw._semantic_generation_plan) }
@@ -3947,6 +4572,25 @@ export class ServerXVMModule extends XModule {
       path.isAbsolute(relative)
     ) {
       throw new XError("E_XVM_INVALID_APP_PATH", "Invalid user app path");
+    }
+
+    return app_dir;
+  }
+
+  private resolve_trash_root(): string {
+    return path.resolve(path.dirname(path.resolve(this._apps_root)), XVM_TRASH_FOLDER);
+  }
+
+  private resolve_trash_app_dir(env: string, app_id: string): string {
+    const root = this.resolve_trash_root();
+    const app_dir = path.resolve(root, env, app_id);
+    const relative = path.relative(root, app_dir);
+
+    if (
+      relative.startsWith("..") ||
+      path.isAbsolute(relative)
+    ) {
+      throw new XError("E_XVM_INVALID_TRASH_PATH", "Invalid trash app path");
     }
 
     return app_dir;

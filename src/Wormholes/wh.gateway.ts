@@ -57,7 +57,9 @@ export type WHAuthResult = {
   // optional identity + clearance
   _clearance_level?: number;
   _user_id?: string;
+  _account_id?: string;
   _agent_id?: string;
+  _auth_type?: string;
 
   // extra payload returned to client in AUTH RES
   _result?: any;
@@ -68,6 +70,7 @@ export type WHGatewayOptions = {
   _xpell?: string;         // xpell version (optional)
   _caps?: string[];        // hello caps override
   _require_auth?: boolean; // default true
+  _auth_cookie_name?: string;
 
   /**
    * AUTH handler for your environment.
@@ -151,7 +154,9 @@ function injectMeta(cmd: XCmd, ctx: WHContext): XCmd {
     _authenticated: ctx?._auth?._authenticated === true,
     _clearance_level: ctx?._auth?._clearance_level ?? 0,
     _user_id: ctx?._auth?._user_id,
+    _account_id: ctx?._auth?._account_id,
     _agent_id: ctx?._auth?._agent_id,
+    _auth_type: ctx?._auth?._auth_type,
   };
 
   return cmd;
@@ -227,7 +232,9 @@ export async function handleEnvelope(
           _authenticated: true,
           _clearance_level: out._clearance_level,
           _user_id: out._user_id,
+          _account_id: out._account_id,
           _agent_id: out._agent_id,
+          _auth_type: out._auth_type,
         };
 
         if (out._sid) ctx._sid = out._sid;
@@ -236,7 +243,9 @@ export async function handleEnvelope(
           _sid: ctx._sid,
           _clearance_level: out._clearance_level,
           _user_id: out._user_id,
+          _account_id: out._account_id,
           _agent_id: out._agent_id,
+          _auth_type: out._auth_type,
           ...(out._result ? { _data: out._result } : {}),
         };
 

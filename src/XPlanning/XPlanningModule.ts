@@ -10,6 +10,7 @@ import {
   type XpellSkillCommand,
 } from "@xpell/core";
 import { _xu } from "@xpell/node-core";
+import { read_xvibe_explicit_planner_version } from "@xpell/vibe";
 
 import {
   XNODE_PLANNING_ERR,
@@ -18,6 +19,7 @@ import {
   extract_xvibe_planning_state,
   normalize_xvibe_planning_state,
   resolve_xnode_confirmed_runtime_lifecycle,
+  resolve_xnode_manual_runtime_lifecycle,
   resolve_xnode_planning_runtime_lifecycle,
   resolve_xnode_project_memory_runtime_lifecycle,
   validate_xvibe_planning_answer,
@@ -32,6 +34,7 @@ type PlanningCommandParams = Record<string, unknown> & {
   _app_id: string;
   _env: string;
   _conversation_id?: string;
+  _planner_version?: "v1" | "v2";
 };
 
 export const XPLANNING_OPS: Record<string, XpellSkillCommand> = {
@@ -46,6 +49,7 @@ export const XPLANNING_OPS: Record<string, XpellSkillCommand> = {
       _conversation_id: "Conversation id used by XVibe for draft storage.",
       _message: "User's initial planning message.",
       _runtime_context: "Optional XVibe runtime context.",
+      _planner_version: "Optional planner version. Supported values are v1 and v2.",
     },
   },
   "get-planning-state": {
@@ -73,17 +77,32 @@ export const XPLANNING_OPS: Record<string, XpellSkillCommand> = {
       _planning_state: "Current validated planning state used for boundary answer validation.",
       _message: "Optional message text. Defaults to the answer text.",
       _runtime_context: "Optional XVibe runtime context.",
+      _planner_version: "Optional planner version. Supported values are v1 and v2.",
     },
   },
   "resume-planning": {
     _name: "resume-planning",
     _scope: "module",
     _description:
-      "Alias for get-planning-state. It validates the persisted draft without changing it.",
+      "Resume an intentionally ended planning draft and return the active planning boundary DTO.",
     _params: {
       _app_id: "Target app id.",
       _env: "Optional environment. Defaults to default.",
       _conversation_id: "Conversation id containing the planning draft.",
+    },
+  },
+  "end-planning": {
+    _name: "end-planning",
+    _scope: "module",
+    _description:
+      "End initial planning without confirmation or generation, preserving the conversation planning draft for manual work.",
+    _params: {
+      _app_id: "Target app id.",
+      _env: "Optional environment. Defaults to default.",
+      _conversation_id: "Conversation id containing the planning draft.",
+      _planning_state: "Optional validated planning state or project-plan fallback.",
+      _project_plan: "Optional XVibe project-plan fallback.",
+      _message_id: "Optional XVibe message id.",
     },
   },
   "validate-planning-state": {
@@ -211,6 +230,12 @@ function read_params(params: unknown): PlanningCommandParams {
     ...record,
     _app_id: read_required_string(record, "_app_id"),
     _env: read_env(record),
+    ...(read_xvibe_explicit_planner_version(record._planner_version)
+      ? {
+        _planner_version:
+          read_xvibe_explicit_planner_version(record._planner_version),
+      }
+      : {}),
     ...(typeof record._conversation_id === "string" &&
       record._conversation_id.trim().length > 0
       ? { _conversation_id: record._conversation_id.trim() }
@@ -228,6 +253,10 @@ function normalize_runtime_context(
   delete runtime_context._guide_active_recommendation;
   delete runtime_context._runtime_lifecycle;
 
+  const planner_version =
+    params._planner_version ??
+    read_xvibe_explicit_planner_version(runtime_context._planner_version);
+
   const runtime_lifecycle = resolve_xnode_planning_runtime_lifecycle({
     _planning_status: "collecting-information",
     _ready: false,
@@ -238,6 +267,7 @@ function normalize_runtime_context(
     ...extra,
     _app_id: params._app_id,
     _env: params._env,
+    ...(planner_version ? { _planner_version: planner_version } : {}),
     _stage: "planning",
     _runtime_lifecycle: runtime_lifecycle,
     ...(params._conversation_id
@@ -899,7 +929,96 @@ export class XPlanningModule extends XModule {
   }
 
   async _resume_planning(xcmd: XCommand) {
-    return this._get_planning_state(xcmd);
+    try {
+      const params = read_params(xcmd?._params);
+      const xvibe_result = await _x.execute({
+        _module: "xvibe",
+        _op: "resume-planning",
+        _params: {
+          _app_id: params._app_id,
+          _env: params._env,
+          _conversation_id: params._conversation_id,
+          ...(params._message_id ? { _message_id: params._message_id } : {}),
+        },
+      } as any);
+
+      if ((xvibe_result as any)?._ok !== true) return xvibe_result;
+
+      const planning = normalize_xvibe_planning_state(xvibe_result);
+      log_readiness(planning, {
+        _app_id: params._app_id,
+        _env: params._env,
+        _conversation_id: params._conversation_id,
+        _xvibe_op: "resume-planning",
+      });
+      return planning_response(planning, {
+        _app_id: params._app_id,
+        _env: params._env,
+        _conversation_id: params._conversation_id,
+        _operation: "resume-planning",
+        _xvibe_op: "resume-planning",
+      });
+    } catch (err) {
+      _xlog.warn("[planning] resume rejected", err);
+      return planning_error_response(err);
+    }
+  }
+
+  async _end_planning(xcmd: XCommand) {
+    try {
+      const params = read_params(xcmd?._params);
+      const raw_plan = extract_xvibe_planning_state(
+        params._planning_state ?? params._project_plan ?? params._artifact,
+      );
+
+      const xvibe_result = await _x.execute({
+        _module: "xvibe",
+        _op: "end-planning",
+        _params: {
+          _app_id: params._app_id,
+          _env: params._env,
+          _conversation_id: params._conversation_id,
+          ...(params._message_id ? { _message_id: params._message_id } : {}),
+          ...(raw_plan ? { _project_plan: raw_plan } : {}),
+        },
+      } as any);
+
+      if ((xvibe_result as any)?._ok !== true) return xvibe_result;
+
+      const planning = normalize_xvibe_planning_state(xvibe_result);
+      const runtime_lifecycle = resolve_xnode_manual_runtime_lifecycle({
+        _planning_status: typeof planning._planning_status === "string"
+          ? planning._planning_status
+          : planning._status,
+        _project_stage: "completed",
+      });
+      _xlog.log("[planning] planning ended manually", {
+        _app_id: params._app_id,
+        _env: params._env,
+        _conversation_id: params._conversation_id,
+      });
+
+      return planning_response(
+        {
+          ...planning,
+          _status: "manual",
+          _current_question: null,
+          _lifecycle_status: "completed",
+          _lifecycle_phase: "manual",
+          _runtime_lifecycle: runtime_lifecycle,
+        },
+        {
+          _app_id: params._app_id,
+          _env: params._env,
+          _conversation_id: params._conversation_id,
+          _operation: "end-planning",
+          _xvibe_op: "end-planning",
+        },
+      );
+    } catch (err) {
+      _xlog.warn("[planning] end planning rejected", err);
+      return planning_error_response(err);
+    }
   }
 
   async _answer_planning_question(xcmd: XCommand) {

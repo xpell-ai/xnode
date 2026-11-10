@@ -10,6 +10,14 @@ import type {
   XAuthAuthorizeResult,
   XAuthCreateApiKeyParams,
   XAuthCreateApiKeyResult,
+  XAuthCreateMcpTokenParams,
+  XAuthCreateMcpTokenResult,
+  XAuthCreateOAuthAuthorizationCodeParams,
+  XAuthCreateOAuthAuthorizationCodeResult,
+  XAuthExchangeOAuthAuthorizationCodeParams,
+  XAuthExchangeOAuthAuthorizationCodeResult,
+  XAuthRevokeOAuthTokenParams,
+  XAuthRevokeOAuthTokenResult,
   XAuthHashSecretParams,
   XAuthHashSecretResult,
   XAuthVerifySecretParams,
@@ -17,12 +25,17 @@ import type {
   XAuthVerifyJwtParams,
   XAuthVerifyJwtResult,
   XAuthCreateJwtParams,
-  XAuthCreateJwtResult
+  XAuthCreateJwtResult,
+  XAuthAccount,
+  XAuthSession,
+  XAuthUser
 } from "./XAuthTypes.js";
 import {
   create_api_key,
   detect_token_type,
   get_jwt_config,
+  get_mcp_token_jwt_config,
+  get_oauth_mcp_access_token_jwt_config,
   hash_secret,
   is_local_dev_mode,
   pick_safe_jwt_claims,
@@ -32,6 +45,11 @@ import {
   XAUTH_ERR,
   xauth_unauthorized
 } from "./XAuthUtils.js";
+import {
+  createXAuthOAuthAuthorizationCode,
+  exchangeXAuthOAuthAuthorizationCode,
+  revokeXAuthOAuthToken,
+} from "./XAuthOAuth.js";
 
 const DEV_EMAIL = "admin@local.dev";
 const DEV_PASSWORD = "admin";
@@ -39,6 +57,7 @@ const DEV_USER_ID = "dev-user";
 const DEV_ACCOUNT_ID = "dev-account";
 const DEV_CLEARANCE_LEVEL = 100;
 const SUPER_USER_CLEARANCE_LEVEL = 999;
+const MCP_TOKEN_CLEARANCE_LEVEL = 100;
 
 
 
@@ -74,6 +93,58 @@ export const XAUTH_OPS: Record<string, XpellSkillCommand> = {
       _email: "Optional safe email claim.",
       _role: "Optional safe role claim.",
       _roles: "Optional safe roles claim."
+    }
+  },
+
+  "create-mcp-token": {
+    _name: "create-mcp-token",
+    _scope: "module",
+    _description: "Create a short-lived admin MCP bearer token from a trusted authenticated admin context.",
+    _params: {
+      _expires_in: "Optional short duration string such as 1h, 4h, or 8h."
+    }
+  },
+
+  "create-oauth-authorization-code": {
+    _name: "create-oauth-authorization-code",
+    _scope: "module",
+    _description: "Create a short-lived one-time OAuth authorization code for an authenticated XAuth browser session.",
+    _params: {
+      client_id: "OAuth client id.",
+      redirect_uri: "Validated redirect URI.",
+      resource: "Protected MCP resource URI.",
+      scopes: "Granted OAuth scopes.",
+      code_challenge: "PKCE S256 challenge.",
+      code_challenge_method: "PKCE challenge method.",
+      issuer: "Authorization server issuer."
+    }
+  },
+
+  "exchange-oauth-authorization-code": {
+    _name: "exchange-oauth-authorization-code",
+    _scope: "module",
+    _description: "Exchange an OAuth authorization code or refresh token for MCP access credentials.",
+    _params: {
+      grant_type: "OAuth grant type.",
+      code: "Authorization code.",
+      refresh_token: "Opaque refresh token.",
+      client_id: "OAuth client id.",
+      redirect_uri: "Redirect URI.",
+      resource: "Protected MCP resource URI.",
+      code_verifier: "PKCE verifier.",
+      scope: "Optional requested scope subset for refresh_token grants."
+    }
+  },
+
+  "revoke-oauth-token": {
+    _name: "revoke-oauth-token",
+    _scope: "module",
+    _description: "Revoke an OAuth refresh-token grant family.",
+    _params: {
+      token: "Refresh token to revoke.",
+      token_type_hint: "Optional OAuth token type hint.",
+      client_id: "Optional OAuth client id binding.",
+      resource: "Optional protected resource binding."
     }
   },
 
@@ -215,6 +286,27 @@ export class XAuthModule extends XModule {
       _clearance_level: DEV_CLEARANCE_LEVEL,
       _auth_type: "jwt"
     });
+    const payload = verify_jwt(token);
+    const user: XAuthUser = {
+      _id: DEV_USER_ID,
+      email,
+      _clearance_level: DEV_CLEARANCE_LEVEL
+    };
+    const account: XAuthAccount = {
+      _id: DEV_ACCOUNT_ID
+    };
+    const session: XAuthSession = {
+      _authenticated: true,
+      _auth_type: "jwt",
+      _token: token,
+      _user_id: DEV_USER_ID,
+      _account_id: DEV_ACCOUNT_ID,
+      _clearance_level: DEV_CLEARANCE_LEVEL,
+      _user: user,
+      _account: account,
+      _issued_at: payload.iat,
+      _expires_at: payload.exp
+    };
 
     _xlog.log("[xauth] dev login success", {
       _user_id: DEV_USER_ID,
@@ -223,12 +315,11 @@ export class XAuthModule extends XModule {
 
     return {
       _ok: true,
+      _authenticated: true,
       _token: token,
-      _user: {
-        _id: DEV_USER_ID,
-        email,
-        _clearance_level: DEV_CLEARANCE_LEVEL
-      }
+      _user: user,
+      _account: account,
+      _session: session
     };
   }
 
@@ -298,6 +389,76 @@ export class XAuthModule extends XModule {
     };
   }
 
+  async _create_mcp_token(xcmd: XCommand): Promise<XAuthCreateMcpTokenResult> {
+    const params = (xcmd._params ?? {}) as XAuthCreateMcpTokenParams;
+    const ctx = is_record((xcmd as any)._ctx) ? (xcmd as any)._ctx : {};
+    const auth = is_record(ctx._auth) ? ctx._auth : {};
+    const user_id = typeof auth._user_id === "string" ? auth._user_id.trim() : "";
+    const account_id = typeof auth._account_id === "string" ? auth._account_id.trim() : "";
+    const clearance_level =
+      typeof auth._clearance_level === "number"
+        ? auth._clearance_level
+        : 0;
+
+    if (auth._authenticated !== true || !user_id || !account_id) {
+      throw xauth_unauthorized("Admin authentication required", XAUTH_ERR.UNAUTHORIZED);
+    }
+
+    if (clearance_level < MCP_TOKEN_CLEARANCE_LEVEL) {
+      throw xauth_unauthorized("Admin clearance required", XAUTH_ERR.UNAUTHORIZED);
+    }
+
+    const expires_in = typeof params._expires_in === "string"
+      ? params._expires_in
+      : undefined;
+    const token = sign_jwt({
+      _user_id: user_id,
+      _account_id: account_id,
+      _clearance_level: clearance_level,
+      _auth_type: "jwt",
+      ...pick_safe_jwt_claims(auth),
+      _token_purpose: "mcp",
+      _audience: "mcp"
+    }, get_mcp_token_jwt_config(expires_in));
+    const payload = verify_jwt(token);
+
+    _xlog.log("[xauth] mcp token issued", {
+      _user_id: user_id,
+      _clearance_level: clearance_level,
+      _expires_at: payload.exp
+    });
+
+    return {
+      _ok: true,
+      _token: token,
+      _expires_at: payload.exp,
+      _clearance_level: clearance_level
+    };
+  }
+
+  async _create_oauth_authorization_code(
+    xcmd: XCommand,
+  ): Promise<XAuthCreateOAuthAuthorizationCodeResult> {
+    const params = (xcmd._params ?? {}) as XAuthCreateOAuthAuthorizationCodeParams;
+    const ctx = is_record((xcmd as any)._ctx) ? (xcmd as any)._ctx : {};
+    const auth = is_record(ctx._auth) ? ctx._auth : {};
+    return createXAuthOAuthAuthorizationCode(params, auth as any);
+  }
+
+  async _exchange_oauth_authorization_code(
+    xcmd: XCommand,
+  ): Promise<XAuthExchangeOAuthAuthorizationCodeResult> {
+    const params = (xcmd._params ?? {}) as XAuthExchangeOAuthAuthorizationCodeParams;
+    return exchangeXAuthOAuthAuthorizationCode(params);
+  }
+
+  async _revoke_oauth_token(
+    xcmd: XCommand,
+  ): Promise<XAuthRevokeOAuthTokenResult> {
+    const params = (xcmd._params ?? {}) as XAuthRevokeOAuthTokenParams;
+    return revokeXAuthOAuthToken(params);
+  }
+
   async _create_api_key(xcmd: XCommand): Promise<XAuthCreateApiKeyResult> {
     const params = (xcmd._params ?? {}) as XAuthCreateApiKeyParams;
     const prefix = typeof params._prefix === "string" ? params._prefix : "";
@@ -364,13 +525,30 @@ export class XAuthModule extends XModule {
     }
 
     if (token_type === "jwt" && token) {
-      const verified = await this._verify_jwt({
-        _module: XAuthModule._name,
-        _op: "verify_jwt",
-        _params: { _token: token }
-      } as unknown as XCommand);
+      try {
+        const verified = await this._verify_jwt({
+          _module: XAuthModule._name,
+          _op: "verify_jwt",
+          _params: { _token: token }
+        } as unknown as XCommand);
 
-      return verified._auth;
+        return verified._auth;
+      } catch (error) {
+        const oauth_issuer = typeof meta._oauth_issuer === "string"
+          ? meta._oauth_issuer.trim()
+          : "";
+        if (ctx._source !== "mcp" || !oauth_issuer) throw error;
+
+        const payload = verify_jwt(token, get_oauth_mcp_access_token_jwt_config(oauth_issuer));
+        return {
+          _authenticated: true,
+          _auth_type: "jwt",
+          _user_id: payload._user_id,
+          _account_id: payload._account_id,
+          _clearance_level: payload._clearance_level,
+          ...pick_safe_jwt_claims(payload)
+        };
+      }
     }
 
     if (token_type === "api_key") {

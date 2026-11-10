@@ -8,10 +8,27 @@ export type EntityProviderCapabilityName =
     | "hash-verification"
     | "aggregation"
     | "transactions"
+    | "operation-atomic-writes"
+    | "app-local-atomic-unit"
     | "persistent-storage"
+    | "server-side-pagination"
+    | "exact-count"
+    | "unique-scalar-indexes"
     | "query-operators"
     | "runtime-entity-handle"
     | "physical-unregister";
+
+export type EntityProviderRuntimeContext = {
+    _work_folder: string;
+    /** Trusted host policy only; entity definitions and command params cannot override it. */
+    _sqlite_require_full_durability?: boolean;
+};
+
+export type EntityProviderConstructionOptions = {
+    _definition: any;
+    _physical_identity: EntityPhysicalIdentity;
+    _runtime_context?: EntityProviderRuntimeContext;
+};
 
 export type EntityProviderFindOptions = {
     _skip?: number;
@@ -154,4 +171,81 @@ export function aggregateEntityRecords(
         _value:
             value
     };
+}
+
+export function assertEntityProviderQueryOperators(
+    provider: EntityProvider,
+    query: any,
+    supportedOperators: readonly string[]
+) {
+    if (
+        query === null ||
+        query === undefined ||
+        typeof query !== "object" ||
+        Array.isArray(query)
+    ) {
+        return;
+    }
+
+    const supported =
+        new Set(supportedOperators);
+
+    for (const [field, value] of Object.entries(query)) {
+        if (
+            value === null ||
+            typeof value !== "object" ||
+            Array.isArray(value) ||
+            value instanceof Date
+        ) {
+            continue;
+        }
+
+        for (const rawOperator of Object.keys(value)) {
+            const operator =
+                rawOperator.startsWith("!")
+                    ? rawOperator.slice(1)
+                    : rawOperator;
+
+            if (!supported.has(operator)) {
+                throw new XError(
+                    "E_ENTITY_PROVIDER_QUERY_UNSUPPORTED",
+                    `Entity provider '${provider._provider}' does not support query operator '${rawOperator}'`,
+                    {
+                        _meta: {
+                            _provider:
+                                provider._provider,
+                            _provider_type:
+                                provider._provider_type,
+                            _field:
+                                field,
+                            _operator:
+                                rawOperator
+                        }
+                    }
+                );
+            }
+
+            if (
+                operator === "_in" &&
+                !Array.isArray((value as Record<string, any>)[rawOperator])
+            ) {
+                throw new XError(
+                    "E_ENTITY_PROVIDER_QUERY_UNSUPPORTED",
+                    "_in requires an array",
+                    {
+                        _meta: {
+                            _provider:
+                                provider._provider,
+                            _provider_type:
+                                provider._provider_type,
+                            _field:
+                                field,
+                            _operator:
+                                rawOperator
+                        }
+                    }
+                );
+            }
+        }
+    }
 }

@@ -6,7 +6,8 @@ import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { XError } from "@xpell/core";
 import { _xu } from "@xpell/node-core";
-import XDB from "../XDB/XDB.js";
+import { assertEntityLocalUnitHashCreateInput, localUnitCanonical, localUnitError, localUnitHash, resolveLocalUnitHashPolicy, validateLocalUnit, ENTITY_LOCAL_UNIT_CAPABILITIES, type EntityLocalUnit, type EntityLocalUnitHashPolicy, type EntityLocalUnitCapacityLimits } from "./EntityLocalUnit.js";
+import { historicalImportContext, historicalImportTimestamp, isHistoricalImportProvider } from "./EntityHistoricalImport.js";
 import type {
     EntityAggregationRequest,
     EntityAggregationResult,
@@ -15,6 +16,7 @@ import type {
     EntityProviderCapabilityName,
     EntityProviderDisposeResult,
     EntityProviderFindOptions,
+    EntityProviderRuntimeContext,
     EntityPhysicalIdentity,
     EntityProviderType
 } from "./EntityProvider.js";
@@ -38,6 +40,9 @@ type SQLiteIndexedField = {
 export type SQLiteEntityProviderOptions = {
     _definition: any;
     _physical_identity: EntityPhysicalIdentity;
+    _runtime_context?: EntityProviderRuntimeContext;
+    /** @internal Reserved physical location for a privately issued import provider. */
+    _historical_database?: string;
 };
 
 export class SQLiteEntityProvider implements EntityProvider {
@@ -53,10 +58,14 @@ export class SQLiteEntityProvider implements EntityProvider {
     private _table_name: string;
     private _indexed_fields: SQLiteIndexedField[] = [];
     private _loaded_rows = 0;
+    private readonly _runtime_context?: EntityProviderRuntimeContext;
+    private readonly _historical_database?: string;
 
     constructor(opts: SQLiteEntityProviderOptions) {
         this._definition = opts._definition;
+        this._historical_database = opts._historical_database;
         this._physical_identity = opts._physical_identity;
+        this._runtime_context = opts._runtime_context ? Object.freeze({ ...opts._runtime_context }) : undefined;
         this._physical_entity_name =
             this._physical_identity._physical_entity_name;
         this._db_path =
@@ -66,8 +75,13 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     async init() {
-        this.open();
-        await this.syncSchema(this._definition);
+        try {
+            this.open();
+            await this.syncSchema(this._definition);
+        } catch (error) {
+            if (this._db?.open) this._db.close();
+            throw error;
+        }
     }
 
     private open() {
@@ -75,19 +89,42 @@ export class SQLiteEntityProvider implements EntityProvider {
             return;
         }
 
+        if (fs.existsSync(path.join(path.dirname(this._db_path), "historical-restore.pending"))) {
+            throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_QUARANTINED");
+        }
         fs.mkdirSync(path.dirname(this._db_path), {
             recursive: true
         });
 
         this._db = new Database(this._db_path);
+        if (this._db.prepare("SELECT 1 FROM sqlite_master WHERE name='entity_historical_import_meta'").get() && !isHistoricalImportProvider(this)) {
+            throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_QUARANTINED");
+        }
         this._db.pragma("foreign_keys = ON");
         this._db.pragma("journal_mode = WAL");
-        this._db.pragma("synchronous = NORMAL");
+        this._db.pragma(this._runtime_context?._sqlite_require_full_durability
+            ? "synchronous = FULL" : "synchronous = NORMAL");
         this._db.pragma("busy_timeout = 5000");
+        const effective = this.sqlitePragmas();
+        if (this._runtime_context?._sqlite_require_full_durability &&
+            (effective._journal_mode !== "wal" || effective._synchronous !== 2 ||
+             effective._foreign_keys !== 1 || effective._busy_timeout !== 5000)) {
+            throw this.providerError("E_ENTITY_SQLITE_DURABILITY", "Required SQLite WAL/FULL policy could not be verified");
+        }
         this.initProviderSchema();
     }
 
+    private sqlitePragmas() {
+        return {
+            _journal_mode: this._db.pragma("journal_mode", { simple: true }),
+            _synchronous: this._db.pragma("synchronous", { simple: true }),
+            _foreign_keys: this._db.pragma("foreign_keys", { simple: true }),
+            _busy_timeout: this._db.pragma("busy_timeout", { simple: true })
+        };
+    }
+
     private resolveDbPath(definition: any) {
+        if (this._historical_database) return this._historical_database;
         const configured =
             definition?._storage?._sqlite?._db_path ??
             definition?._storage?._db_path;
@@ -97,7 +134,7 @@ export class SQLiteEntityProvider implements EntityProvider {
         }
 
         const work_folder =
-            (XDB as any)?._initOpts?.workFolder ??
+            this._runtime_context?._work_folder ??
             process.cwd();
 
         return path.join(
@@ -155,6 +192,10 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     async syncSchema(definition: any) {
+        const appendOnlyTrigger = `${this._table_name}_append_update`;
+        if (definition?._storage?._append_only !== true && this._db.prepare(
+            "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?"
+        ).get(appendOnlyTrigger)) throw localUnitError("E_ENTITY_APPEND_ONLY");
         this._definition = definition;
         this._schema =
             this.normalizeRuntimeSchema(definition?._schema ?? {});
@@ -165,6 +206,11 @@ export class SQLiteEntityProvider implements EntityProvider {
         this.createRecordTable();
         this.ensureIndexColumns();
         this.ensureSqliteIndexes();
+        if (definition?._storage?._append_only === true) {
+            for (const op of ["UPDATE", "DELETE"]) {
+                this._db.exec(`CREATE TRIGGER IF NOT EXISTS ${this.quoteIdentifier(`${this._table_name}_append_${op.toLowerCase()}`)} BEFORE ${op} ON ${this.quoteIdentifier(this._table_name)} BEGIN SELECT RAISE(ABORT, 'E_ENTITY_APPEND_ONLY'); END`);
+            }
+        }
         this.saveSchemaMetadata();
     }
 
@@ -1372,6 +1418,7 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     async update(filter: any, updates: any) {
+        if (this._definition?._storage?._append_only === true) throw localUnitError("E_ENTITY_APPEND_ONLY");
         if (
             !filter ||
             typeof filter !== "object" ||
@@ -1477,6 +1524,7 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     async delete(filter: any) {
+        if (this._definition?._storage?._append_only === true) throw localUnitError("E_ENTITY_APPEND_ONLY");
         if (
             !filter ||
             typeof filter !== "object" ||
@@ -1633,13 +1681,38 @@ export class SQLiteEntityProvider implements EntityProvider {
             },
             {
                 _name: "transactions",
+                _supported: false,
+                _reason: "SQLiteEntityProvider does not expose application-controlled transaction boundaries."
+            },
+            {
+                _name: "operation-atomic-writes",
                 _supported: true,
-                _description: "Use SQLite transactions for writes."
+                _description: "Wrap each provider write operation in an internal SQLite transaction."
+            },
+            {
+                _name: "app-local-atomic-unit",
+                _supported: true,
+                _description: "Bound fixed-record units through a trusted EntityManager binding; one native app/database, WAL/FULL. No transaction handles."
             },
             {
                 _name: "persistent-storage",
                 _supported: true,
                 _description: "Persist records as SQLite rows in provider-owned tables."
+            },
+            {
+                _name: "server-side-pagination",
+                _supported: true,
+                _description: "Push skip and limit into the SQLite query."
+            },
+            {
+                _name: "exact-count",
+                _supported: true,
+                _description: "Use SQL COUNT without applying find page limits."
+            },
+            {
+                _name: "unique-scalar-indexes",
+                _supported: true,
+                _description: "Enforce unique scalar indexes with SQLite constraints."
             },
             {
                 _name: "query-operators",
@@ -1738,8 +1811,189 @@ export class SQLiteEntityProvider implements EntityProvider {
             _table_name:
                 this._table_name,
             _loaded_rows:
-                this._loaded_rows
+                this._loaded_rows,
+            _sqlite_pragmas: this.sqlitePragmas()
         };
+    }
+
+    /** Internal validation only: no default insertion, coercion, hashing or timestamp synthesis. */
+    validateHistoricalRecord(record: any, capturedAt: string): void {
+        if (!record || !historicalImportTimestamp(record._created_at) || !historicalImportTimestamp(record._updated_at) ||
+            record._created_at > record._updated_at || record._updated_at > capturedAt) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_RECORD");
+        localUnitCanonical(record);
+        for (const key of Object.keys(record)) if (!Object.hasOwn(this._schema, key)) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_RECORD");
+        for (const [key, field] of Object.entries(this._schema)) {
+            const value = record[key], type = this.fieldType(key);
+            if (!Object.hasOwn(record, key) || value === null) {
+                if (field._required || ["_id", "_created_at", "_updated_at"].includes(key) || (type === "hash" && Object.hasOwn(record, key))) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_RECORD");
+                continue;
+            }
+            if (type === "hash") {
+                // Canonical bcrypt base64, supported revisions and cost 04..31; never rehash.
+                if (typeof value !== "string" || !/^\$2[aby]\$(?:0[4-9]|[12]\d|3[01])\$[./A-Za-z0-9]{21}[.Oeu][./A-Za-z0-9]{30}[.CGKOSWaeimquy26]$/u.test(value)) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_RECORD");
+            } else if (localUnitCanonical(this.serializeRecordValue(key, this.normalizeFieldValue(key, value))) !== localUnitCanonical(value)) {
+                throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_RECORD");
+            }
+        }
+    }
+
+    /** Independently compare physical indexed columns with preserved JSON during reconciliation. */
+    validateHistoricalStoredRow(row: any): void {
+        const record = JSON.parse(row._json);
+        if (row._id !== record._id || row._created_at !== record._created_at || row._updated_at !== record._updated_at ||
+            this._indexed_fields.some(field => row[field._column_name] !== this.sqliteValue(field, record))) {
+            throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_INTEGRITY");
+        }
+    }
+
+    /** Only EntityManager's pinned, app-local binding calls this. Handles never escape. */
+    static async commitLocalUnit(
+        providers: ReadonlyMap<string, SQLiteEntityProvider>, unit: EntityLocalUnit,
+        clock: () => number, fault?: (point: string) => void,
+        hashPolicy?: EntityLocalUnitHashPolicy,
+        limits: EntityLocalUnitCapacityLimits = ENTITY_LOCAL_UNIT_CAPABILITIES._profiles["standard-v1"],
+        revalidate?: () => void,
+        historicalToken?: object
+    ) {
+        const historical = historicalToken === undefined ? undefined : historicalImportContext(historicalToken);
+        if (historical && hashPolicy !== undefined) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_UNAUTHORIZED");
+        const hash = resolveLocalUnitHashPolicy(hashPolicy);
+        // Snapshot before any await. Never fingerprint a plaintext proposal for a receipt.
+        if (hash) unit = validateLocalUnit(unit, limits);
+        const list = [...providers.values()];
+        const first = list[0];
+        if (!first || list.some(p => !p._db?.open || p._db_path !== first._db_path ||
+            p._physical_identity._storage_scope !== "app" || p.resolveDbPath(p._definition) !== p._db_path)) {
+            throw localUnitError("E_ENTITY_LOCAL_UNIT_STORAGE");
+        }
+        const schemaHashes = list.map(p => localUnitHash(p._definition));
+        const prepared = new Map<any, any>();
+        for (const op of unit._records) {
+            const p = providers.get(op._entity);
+            if (!p) throw localUnitError();
+            const input = op._create ?? op._update;
+            if (!input) continue;
+            if (historical) {
+                if (!op._create || op._update || !isHistoricalImportProvider(p)) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_UNAUTHORIZED");
+                p.validateHistoricalRecord(input, historical._captured_at);
+                historical.approve(op, input);
+                prepared.set(op, JSON.parse(localUnitCanonical(input)));
+                continue;
+            }
+            if (op._update && p._definition?._storage?._append_only === true) throw localUnitError("E_ENTITY_APPEND_ONLY");
+            const hashFields = Object.keys(p._schema).filter(key => p.fieldType(key) === "hash");
+            if (hashFields.length && !hash) throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+            for (const key of hashFields) {
+                const explicit = Object.hasOwn(input, key);
+                if (op._update) {
+                    if (explicit) throw localUnitError("E_ENTITY_LOCAL_UNIT_HASH_MUTATION");
+                } else if (explicit) {
+                    assertEntityLocalUnitHashCreateInput(hash!._policy, input[key]);
+                } else if (p._schema[key]._required || Object.hasOwn(p._schema[key], "_default")) {
+                    throw localUnitError("E_ENTITY_LOCAL_UNIT_HASH_INPUT");
+                }
+            }
+            for (const key of Object.keys(input)) {
+                if (!p._schema[key] || ["_created_at", "_updated_at"].includes(key)) throw localUnitError();
+            }
+            let values: Record<string, any>;
+            try {
+                values = op._create ? await p.prepareFields(input) : await p.prepareUpdates(input);
+            } catch (error) {
+                if (!hash) throw error;
+                // Provider/library exceptions must never echo credential input.
+                throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+            }
+            for (const [key, value] of Object.entries(values)) values[key] = p.serializeRecordValue(key, value);
+            // Units reject truncation/coercion rather than silently changing prepared business intent.
+            for (const key of Object.keys(input)) {
+                if (op._create && hashFields.includes(key)) {
+                    if (typeof values[key] !== "string" || !/^\$2[aby]\$10\$[./a-z0-9]{53}$/iu.test(values[key])) throw localUnitError("E_ENTITY_LOCAL_UNIT_HASH_INPUT");
+                } else if (localUnitCanonical(values[key]) !== localUnitCanonical(input[key])) throw localUnitError();
+            }
+            prepared.set(op, values);
+        }
+        if (hash) validateLocalUnit({ ...unit, _records: unit._records.map(op => {
+            const values = prepared.get(op);
+            return values ? { ...op, ...(op._create ? { _create: values } : { _update: values }) } : op;
+        }) }, limits);
+        const db = new Database(first._db_path, { fileMustExist: true });
+        try {
+            db.pragma("busy_timeout = 5000");
+            db.pragma("foreign_keys = ON");
+            db.pragma("synchronous = FULL");
+            if (db.pragma("journal_mode", { simple: true }) !== "wal" ||
+                db.pragma("synchronous", { simple: true }) !== 2 || db.pragma("foreign_keys", { simple: true }) !== 1 ||
+                db.pragma("busy_timeout", { simple: true }) !== 5000) {
+                throw localUnitError("E_ENTITY_LOCAL_UNIT_DURABILITY");
+            }
+            const result = db.transaction(() => {
+                revalidate?.();
+                const replay = historical?.before(db);
+                if (replay) return replay;
+                const now = clock();
+                if (!Number.isSafeInteger(now) || now < 0) throw localUnitError();
+                if (unit._valid_until !== undefined && now >= unit._valid_until) throw localUnitError("E_ENTITY_LOCAL_UNIT_EXPIRED");
+                for (const [i, p] of list.entries()) {
+                    const meta = db.prepare("SELECT * FROM entity_provider_meta WHERE physical_entity_name=?").get(p._physical_entity_name) as any;
+                    if (!p._db?.open || localUnitHash(p._definition) !== schemaHashes[i] || !meta || meta.table_name !== p._table_name ||
+                        p.resolveDbPath(p._definition) !== first._db_path || p._physical_identity._storage_scope !== "app" ||
+                        meta.physical_identity !== p._physical_identity._physical_identity ||
+                        localUnitCanonical(JSON.parse(meta.schema_json)) !== localUnitCanonical(p._schema)) throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+                }
+                const rows = unit._records.map(op => {
+                    const p = providers.get(op._entity)!;
+                    const row = db.prepare(`SELECT _json FROM ${p.quoteIdentifier(p._table_name)} WHERE _id=?`).get(op._id) as any;
+                    const current = row ? JSON.parse(row._json) : null;
+                    if (Object.hasOwn(op, "_expect") && localUnitCanonical(op._expect) !== localUnitCanonical(current)) {
+                        throw localUnitError("E_ENTITY_LOCAL_UNIT_CONFLICT");
+                    }
+                    return current;
+                });
+                if (unit._lease) {
+                    const lease = unit._lease;
+                    const row = rows[unit._records.findIndex(op => op._entity === lease._entity && op._id === lease._id)];
+                    if (!row || row._state !== "claimed" || row._owner_id !== lease._owner_id ||
+                        row._owner_epoch !== lease._owner_epoch || row._version !== lease._version ||
+                        !Number.isSafeInteger(row._lease_expires_at) || row._lease_expires_at <= now) throw localUnitError("E_ENTITY_LOCAL_UNIT_FENCED");
+                }
+                const changed: any[] = [];
+                let count = 0;
+                const records = unit._records.map((op, i) => {
+                    const p = providers.get(op._entity)!;
+                    const values = prepared.get(op);
+                    if (!values) return { _entity: op._entity, _record: rows[i] };
+                    const stamp = new Date(now).toISOString();
+                    const record = op._create ? (historical ? { ...values } : { ...values, _created_at: stamp, _updated_at: stamp }) : { ...rows[i], ...values, _updated_at: stamp };
+                    const indexed = p._indexed_fields.filter(f => f._field_name !== "_id");
+                    let changes: number;
+                    if (op._create) {
+                        const columns = ["_id", "_created_at", "_updated_at", "_json", ...indexed.map(f => f._column_name)];
+                        changes = db.prepare(`INSERT INTO ${p.quoteIdentifier(p._table_name)} (${columns.map(c => p.quoteIdentifier(c)).join(",")}) VALUES (${columns.map(() => "?").join(",")})`).run(
+                            record._id, record._created_at, record._updated_at, JSON.stringify(record), ...indexed.map(f => p.sqliteValue(f, record))
+                        ).changes;
+                    } else {
+                        const columns = ["_updated_at", "_json", ...indexed.map(f => f._column_name)];
+                        changes = db.prepare(`UPDATE ${p.quoteIdentifier(p._table_name)} SET ${columns.map(c => p.quoteIdentifier(c) + "=?").join(",")} WHERE _id=?`).run(
+                            record._updated_at, JSON.stringify(record), ...indexed.map(f => p.sqliteValue(f, record)), op._id
+                        ).changes;
+                    }
+                    if (changes !== 1) throw localUnitError("E_ENTITY_LOCAL_UNIT_CONFLICT");
+                    changed.push({ _entity: op._entity, _record: record, _event: op._create ? "xdb:create" : "xdb:update" });
+                    fault?.(`after_write_${++count}`);
+                    return { _entity: op._entity, _record: record };
+                });
+                if ((hash || historical) && Buffer.byteLength(localUnitCanonical(records)) > limits._bytes) throw localUnitError();
+                historical?.after(db);
+                if (count > 0) fault?.("before_commit");
+                return { _records: records, _changed: changed, _durability: { _journal_mode: "wal", _synchronous: 2, _foreign_keys: 1 } };
+            }).immediate();
+            return result;
+        } catch (err: any) {
+            if (String(err?.code ?? "").startsWith("SQLITE_")) throw localUnitError(
+                String(err.code).startsWith("SQLITE_BUSY") ? "E_ENTITY_LOCAL_UNIT_BUSY" : "E_ENTITY_LOCAL_UNIT_CONSTRAINT");
+            throw err;
+        } finally { db.close(); }
     }
 
     async dispose(): Promise<EntityProviderDisposeResult> {

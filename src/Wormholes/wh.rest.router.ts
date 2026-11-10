@@ -38,24 +38,54 @@ function getBearerToken(req: Request): string | undefined {
     return m?.[1];
 }
 
+function getCookieToken(req: Request, name: string | undefined): string | undefined {
+    if (!name) return undefined;
+    const header = req.headers.cookie;
+    if (typeof header !== "string" || !header.trim()) return undefined;
+
+    for (const part of header.split(";")) {
+        const separator = part.indexOf("=");
+        if (separator < 0) continue;
+
+        const key = part.slice(0, separator).trim();
+        if (key !== name) continue;
+
+        const raw = part.slice(separator + 1).trim();
+        try {
+            return decodeURIComponent(raw);
+        } catch {
+            return raw;
+        }
+    }
+
+    return undefined;
+}
+
 function getSid(req: Request): string | undefined {
     const h = req.headers["x-wormholes-sid"];
     if (!h) return undefined;
     return Array.isArray(h) ? h[0] : h;
 }
 
+function getHeaderValue(value: unknown): string | undefined {
+    const header = Array.isArray(value) ? value[0] : value;
+    return typeof header === "string" && header.trim() ? header.trim() : undefined;
+}
+
+function getForwardedFirst(value: string | undefined): string | undefined {
+    return value?.split(",")[0]?.trim() || undefined;
+}
+
 function mkCtx(req: Request, opts: WHGatewayOptions): WHContext {
-    const token = getBearerToken(req);
+    const token = getBearerToken(req) ?? getCookieToken(req, opts._auth_cookie_name);
     const sid = getSid(req);
+    const forwarded_proto = getForwardedFirst(getHeaderValue(req.headers["x-forwarded-proto"]));
+    const forwarded_host = getForwardedFirst(getHeaderValue(req.headers["x-forwarded-host"]));
 
     return {
         _sid: sid,
         _auth: {
-            // For REST we can treat "has token" as "authenticated pending gateway AUTH"
-            // But gateway currently requires ctx._auth._authenticated true for REQ.
-            // So: if you use Bearer token as stateless auth, you should set _require_auth=false
-            // and implement opts._authorize_req to validate token per request OR
-            // implement a REST middleware that does AUTH per request and sets ctx._auth.
+            // Resolved per REQ from bearer/cookie token before gateway execution.
             _authenticated: false,
         },
         _meta: {
@@ -64,6 +94,11 @@ function mkCtx(req: Request, opts: WHGatewayOptions): WHContext {
                 (req.headers["x-correlation-id"] as string | undefined),
             _user_agent: req.headers["user-agent"] as string | undefined,
             _ip: req.ip,
+            _host: getHeaderValue(req.headers.host),
+            _protocol: forwarded_proto === "https" || forwarded_proto === "http" ? forwarded_proto : req.protocol,
+            _origin: getHeaderValue(req.headers.origin),
+            _x_forwarded_host: forwarded_host,
+            _x_forwarded_proto: forwarded_proto,
             ...(token ? { _token: token } : {}),
         },
 
@@ -72,6 +107,33 @@ function mkCtx(req: Request, opts: WHGatewayOptions): WHContext {
             _to: opts._node ? { _node: opts._node } : undefined,
         },
     };
+}
+
+async function resolveReqAuth(env: WHAny, ctx: WHContext, opts: WHGatewayOptions): Promise<void> {
+    if (!opts._auth) return;
+
+    const env_token = typeof env._token === "string" && env._token.trim()
+        ? env._token.trim()
+        : undefined;
+    const token = env_token ?? ctx._meta?._token;
+    if (!token) return;
+
+    try {
+        const auth = await opts._auth({ _token: token }, ctx);
+        ctx._auth = auth?._authenticated === true
+            ? {
+                _authenticated: true,
+                _clearance_level: auth._clearance_level,
+                _user_id: auth._user_id,
+                _account_id: auth._account_id,
+                _agent_id: auth._agent_id,
+                _auth_type: auth._auth_type,
+            }
+            : { _authenticated: false };
+        if (auth?._sid) ctx._sid = auth._sid;
+    } catch {
+        ctx._auth = { _authenticated: false };
+    }
 }
 
 /**
@@ -164,12 +226,7 @@ export function createWormholesRestRouter(opts: WHRestRouterOptions): Router {
                 throw whBadEnvelope("Expected REQ envelope", { got: env._kind });
             }
 
-            // IMPORTANT: For REST stateless auth, you probably want to:
-            // - set opts._require_auth = false
-            // - validate Authorization bearer token per request inside opts._authorize_req
-            //
-            // OR do a middleware that runs opts._auth and sets ctx._auth._authenticated=true
-            // for each call.
+            await resolveReqAuth(env, ctx, opts);
 
             const out = await handleEnvelope(env, ctx, opts);
 

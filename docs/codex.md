@@ -125,6 +125,9 @@ Rules:
 - Server must support **host-defined routing** via explicit APIs.
 - Avoid wildcard SPA fallbacks that can break Wormholes REST routes.
 - Middlewares must be installed deterministically (ordered, explicit).
+- `XWebServer` JSON requests are parsed once with the configured 10 MB limit.
+- When the JSON parser handles a request, the exact received bytes are available request-locally as the optional `Buffer` property `req.rawBody`; non-JSON bodies are not captured by this mechanism.
+- Raw request bodies must not be logged, persisted, included in generic errors, or passed into XModules automatically.
 
 ### Static Hosting
 - Static files live under `work_folder/public` (or equivalent).
@@ -155,6 +158,7 @@ Because xnode is a library, host applications must control routes.
 
 Required mechanism:
 - Code-based installer: `useRoutes((app, server) => { ... })`
+- Public bootstrap installer: `XNode.start({ _routes: [contributor] })`; contributors are registered in supplied order before `XWebServer.load()` and before the fallback route.
 - Optional config-based routes (simple home/static/json routes)
 - Deterministic precedence:
   1) host code routes
