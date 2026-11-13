@@ -82,7 +82,7 @@ export type WHGatewayOptions = {
    * Optional policy hook: called before executing REQ.
    * Throw XError to block.
    */
-  _authorize_req?: (cmd: XCmd, ctx: WHContext) => Promise<void> | void;
+  _authorize_req?: (cmd: XCmd, ctx: WHContext, requestID?: string) => Promise<void> | void;
 
   /**
    * Optional: allow inbound EVT from peers (default false).
@@ -271,7 +271,7 @@ export async function handleEnvelope(
 
         // optional authz hook
         if (opts._authorize_req) {
-          await opts._authorize_req(cmd, ctx);
+          await opts._authorize_req(cmd, ctx, req._id);
         }
 
         try {

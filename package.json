@@ -1,6 +1,6 @@
 {
   "name": "@xpell/node",
-  "version": "2.0.7",
+  "version": "2.0.8",
   "publishConfig": {
     "access": "public"
   },
@@ -8,7 +8,10 @@
   "files": [
     "dist",
     "docs",
-    "system-xapps"
+    "system-xapps",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -32,8 +35,13 @@
         "_scope": "package",
         "_runtime": "node",
         "_description": "Runs the existing @xpell/node build script.",
-        "_profiles": ["xpell-node.package"],
-        "_tags": ["package", "build"],
+        "_profiles": [
+          "xpell-node.package"
+        ],
+        "_tags": [
+          "package",
+          "build"
+        ],
         "_entry": {
           "_type": "build",
           "_script": "build"
@@ -47,8 +55,13 @@
         "_scope": "package",
         "_runtime": "node",
         "_description": "Runs the existing @xpell/node test script, which builds and executes dist/test.js.",
-        "_profiles": ["xpell-node.package"],
-        "_tags": ["package", "script"],
+        "_profiles": [
+          "xpell-node.package"
+        ],
+        "_tags": [
+          "package",
+          "script"
+        ],
         "_entry": {
           "_type": "script",
           "_script": "test"
@@ -62,8 +75,12 @@
         "_scope": "package",
         "_runtime": "node",
         "_description": "Verifies package metadata and declared local entries without publishing or network checks.",
-        "_profiles": ["xpell-node.package"],
-        "_tags": ["package-check"],
+        "_profiles": [
+          "xpell-node.package"
+        ],
+        "_tags": [
+          "package-check"
+        ],
         "_entry": {
           "_type": "package-check",
           "_check": "package"
@@ -74,8 +91,13 @@
       {
         "_id": "xpell-node.package",
         "_title": "@xpell/node package verification",
-        "_includes": ["xpell-node.*"],
-        "_tags": ["package", "node"]
+        "_includes": [
+          "xpell-node.*"
+        ],
+        "_tags": [
+          "package",
+          "node"
+        ]
       }
     ]
   },
