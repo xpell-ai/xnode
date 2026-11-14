@@ -10,9 +10,9 @@ import { fileURLToPath } from 'node:url';
 assert.equal(process.versions.node, '22.23.1', 'Use the verified Node 22.23.1 build runtime');
 const workspace = fileURLToPath(new URL('../../../', import.meta.url));
 const packages = [
-  'packages/xpell-core', 'packages/xnode-core', 'packages/modules/file-service',
+  'packages/xpell-core', 'packages/xnode-core', 'packages/file-service',
   'packages/xmcp', 'packages/xvibe', 'packages/xnode', 'packages/xagent',
-  'packages/xagent-channels', 'packages/modules/xnet',
+  'packages/xagent-channels', 'packages/xnet',
 ];
 const output = mkdtempSync(path.join(tmpdir(), 'xnode-expanded-build-'));
 const hashes = {};

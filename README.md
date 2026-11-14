@@ -1,5 +1,11 @@
 # @xpell/node
 
+## 2.0.8 release candidate
+
+Target publication date: **13 November 2026**; this candidate has not been published.
+Use the coordinated 2.0.8 runtime dependencies. See [CHANGELOG](./CHANGELOG.md)
+for package changes and qualification limits; [LICENSE](./LICENSE) contains the MIT terms.
+
 Xpell 2 Alpha --- Server Runtime (xnode)
 
 `@xpell/node` is the server-side execution layer of the Xpell 2
