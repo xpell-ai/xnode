@@ -21,10 +21,13 @@ The reusable conformance suite covers:
 
 Providers may retain extensions beyond this subset. XDB remains fully materialized and uses its existing query engine. Memory remains process-local. SQLite remains row-backed and queries only `_id`, timestamps where supported, and indexed scalar fields. Mongo translates the portable subset to Mongo operations but still requires deployment-backed integration verification.
 
+PostgreSQL is an explicit native opt-in row provider. See [PostgreSQL P1](./postgresql-entity-provider-v1.md) and its [real-database qualification lane](../postgresql-provider-qualification.md). It preserves the portable envelopes/default provider, verifies an explicitly initialized store, and advertises operation-atomic writes but no application-controlled transactions, app-local atomic units or raw runtime handle. SQLite behavior and existing SQLite-only bindings below remain unchanged.
+
 ## Capability terminology
 
 - `transactions` means an application-controlled transaction boundary. No current EntityProvider exposes that API.
 - `operation-atomic-writes` means a single provider method is internally atomic. SQLite advertises this because each write method uses an internal SQLite transaction.
+- PostgreSQL P1 implements the same operation-atomic capability with one bounded SERIALIZABLE transaction, native constraints and no automatic retry. This does not make the existing SQLite local-unit extension provider-independent.
 - `app-local-atomic-unit` is an optional SQLite extension, separate from portable CRUD and `transactions`. It requires a trusted EntityManager binding as described below.
 - `server-side-pagination` means skip/limit are applied inside the server-side provider rather than by EntityManager.
 - `exact-count` means count is independent of normal find limits.

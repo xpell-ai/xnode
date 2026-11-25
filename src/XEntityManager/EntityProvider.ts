@@ -1,6 +1,8 @@
 import { XError } from "@xpell/core";
 
-export type EntityProviderType = "xdb" | "memory" | "sqlite" | "mongo";
+import type { PostgreSQLRuntimeHandle } from "./PostgreSQLRuntime.js";
+
+export type EntityProviderType = "xdb" | "memory" | "sqlite" | "mongo" | "postgresql";
 
 export type EntityStorageScope = "global" | "app" | "server";
 
@@ -20,6 +22,8 @@ export type EntityProviderCapabilityName =
 
 export type EntityProviderRuntimeContext = {
     _work_folder: string;
+    /** Native trusted store/placement owner; never sourced from entity or command JSON. */
+    _postgresql?: PostgreSQLRuntimeHandle;
     /** Trusted host policy only; entity definitions and command params cannot override it. */
     _sqlite_require_full_durability?: boolean;
 };

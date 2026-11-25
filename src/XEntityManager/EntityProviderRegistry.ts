@@ -9,6 +9,7 @@ import { MemoryEntityProvider } from "./MemoryEntityProvider.js";
 import { MongoEntityProvider } from "./MongoEntityProvider.js";
 import { SQLiteEntityProvider } from "./SQLiteEntityProvider.js";
 import { XDBEntityProvider } from "./XDBEntityProvider.js";
+import { PostgreSQLEntityProvider } from "./PostgreSQLEntityProvider.js";
 
 type EntityProviderConstructor = new (
     opts: EntityProviderConstructionOptions
@@ -18,7 +19,8 @@ const ENTITY_PROVIDER_TYPES: EntityProviderType[] = [
     "xdb",
     "memory",
     "sqlite",
-    "mongo"
+    "mongo",
+    "postgresql"
 ];
 
 const ENTITY_PROVIDER_REGISTRY: Record<EntityProviderType, EntityProviderConstructor> = {
@@ -29,7 +31,9 @@ const ENTITY_PROVIDER_REGISTRY: Record<EntityProviderType, EntityProviderConstru
     sqlite:
         SQLiteEntityProvider,
     mongo:
-        MongoEntityProvider
+        MongoEntityProvider,
+    postgresql:
+        PostgreSQLEntityProvider
 };
 
 export function resolveEntityProviderType(raw_provider: any): EntityProviderType {
