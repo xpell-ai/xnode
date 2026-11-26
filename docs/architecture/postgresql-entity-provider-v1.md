@@ -6,6 +6,14 @@ Status: implementation candidate; owner acceptance and merge pending. The narrow
 
 Registry name: `postgresql`. Configuration is trusted native startup data, never entity JSON, command parameters, transport metadata, Settings mutations or a model tool. `XNodeOptions._entity_postgresql` accepts `PostgreSQLRuntimeOptions`. Direct EntityManager owners can pass an opaque `createPostgreSQLRuntime(options)` handle as `_provider_runtime_context._postgresql` and explicitly close it when their owned runtime ends.
 
+### Required application startup
+
+For XNode hosts with explicit PostgreSQL placements, the placed entities are required at startup. Provision their validated app/entity artifacts before `XNode.start()`; registering them only after successful startup cannot satisfy readiness. Direct EntityManager owners still control their own registration/initialization lifecycle.
+
+XNode supplies a trusted native registration-response guard to ServerXVM. A failed response for a required PostgreSQL application/placement aborts loading before that app bundle is published, including trusted older artifacts whose declared provider remains SQLite. Before `_started`, MCP Ready or `server:started`, the owned EntityManager also verifies that every explicit placement has a registered PostgreSQL provider and freshly verifies its store/schema. Missing apps/entities and ignored or incomplete registrations cannot produce Ready. Failure uses the existing owned-resource cleanup path; connections, core execution and listeners are closed.
+
+The guard is native-only, not an operation/model tool or persisted app field. It preserves existing response behavior for SQLite-only hosts and unrelated applications; it does not turn legacy errors into a new global startup policy. Applications without PostgreSQL native options keep their existing behavior.
+
 Each named connection requires:
 
 - `_connection_string_env`: explicit environment-variable reference. No guessed URI or PG environment-variable fallback. The URI must contain host, user, password and the same database as `_database`; URI query parameters are rejected, including SSL overrides.
@@ -60,6 +68,10 @@ Provision a separate dedicated database and non-superuser schema-maintenance rol
 `initializePostgreSQLStore({ _connection, _runtime_role, _entities, _authorize_empty_store: true })` is a native one-time operation. It verifies the pinned engine/durability, refuses an existing target schema or user relation, takes a database/schema-specific exclusive advisory transaction lock, then atomically creates tables, guards, inventory, immutable store identity and version/checksum receipts. It does not create databases, seed business data, adopt an unknown store, or replace missing data.
 
 Ordinary `init()`/`syncSchema()` verify identity, inventory, exact logical definition/layout, executed migration checksums, generated DDL-plan hash, physical columns/indexes/constraints/trigger functions and role restrictions. They issue no DDL or repair. Partial/wrong/mismatched stores reject. A changed entity definition requires a separately reviewed schema migration; re-registration never silently evolves it.
+
+Physical verification also checks operational catalog state independently of deparsed DDL hashes. Each entity table **and** `ep_store`, `ep_migrations`, `ep_entities` must be an ordinary permanent logged relation. Their indexes must be valid, ready for writes, live, and permanent. User protection triggers must retain the qualified normal (`O`) activation mode. Disabled, replica-only or otherwise changed activation states fail closed. This includes initialized providers on subsequent operations and the maintenance migration verification path; no automatic repair/adoption is performed.
+
+PostgreSQL's deparsed index/trigger definitions do not substitute for these catalog flags: see [pg_trigger](https://www.postgresql.org/docs/17/catalog-pg-trigger.html), [pg_index](https://www.postgresql.org/docs/17/catalog-pg-index.html), and [pg_class](https://www.postgresql.org/docs/17/catalog-pg-class.html). The existing structural digest format is retained; healthy previously initialized P1 candidate stores are not automatically rewritten. These are readiness/operation checks, not a new concurrent-maintenance fencing or HA guarantee.
 
 The initial `migratePostgreSQLStore` supports exactly the reviewed v1→v2 metadata-format upgrade (adding migration-description metadata), under separate native maintenance ownership. It verifies the source inventory/physical fingerprints, executes versioned SQL and writes its checksum/version in one transaction. Tests cover interruption after actual DDL and lost acknowledgement after actual COMMIT. Arbitrary entity schema transformations, caller-authored SQL, automatic down migrations and business-data conversion are unsupported. Add future schema evolutions as reviewed versioned migrations; do not misuse `syncSchema`.
 

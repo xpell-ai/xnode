@@ -83,6 +83,15 @@ END $guard$`);
 }
 
 async function fingerprint(client: PoolClient, schema: string, table: string) {
+    // Deparsed DDL omits activation/persistence/index-build state. Enforce these
+    // independently of the stored digest, including the durable identity/ledger tables.
+    const relations = [table, "ep_store", "ep_migrations", "ep_entities"].map(name => pgNamespace(schema, name));
+    const states = (await client.query(`SELECT c.relkind,c.relpersistence,
+      NOT EXISTS(SELECT 1 FROM pg_index i JOIN pg_class ic ON ic.oid=i.indexrelid WHERE i.indrelid=c.oid
+        AND (NOT i.indisvalid OR NOT i.indisready OR NOT i.indislive OR ic.relkind<>'i' OR ic.relpersistence<>'p')) AS indexes_ready,
+      NOT EXISTS(SELECT 1 FROM pg_trigger t WHERE t.tgrelid=c.oid AND NOT t.tgisinternal AND t.tgenabled<>'O') AS triggers_enabled
+      FROM unnest($1::text[]) required(name) LEFT JOIN pg_class c ON c.oid=to_regclass(required.name)`, [relations])).rows;
+    if (states.length !== relations.length || states.some(s => s.relkind !== "r" || s.relpersistence !== "p" || !s.indexes_ready || !s.triggers_enabled)) throw pgError("SCHEMA_MISMATCH");
     const result = await client.query(`SELECT
       (SELECT json_agg(row_to_json(c) ORDER BY c.attnum) FROM (SELECT a.attnum,a.attname,format_type(a.atttypid,a.atttypmod) AS type,a.attnotnull,pg_get_expr(d.adbin,d.adrelid) AS default_value FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped) c) AS columns,
       (SELECT json_agg(pg_get_indexdef(i.indexrelid) ORDER BY pg_get_indexdef(i.indexrelid)) FROM pg_index i WHERE i.indrelid=to_regclass($1)) AS indexes,

@@ -354,9 +354,11 @@ export class XNode {
             await this.loadOwnedModule(this._entity_manager);
             await this.loadOwnedModule(new XPlanningModule());
             await this.loadOwnedModule(new XStudioModule());
-            const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path });
+            const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path,
+                _assert_entity_registration: (app_id: string, env: string, entity: any, response: any) =>
+                    this._entity_manager!.assertPostgreSQLRegistration(app_id, env, entity, response) });
             await this.loadOwnedModule(server_xvm);
-
+            await this._entity_manager.assertPostgreSQLReady();
 
             this._started = true;
             markXpellMCPRuntimeReady("xnode_module_graph_loaded");

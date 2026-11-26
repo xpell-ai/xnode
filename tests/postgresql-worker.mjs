@@ -14,6 +14,12 @@ async function run(input) {
   const node = new XNode(), systems = path.join(input.work, 'empty-systems');
   fs.mkdirSync(path.join(input.work, 'settings'), { recursive: true }); fs.mkdirSync(systems, { recursive: true });
   fs.writeFileSync(path.join(input.work, 'settings/mcp.json'), '{"enabled":false}');
+  // Required native PG placements must exist during startup, rather than first
+  // registering after XNode has already announced readiness.
+  const app = path.join(input.work, 'xvm/apps/test/pg73');
+  fs.mkdirSync(path.join(app, 'entities'), { recursive: true });
+  fs.writeFileSync(path.join(app, 'app.json'), JSON.stringify({ _app_id: 'pg73', _env: 'test', _config: {} }));
+  fs.writeFileSync(path.join(app, 'entities/records.json'), JSON.stringify(input.entity._definition));
   const register = async () => {
     const response = await _x.execute({ _module: 'entity-manager', _op: 'register', _params: { _app_id: 'pg73', _env: 'test', _entity: input.entity._definition } });
     if (!response?._ok) throw new Error('WORKER_REGISTRATION_FAILED');

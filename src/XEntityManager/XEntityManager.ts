@@ -353,6 +353,25 @@ export class XEntityManager extends XModule {
         await closing;
     }
 
+    /** Native XNode/XVM startup guard; deliberately not an EntityManager command. */
+    assertPostgreSQLRegistration(app_id: unknown, env: unknown, entity: any, response: any) {
+        const handle = this._provider_runtime_context._postgresql;
+        if (handle && response?._ok !== true && getPostgreSQLRuntime(handle).requiresRegistration(app_id, env, entity)) throw pgError("REGISTRATION");
+    }
+
+    /** Every explicitly placed entity must be registered and freshly verified before Ready. */
+    async assertPostgreSQLReady() {
+        const handle = this._provider_runtime_context._postgresql;
+        if (!handle) return;
+        const providers = new Map([...this._entities.values()].filter(e => e._provider instanceof PostgreSQLEntityProvider)
+            .map(e => [e._provider.getPhysicalIdentity()._physical_identity, e._provider]));
+        for (const identity of getPostgreSQLRuntime(handle).requiredEntityIdentities()) {
+            const provider = providers.get(identity);
+            if (!provider) throw pgError("NOT_READY");
+            await provider.init();
+        }
+    }
+
     /* -------------------------------------------------- */
     /* HELPERS                                            */
     /* -------------------------------------------------- */

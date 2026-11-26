@@ -1,5 +1,5 @@
 {
-  "status": "P1 review candidate: both qualified Node lanes pass the owner-approved scope; one explicit SQLite Unicode-parity deferral",
+  "status": "P1 review candidate after independent-review corrections; owner acceptance/merge pending",
   "postgresql": {
     "version": "17.12",
     "source_sha256": "9cf136a703d8ee2f83465c43be4e9e8e7930c82b0bfba13be7e2537be769ac55",
@@ -53,11 +53,11 @@
     "sqlite_implementation_changed": false,
     "node22_only_guard": false
   },
-  "candidate_archive_sha256": "f90f14efe76160a978a0a1e18087464befa4ebb1bc9f684473b10ed3fe4efe92",
-  "candidate_archive_integrity": "sha512-pAlb78oDlM/xuQGDwYyH3SWeRdFbC6HbD1o1PTR4eAQFba2JLj6VWt8L13MMhrPaLSUjEiv/nh0o5WYlmkPnuA==",
+  "candidate_archive_sha256": "c15792f086fd2c3197c06817888d23e00dd7712f5d2ce96b045aa932243a791a",
+  "candidate_archive_integrity": "sha512-s29aIZL6C7MJQDjViWyQXQ6gA3jVs5DROop0A+ATN/pjyZsrVZFk4itP13awTGGB+4SCnd3gEi5KqtyRpo5uhw==",
   "fixture_lock_sha256": "7aa0dc257e72569021611186a424fc6a39ba200522be1ae0c144d41c886fa6b6",
   "qualified_dist_file_count": 278,
-  "results": {
+  "historical_results_before_independent_review": {
     "packed_node22": {
       "pass": 42,
       "fail": 0,
@@ -84,5 +84,58 @@
       "node22": "PASS",
       "node24": "PASS"
     }
+  },
+  "historical_archive_before_independent_review": "f90f14efe76160a978a0a1e18087464befa4ebb1bc9f684473b10ed3fe4efe92",
+  "results": {
+    "packed_node22": {
+      "pass": 62,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "d22a44fb904e80ceca29d8b883de06088281a8dac1f01a6e320d5156d6c141f6"
+    },
+    "packed_node24": {
+      "pass": 62,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "4c11f5bd02c7bee9cfbbebfafca79b123bcb47e9017af00e49efab5677ac32ea"
+    },
+    "sqlite_node22": {
+      "pass": 216,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "log_sha256": "fb68e6d4dc9d64cc199c2aa201d791a39a4a0cb8ca926b6992bade756fcc0569"
+    },
+    "consumer_typescript": {
+      "node22": "PASS",
+      "node24": "PASS"
+    }
+  },
+  "independent_review_2026_11_26": {
+    "reviewed_head": "1dc6c8a2e88bd80c59dde5e8be640067efaa08ac",
+    "baseline": {
+      "pass": 1,
+      "fail": 14,
+      "skip": 0,
+      "cancelled": 0,
+      "log_sha256": "d38f3be9309f49e01c97ff4023e190f5dbf5208fe383aaf826597550f055e975",
+      "note": "Reproduced before corrective source edits. Fourteen expected rejection assertions failed; healthy startup control passed. All278 reviewed dist hashes matched the original qualified candidate."
+    },
+    "physical_checks": [
+      "ordinary permanent entity and identity/ledger tables",
+      "normal user-trigger activation",
+      "valid/ready/live permanent indexes"
+    ],
+    "startup_checks": [
+      "required PG response errors abort XVM app loading",
+      "all explicit placements registered and freshly verified before Ready",
+      "no started event on failed startup; owned pool/core/listener cleanup",
+      "healthy SQLite-only and unrelated legacy-error behavior preserved"
+    ],
+    "direct_catalog_mutation": false,
+    "provider_or_registration_response_mocks": false,
+    "unicode_exception_unchanged": true
   }
 }

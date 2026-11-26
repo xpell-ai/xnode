@@ -140,6 +140,22 @@ export class PostgreSQLRuntime {
         } catch (error: any) { for (const e of new Set(this.#entries.values())) void e.pool.end(); throw String(error?._code ?? "").startsWith("E_ENTITY_POSTGRESQL_") ? error : pgError("CONFIG"); }
     }
 
+    /** Native startup policy only; no database handles or command authority. */
+    requiredEntityIdentities() { return [...this.#placements.keys()]; }
+    requiresRegistration(app_id: unknown, env: unknown, definition: any) {
+        const provider = String(definition?._storage?._provider ?? "xdb").trim().toLowerCase();
+        if (provider === "postgresql") return true;
+        try {
+            const app = resolve_entity_scope_identity({ _provider: "postgresql", _app_id: app_id, _env: env, _entity_id: "registration" });
+            if (this.#appContexts.has(canonicalJSON([app._app_id, app._env]))) return true;
+        } catch { /* Unrelated legacy registrations retain their existing response contract. */ }
+        try {
+            const identity = resolve_entity_scope_identity({ _provider: "postgresql", _app_id: app_id, _env: env,
+                _entity_id: definition?._id ?? definition?._name, _storage_scope: definition?._storage?._scope ?? "app" });
+            return this.#placements.has(identity._physical_identity);
+        } catch { return false; }
+    }
+
     resolveProvider(definition: any, identity: EntityPhysicalIdentity, scope?: { _app_id?: unknown; _env?: unknown }) {
         const placement = this.#placements.get(identity._physical_identity);
         const context = scope ?? identity as EntityPhysicalIdentity & { _app_id?: unknown; _env?: unknown };
