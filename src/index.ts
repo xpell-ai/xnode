@@ -121,6 +121,9 @@ export { ENTITY_HISTORICAL_IMPORT_BACKUP_CAPABILITIES, ENTITY_HISTORICAL_IMPORT_
 export type { EntityHistoricalBackupOptions, EntityHistoricalRestoreOptions, BoundEntityHistoricalRestore } from "./XEntityManager/EntityHistoricalBackup.js";
 export { ENTITY_LOCAL_UNIT_CAPABILITIES, ENTITY_LOCAL_UNIT_HASH_CAPABILITIES } from "./XEntityManager/EntityLocalUnit.js";
 export { ENTITY_LOCAL_UNIT_HASH_INPUT_CAPABILITIES, assertEntityLocalUnitHashCreateInput } from "./XEntityManager/EntityLocalUnit.js";
+export { ENTITY_LOCAL_UNIT_DURABILITY_CAPABILITIES } from "./XEntityManager/EntityLocalUnit.js";
+export type { EntityLocalUnitDurabilityContract, EntityLocalUnitDurability, EntityLocalUnitDurabilityAttestation,
+    EntityLocalUnitStoreIdentity, EntityLocalUnitOwnerContext, EntityLocalUnitOwnership } from "./XEntityManager/EntityLocalUnit.js";
 export type { EntityLocalUnit, EntityLocalUnitBinding, BoundEntityLocalUnit, EntityLocalUnitCapacityProfile, EntityLocalUnitCapacityLimits, EntityLocalUnitCapacity, EntityLocalUnitHashPolicy, EntityLocalUnitHashAcknowledgement } from "./XEntityManager/EntityLocalUnit.js";
 export { ServerXVMModule } from "./XVM/ServerXVMModule.js";
 export { default as ServerXVMModuleDefault } from "./XVM/ServerXVMModule.js";

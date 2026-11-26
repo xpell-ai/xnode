@@ -3,6 +3,8 @@ import type { EntityPhysicalIdentity } from "./EntityProvider.js";
 import { canonicalJSON, digest, layoutFor, literal, pgError, quote, type PGLayout } from "./PostgreSQLValues.js";
 import { pgNamespace, poolConfiguration, sanitizedPGError, safeIdentifier, type PostgreSQLConnectionOptions } from "./PostgreSQLRuntime.js";
 import { resolve_entity_scope_identity } from "./EntityScope.js";
+import { localUnitError, type EntityLocalUnitOwnership } from "./EntityLocalUnit.js";
+import type { PostgreSQLUnitFence } from "./PostgreSQLLocalUnit.js";
 
 export type PostgreSQLStoreEntity = { _definition: any; _physical_identity: EntityPhysicalIdentity };
 export function assertPostgreSQLIdentity(definition: any, identity: EntityPhysicalIdentity) {
@@ -30,8 +32,17 @@ function migrationV2SQL(schema: string) {
         `INSERT INTO ${ns("ep_migrations")}(version,checksum,description) VALUES(2,$1,'metadata description')`,
         `UPDATE ${ns("ep_store")} SET schema_version=2 WHERE singleton=TRUE`];
 }
+function migrationV3SQL(schema: string, role: string) {
+    const ns = (name: string) => pgNamespace(schema, name);
+    return [`CREATE TABLE ${ns("ep_fence")} (singleton boolean PRIMARY KEY CHECK(singleton),store_id text NOT NULL,required boolean NOT NULL CHECK(required),owner_id uuid,epoch bigint NOT NULL CHECK(epoch>=0),lock_anchor boolean NOT NULL DEFAULT TRUE CHECK(lock_anchor),CHECK((epoch=0 AND owner_id IS NULL) OR (epoch>0 AND owner_id IS NOT NULL)))`,
+        `INSERT INTO ${ns("ep_fence")} (singleton,store_id,required,owner_id,epoch) VALUES(TRUE,$1,TRUE,NULL,0)`,
+        `GRANT SELECT,UPDATE(lock_anchor) ON ${ns("ep_fence")} TO ${quote(role)}`,
+        `UPDATE ${ns("ep_store")} SET schema_version=3 WHERE singleton=TRUE`,
+        `INSERT INTO ${ns("ep_migrations")}(version,checksum,description) VALUES(3,$1,$2)`];
+}
 // Hash the executed versioned SQL with a fixed namespace token; entity DDL has its own exact plan hash.
-export const MIGRATION_CHECKSUMS = Object.freeze(["", digest(metadataDDL("_xpell_schema")), digest(canonicalJSON(migrationV2SQL("_xpell_schema")))]);
+export const MIGRATION_CHECKSUMS = Object.freeze(["", digest(metadataDDL("_xpell_schema")), digest(canonicalJSON(migrationV2SQL("_xpell_schema"))),
+    digest(canonicalJSON(migrationV3SQL("_xpell_schema", "_xpell_runtime_role")))]);
 export function postgresqlInventory(entities: PostgreSQLStoreEntity[]) {
     const layouts = entities.map(e => {
         assertPostgreSQLIdentity(e._definition, e._physical_identity);
@@ -111,10 +122,33 @@ export async function verifyEntitySchema(client: PoolClient, namespace: (name: s
         || digest(canonicalJSON(recordDDL(schema.nspname, layout))) !== m.ddl_plan_sha256) throw pgError("SCHEMA_MISMATCH");
     const all = (await client.query(`SELECT physical_identity AS identity,definition_sha256 AS definition,layout_sha256 AS layout FROM ${namespace("ep_entities")} ORDER BY physical_identity COLLATE "C"`)).rows;
     all.sort((a, b) => a.identity < b.identity ? -1 : a.identity > b.identity ? 1 : 0);
-    const store = (await client.query(`SELECT schema_version,inventory_sha256 FROM ${namespace("ep_store")} WHERE singleton=TRUE`)).rows[0];
+    const store = (await client.query(`SELECT store_id,schema_version,inventory_sha256 FROM ${namespace("ep_store")} WHERE singleton=TRUE`)).rows[0];
     if (!store || digest(canonicalJSON(all)) !== store.inventory_sha256) throw pgError("SCHEMA_MISMATCH");
     const ledger = (await client.query(`SELECT version,checksum FROM ${namespace("ep_migrations")} ORDER BY version`)).rows;
     if (ledger.length !== store.schema_version || ledger.some((m, i) => m.version !== i + 1 || m.checksum !== MIGRATION_CHECKSUMS[i + 1])) throw pgError("MIGRATION_MISMATCH");
+    if (store.schema_version === 3) await verifyFenceStructure(client, namespace, store.store_id);
+}
+
+async function verifyFenceStructure(client: PoolClient, ns: (name: string) => string, storeId: string) {
+    const relation = ns("ep_fence");
+    const schema = (await client.query("SELECT n.nspname,pg_has_role(current_user,c.relowner,'MEMBER') AS owner,has_table_privilege(current_user,c.oid,'INSERT,DELETE,TRUNCATE,TRIGGER') AS unsafe FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.oid=to_regclass($1)", [relation])).rows[0];
+    const ledger = (await client.query(`SELECT description FROM ${ns("ep_migrations")} WHERE version=3`)).rows;
+    if (!schema || schema.owner || schema.unsafe || ledger.length !== 1 || ledger[0].description !== "fence-v1:" + await fingerprint(client, schema.nspname, "ep_fence")) throw pgError("SCHEMA_MISMATCH");
+    const privileges = (await client.query(`SELECT a.attname,has_column_privilege(current_user,a.attrelid,a.attnum,'SELECT') AS readable,has_column_privilege(current_user,a.attrelid,a.attnum,'UPDATE') AS writable FROM pg_attribute a WHERE a.attrelid=to_regclass($1) AND a.attnum>0 AND NOT a.attisdropped`, [relation])).rows;
+    if (privileges.length !== 6 || privileges.some(p => !p.readable || p.writable !== (p.attname === "lock_anchor"))) throw pgError("ROLE");
+    const row = (await client.query(`SELECT store_id,required,owner_id,epoch::text AS epoch FROM ${relation} WHERE singleton=TRUE`)).rows;
+    if (row.length !== 1 || row[0].store_id !== storeId || row[0].required !== true || !/^(0|[1-9]\d*)$/.test(row[0].epoch) ||
+        BigInt(row[0].epoch) > 9223372036854775807n || (row[0].epoch === "0") !== (row[0].owner_id === null)) throw pgError("STORE_IDENTITY");
+}
+
+/** Fixed transaction-side consumer only. Production authority issuance is deferred to P3. */
+export async function verifyPostgreSQLFence(client: PoolClient, ns: (name: string) => string, storeId: string,
+    frame?: PostgreSQLUnitFence): Promise<EntityLocalUnitOwnership> {
+    await verifyFenceStructure(client, ns, storeId);
+    const row = (await client.query(`SELECT store_id,required,owner_id,epoch::text AS epoch FROM ${ns("ep_fence")} WHERE singleton=TRUE FOR SHARE`)).rows[0];
+    if (!frame || frame._revoked || frame._store_id !== storeId || row.store_id !== storeId || frame._owner_id !== row.owner_id ||
+        !/^[1-9]\d*$/.test(frame._epoch) || frame._epoch !== row.epoch) throw localUnitError("E_ENTITY_LOCAL_UNIT_FENCED");
+    return Object.freeze({ _mode: "epoch-v1", _owner_id: frame._owner_id, _epoch: frame._epoch });
 }
 
 export type PostgreSQLMaintenanceOptions = { _connection: PostgreSQLConnectionOptions; _runtime_role: string; _entities: PostgreSQLStoreEntity[] };
@@ -172,9 +206,12 @@ export async function initializePostgreSQLStore(options: PostgreSQLMaintenanceOp
     });
 }
 
-/** Reviewed metadata-only v1→v2 upgrade; no caller-authored SQL or implicit downgrade. */
-export async function migratePostgreSQLStore(options: PostgreSQLMaintenanceOptions & { _from_version: 1; _to_version: 2 }) {
-    if (options._from_version !== 1 || options._to_version !== 2) throw pgError("MIGRATION_UNSUPPORTED");
+type PostgreSQLMigrationResult<V extends 2 | 3> = { _store_id: string; _schema_version: V; _inventory_sha256: string };
+export function migratePostgreSQLStore(options: PostgreSQLMaintenanceOptions & { _from_version: 1; _to_version: 2 }): Promise<PostgreSQLMigrationResult<2>>;
+export function migratePostgreSQLStore(options: PostgreSQLMaintenanceOptions & { _from_version: 2; _to_version: 3 }): Promise<PostgreSQLMigrationResult<3>>;
+/** Reviewed metadata-only upgrades; no caller-authored SQL or implicit downgrade. */
+export async function migratePostgreSQLStore(options: PostgreSQLMaintenanceOptions & ({ _from_version: 1; _to_version: 2 } | { _from_version: 2; _to_version: 3 })) {
+    if (!(options._from_version === 1 && options._to_version === 2 || options._from_version === 2 && options._to_version === 3)) throw pgError("MIGRATION_UNSUPPORTED");
     poolConfiguration(options._connection);
     options = { ...options, _connection: JSON.parse(JSON.stringify(options._connection)) };
     const c = options._connection, inventory = postgresqlInventory(options._entities);
@@ -182,14 +219,22 @@ export async function migratePostgreSQLStore(options: PostgreSQLMaintenanceOptio
         const ns = (name: string) => pgNamespace(c._schema, name);
         const meta = (await client.query(`SELECT * FROM ${ns("ep_store")} WHERE singleton=TRUE FOR UPDATE`)).rows[0];
         const ledger = (await client.query(`SELECT * FROM ${ns("ep_migrations")} ORDER BY version`)).rows;
-        if (!meta || meta.store_id !== c._expected_store_id || meta.schema_version !== 1 || meta.inventory_sha256 !== inventory._sha256
-            || c._expected_inventory_sha256 !== inventory._sha256 || ledger.length !== 1 || ledger[0].checksum !== MIGRATION_CHECKSUMS[1]) throw pgError("MIGRATION_MISMATCH");
+        if (!meta || meta.store_id !== c._expected_store_id || meta.schema_version !== options._from_version || meta.inventory_sha256 !== inventory._sha256
+            || c._expected_inventory_sha256 !== inventory._sha256 || ledger.length !== options._from_version || ledger.some((m, i) => m.version !== i + 1 || m.checksum !== MIGRATION_CHECKSUMS[i + 1])
+            || options._from_version === 2 && c._expected_schema_version !== 2) throw pgError("MIGRATION_MISMATCH");
         for (const l of inventory._layouts) {
             const row = (await client.query(`SELECT * FROM ${ns("ep_entities")} WHERE identity_hash=$1`, [digest(l._identity)])).rows[0];
             if (!row || row.physical_identity !== l._identity || row.definition_sha256 !== l._definition_hash || row.layout_sha256 !== l._layout_hash || row.ddl_sha256 !== await fingerprint(client, c._schema, l._table)
                 || row.ddl_plan_sha256 !== digest(canonicalJSON(recordDDL(c._schema, l)))) throw pgError("SCHEMA_MISMATCH");
         }
-        for (const sql of migrationV2SQL(c._schema)) await client.query(sql, sql.includes("$1") ? [MIGRATION_CHECKSUMS[2]] : undefined);
-        return { _store_id: c._expected_store_id, _schema_version: 2 as const, _inventory_sha256: inventory._sha256 };
+        if (options._to_version === 2) {
+            for (const sql of migrationV2SQL(c._schema)) await client.query(sql, sql.includes("$1") ? [MIGRATION_CHECKSUMS[2]] : undefined);
+        } else {
+            const sql = migrationV3SQL(c._schema, options._runtime_role);
+            await client.query(sql[0]); await client.query(sql[1], [c._expected_store_id]);
+            await client.query(sql[2]); await client.query(sql[3]);
+            await client.query(sql[4], [MIGRATION_CHECKSUMS[3], "fence-v1:" + await fingerprint(client, c._schema, "ep_fence")]);
+        }
+        return { _store_id: c._expected_store_id, _schema_version: options._to_version, _inventory_sha256: inventory._sha256 };
     });
 }

@@ -3,6 +3,45 @@ import { XError, _xu } from "@xpell/core";
 
 export type EntityLocalUnitCapacityProfile = "standard-v1" | "expanded-v1";
 export type EntityLocalUnitHashPolicy = "create-and-preserve-v1";
+export type EntityLocalUnitDurabilityContract = "provider-neutral-v1";
+declare const ownerContextBrand: unique symbol;
+/** Reserved native consumer type. Production issuance/lifecycle is a separate P3 gate. */
+export type EntityLocalUnitOwnerContext = Readonly<{ [ownerContextBrand]: true }>;
+export type EntityLocalUnitStoreIdentity = Readonly<
+    { _kind: "postgresql-store-v1"; _id: string; _schema_version: number; _inventory_sha256: string } |
+    { _kind: "sqlite-binding-v1"; _id: string; _lifetime: "bound-handle" }
+>;
+export type EntityLocalUnitOwnership = Readonly<{ _mode: "unfenced" } |
+    { _mode: "epoch-v1"; _owner_id: string; _epoch: string }>;
+export type EntityLocalUnitDurability = Readonly<{
+    _contract: EntityLocalUnitDurabilityContract; _version: 1;
+    _backend: "postgresql" | "sqlite"; _store_identity: EntityLocalUnitStoreIdentity;
+    _scope: Readonly<{ _app_id: string; _env: string }>; _schema_sha256: string;
+    _capacity: EntityLocalUnitCapacity; _hash_policy: EntityLocalUnitHashPolicy | null;
+    _semantics: "serializable-exact-record-v1";
+    _durability_profile: "postgresql-local-durable-v1" | "sqlite-wal-full-v1";
+    _ownership: EntityLocalUnitOwnership;
+}>;
+export type EntityLocalUnitDurabilityAttestation = EntityLocalUnitDurability & Readonly<{
+    _unit_id: string; _commit: "confirmed";
+}>;
+export const ENTITY_LOCAL_UNIT_DURABILITY_CAPABILITIES = Object.freeze({
+    _version: 1 as const, _contracts: Object.freeze(["provider-neutral-v1"] as const)
+});
+
+export function resolveLocalUnitDurability(value: unknown): EntityLocalUnitDurabilityContract | undefined {
+    if (value === undefined) return undefined;
+    if (value !== "provider-neutral-v1") throw localUnitError("E_ENTITY_LOCAL_UNIT_DURABILITY");
+    return value;
+}
+
+export function freezeLocalUnitData<T>(value: T): Readonly<T> {
+    if (value && typeof value === "object") {
+        for (const item of Object.values(value)) if (item && typeof item === "object") freezeLocalUnitData(item);
+        Object.freeze(value);
+    }
+    return value;
+}
 export type EntityLocalUnitHashAcknowledgement = Readonly<{
     _version: 1;
     _policy: EntityLocalUnitHashPolicy;
@@ -108,6 +147,10 @@ export type EntityLocalUnitBinding = Readonly<{
     _capacity_profile?: EntityLocalUnitCapacityProfile;
     /** Trusted bootstrap only. Omission retains rejection of Hash-schema writes. */
     _hash_policy?: EntityLocalUnitHashPolicy;
+    /** Supplemental native contract; omission preserves exact legacy SQLite receipts. */
+    _durability_contract?: EntityLocalUnitDurabilityContract;
+    /** Opaque native consumer only. No public issuer exists in P2. */
+    _owner_context?: EntityLocalUnitOwnerContext;
     _clock?: () => number;
     /** Trusted fault injection only; never accepted from a command. */
     _fault?: (point: string) => void;
@@ -119,6 +162,7 @@ export type BoundEntityLocalUnit = Readonly<{
     /** Present only when bootstrap explicitly requested a supported profile. */
     _capacity?: EntityLocalUnitCapacity;
     _hash?: EntityLocalUnitHashAcknowledgement;
+    _durability_contract?: EntityLocalUnitDurability;
     commit: (unit: EntityLocalUnit) => Promise<any>;
 }>;
 
@@ -132,7 +176,7 @@ export function localUnitCanonical(value: any, depth = 0): string {
     if (value === null || typeof value === "boolean" || typeof value === "string") return JSON.stringify(value);
     if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
     if (Array.isArray(value)) return "[" + value.map(v => localUnitCanonical(v, depth + 1)).join(",") + "]";
-    if (!_xu.is_plain_object(value)) throw localUnitError();
+    if (!_xu.is_plain_object(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) throw localUnitError();
     return "{" + Object.keys(value).sort().map(k => {
         if (["__proto__", "constructor", "prototype"].includes(k)) throw localUnitError();
         return JSON.stringify(k) + ":" + localUnitCanonical(value[k], depth + 1);

@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { XError } from "@xpell/core";
+import type { EntityLocalUnitStoreIdentity } from "./EntityLocalUnit.js";
 import { Pool, type PoolClient, type PoolConfig } from "pg";
 import type { EntityPhysicalIdentity, EntityStorageScope } from "./EntityProvider.js";
 import { resolve_entity_scope_identity } from "./EntityScope.js";
@@ -6,7 +8,7 @@ import { canonicalJSON, definitionDigest, digest, pgError, quote } from "./Postg
 
 export type PostgreSQLConnectionOptions = {
     _connection_string_env: string; _database: string; _schema: string; _expected_store_id: string;
-    _expected_inventory_sha256: string; _expected_schema_version?: 1 | 2;
+    _expected_inventory_sha256: string; _expected_schema_version?: 1 | 2 | 3;
     _tls: { _mode: "verify" | "isolated-loopback"; _ca_file?: string };
     _pool?: { _max?: number; _max_waiting?: number };
     _timeouts?: { _acquire_ms?: number; _connect_ms?: number; _statement_ms?: number; _lock_ms?: number; _idle_transaction_ms?: number; _idle_ms?: number; _drain_ms?: number };
@@ -51,7 +53,7 @@ export function poolConfiguration(c: PostgreSQLConnectionOptions): PoolConfig {
     for (const options of [c._pool, c._timeouts]) for (const v of Object.values(options ?? {})) if (v !== undefined && (typeof v !== "number" || !Number.isFinite(v))) throw pgError("CONFIG");
     safeIdentifier(c._database); safeIdentifier(c._schema);
     if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(c._expected_store_id) || !/^[a-f0-9]{64}$/.test(c._expected_inventory_sha256)
-        || ![1, 2].includes(c._expected_schema_version ?? 1) || !/^[A-Z][A-Z0-9_]*$/.test(c._connection_string_env)) throw pgError("CONFIG");
+        || ![1, 2, 3].includes(c._expected_schema_version ?? 1) || !/^[A-Z][A-Z0-9_]*$/.test(c._connection_string_env)) throw pgError("CONFIG");
     const secret = process.env[c._connection_string_env];
     if (!secret) throw pgError("CONFIG");
     let url: URL;
@@ -71,8 +73,11 @@ export function poolConfiguration(c: PostgreSQLConnectionOptions): PoolConfig {
 }
 
 export function sanitizedPGError(error: any, commitSubmitted = false) {
-    if (String(error?._code ?? "").startsWith("E_ENTITY_POSTGRESQL_")) return error;
     const state = String(error?.code ?? "");
+    // Only server-confirmed abort SQLSTATEs establish failure after COMMIT submission.
+    // A client timeout/cancellation or lost reply is not proof of rollback.
+    if (commitSubmitted && !["23505", "23502", "23514", "40001", "40P01"].includes(state)) return pgError("WRITE_UNCERTAIN");
+    if (error instanceof XError && /^(E_ENTITY_POSTGRESQL_|E_ENTITY_LOCAL_UNIT_|E_ENTITY_APPEND_ONLY$)/.test(String(error._code))) return error;
     if (state === "23505" || state === "23502" || state === "23514") return pgError("CONSTRAINT");
     if (["40001", "40P01"].includes(state)) return pgError("CONFLICT");
     if (["57014", "55P03"].includes(state)) return pgError("TIMEOUT");
@@ -173,6 +178,15 @@ export class PostgreSQLRuntime {
     }
 
     namespace(identity: EntityPhysicalIdentity, table: string) { return pgNamespace(this.#entry(identity).config._schema, table); }
+    /** Internal identity metadata only. No configuration, credentials, or SQL handles escape. */
+    localUnitStore(identities: readonly EntityPhysicalIdentity[]): Extract<EntityLocalUnitStoreIdentity, { _kind: "postgresql-store-v1" }> {
+        if (!identities.length) throw pgError("PLACEMENT");
+        const entry = this.#entry(identities[0]);
+        if (identities.some(identity => this.#entry(identity) !== entry)) throw pgError("PLACEMENT");
+        const c = entry.config;
+        return Object.freeze({ _kind: "postgresql-store-v1", _id: c._expected_store_id,
+            _schema_version: c._expected_schema_version ?? 1, _inventory_sha256: c._expected_inventory_sha256 });
+    }
     #entry(identity: EntityPhysicalIdentity) {
         const placement = this.#placements.get(identity._physical_identity);
         if (!placement || this.#closed) throw pgError("UNAVAILABLE");
@@ -243,7 +257,7 @@ export class PostgreSQLRuntime {
         }
     }
 
-    async transaction<T>(identity: EntityPhysicalIdentity, write: boolean, action: (client: PoolClient) => Promise<T>): Promise<T> {
+    async transaction<T>(identity: EntityPhysicalIdentity, write: boolean, action: (client: PoolClient) => Promise<T>, beforeCommit?: () => void): Promise<T> {
         return this.withClient(identity, async client => {
             let commitSubmitted = false;
             const entry = this.#entry(identity), deadline = Date.now() + entry.limits.statement;
@@ -252,6 +266,8 @@ export class PostgreSQLRuntime {
             try {
                 await client.query(write ? "BEGIN ISOLATION LEVEL SERIALIZABLE" : "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
                 const result = await action(client);
+                // Native provider guard only, never exposed through runtime handles/commands.
+                beforeCommit?.();
                 if (Date.now() >= deadline || expired) throw pgError("TIMEOUT");
                 commitSubmitted = true;
                 await client.query("COMMIT");

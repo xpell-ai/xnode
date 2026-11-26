@@ -1,5 +1,7 @@
 # PostgreSQL EntityProvider P1
 
+The additive [P2 local-unit contract](./postgresql-entity-local-unit-p2.md) qualifies negotiated bounded units and explicit metadata v3 fence consumption. P1-only atomic-capability statements below describe the accepted baseline; unrestricted transactions/raw clients remain unsupported. Production ownership issuance is deferred to P3.
+
 Status: implementation candidate; owner acceptance and merge pending. The narrow owner-approved Unicode compatibility exception below is part of this candidate contract. This contract extends [EntityProvider Portable V1](./entity-provider-portable-v1.md). It adds generic PostgreSQL row persistence, not an ORM or an application-specific repository. Existing hosts without PostgreSQL native options keep their existing provider defaults and SQLite behavior.
 
 ## Native configuration and placement

@@ -4,7 +4,10 @@ import type { PoolClient } from "pg";
 import { aggregateEntityRecords, unsupportedEntityProviderCapabilityError, type EntityProvider, type EntityProviderCapability,
     type EntityProviderCapabilityName, type EntityProviderConstructionOptions, type EntityProviderFindOptions, type EntityAggregationRequest } from "./EntityProvider.js";
 import { PostgreSQLRuntime, getPostgreSQLRuntime } from "./PostgreSQLRuntime.js";
-import { verifyEntitySchema, assertPostgreSQLIdentity } from "./PostgreSQLSchema.js";
+import { verifyEntitySchema, assertPostgreSQLIdentity, verifyPostgreSQLFence } from "./PostgreSQLSchema.js";
+import { localUnitError, type EntityLocalUnit } from "./EntityLocalUnit.js";
+import type { LocalUnitExecution } from "./EntityLocalUnitBackend.js";
+import { preparePostgreSQLUnit, executePostgreSQLUnit, type PostgreSQLUnitEntity } from "./PostgreSQLLocalUnit.js";
 import { layoutFor, pgError, prepareRecord, projected, quote, sqliteStringKey, type PGLayout } from "./PostgreSQLValues.js";
 import { exactCount, orderSQL, pageOptions, PG_OPERATORS, whereSQL } from "./PostgreSQLQuery.js";
 
@@ -44,8 +47,42 @@ export class PostgreSQLEntityProvider implements EntityProvider {
         if (!this.#initialized || this.#disposed) throw pgError("UNAVAILABLE");
         return this.#runtime.transaction(this.#identity, write, async client => {
             await verifyEntitySchema(client, this.#namespace, this.#layout);
+            if (write && this.#runtime.localUnitStore([this.#identity])._schema_version === 3) {
+                // P2 has no production issuer. Ordinary CRUD must not bypass a required fence.
+                const store = this.#runtime.localUnitStore([this.#identity]);
+                await verifyPostgreSQLFence(client, this.#namespace, store._id);
+            }
             return action(client);
         });
+    }
+    private static localUnitState(providers: ReadonlyMap<string, PostgreSQLEntityProvider>) {
+        const list = [...providers.values()], first = list[0];
+        if (!first || list.some(p => !p.#initialized || p.#disposed || p.#runtime !== first.#runtime || p.#identity._storage_scope !== "app")) throw localUnitError("E_ENTITY_LOCAL_UNIT_STORAGE");
+        const store = first.#runtime.localUnitStore(list.map(p => p.#identity));
+        const entities = new Map<string, PostgreSQLUnitEntity>([...providers].map(([name, p]) => [name, { _layout: p.#layout, _namespace: p.#namespace }]));
+        return { first, store, entities };
+    }
+    /** Internal native bounded adapter. No SQL/client handle is returned. */
+    static async verifyLocalUnit(providers: ReadonlyMap<string, PostgreSQLEntityProvider>, o: LocalUnitExecution) {
+        const { store } = this.localUnitState(providers);
+        await this.commitLocalUnit(providers, { _unit_id: randomUUID(),
+            _records: [{ _entity: providers.keys().next().value!, _id: randomUUID() }] }, { ...o, _fault: undefined });
+        return store;
+    }
+    static async commitLocalUnit(providers: ReadonlyMap<string, PostgreSQLEntityProvider>, unit: EntityLocalUnit, o: LocalUnitExecution) {
+        // An opaque consumer slot is reserved; production issuance/lifecycle belongs to P3.
+        if (o._owner_context !== undefined) throw localUnitError("E_ENTITY_LOCAL_UNIT_FENCED");
+        const { first, store, entities } = this.localUnitState(providers);
+        const revalidate = () => { o._revalidate(); this.localUnitState(providers); };
+        const execution = { ...o, _revalidate: revalidate };
+        const prepared = await preparePostgreSQLUnit(entities, unit, execution);
+        revalidate(); o._fault?.("after_prepare");
+        let finalize: (() => void) | undefined;
+        return first.#runtime.transaction(first.#identity, true, async client => {
+            const result = await executePostgreSQLUnit(client, entities, prepared, store, execution);
+            finalize = result._finalize;
+            return { _records: result._records, _changed: result._changed, _durability: result._durability, _ownership: result._ownership };
+        }, () => { if (!finalize) throw localUnitError(); finalize(); });
     }
     #columns() { return ["_json", ...this.#layout._fields.map(f => f._column)]; }
     #values(record: any) { return [JSON.stringify(record), ...this.#layout._fields.map(f => projected(f, record[f._name]))]; }
@@ -136,9 +173,9 @@ export class PostgreSQLEntityProvider implements EntityProvider {
     getCapabilities(): EntityProviderCapability[] {
         return (["hash-verification", "aggregation", "transactions", "operation-atomic-writes", "app-local-atomic-unit", "persistent-storage",
             "server-side-pagination", "exact-count", "unique-scalar-indexes", "query-operators", "runtime-entity-handle", "physical-unregister"] as EntityProviderCapabilityName[])
-            .map(name => ({ _name: name, _supported: !["transactions", "app-local-atomic-unit", "runtime-entity-handle", "physical-unregister"].includes(name),
+            .map(name => ({ _name: name, _supported: !["transactions", "runtime-entity-handle", "physical-unregister"].includes(name),
                 ...(name === "query-operators" ? { _operators: [...PG_OPERATORS] } : name === "aggregation" ? { _operators: ["sum"] } : {}),
-                _description: "Portable PostgreSQL P1; no public transaction, atomic-unit, or raw-client authority." }));
+                _description: "Portable PostgreSQL with negotiated bounded native atomic units; no public transaction or raw-client authority. Production ownership issuance is a P3 dependency." }));
     }
     getCapability(name: EntityProviderCapabilityName) { return this.getCapabilities().find(c => c._name === name) ?? { _name: name, _supported: false }; }
     assertCapability(name: EntityProviderCapabilityName) { const c = this.getCapability(name); if (!c._supported) throw unsupportedEntityProviderCapabilityError(this, name); return c; }

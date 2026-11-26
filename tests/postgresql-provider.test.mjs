@@ -27,7 +27,8 @@ test('manager envelopes, trusted placement, capability denial and shared owner c
   assert.equal((await invoke('storage_diagnostics'))._result._diagnostic._storage_provider, 'postgresql');
   assert.equal((await invoke('get_entity'))._ok, false);
   const p = f.make(); await p.init();
-  for (const cap of ['transactions', 'app-local-atomic-unit', 'runtime-entity-handle', 'physical-unregister']) assert.equal(p.getCapability(cap)._supported, false);
+  for (const cap of ['transactions', 'runtime-entity-handle', 'physical-unregister']) assert.equal(p.getCapability(cap)._supported, false);
+  assert.equal(p.getCapability('app-local-atomic-unit')._supported, true); // P2 bounded native extension, not unrestricted transactions.
   const unknown = simpleDefinition('unmapped');
   assert.equal((await invoke('register', { _entity: { ...unknown, _storage: { _provider: 'sqlite', _scope: 'app' } } }))._ok, false);
   assert.equal((await invoke('register', { _entity: { ...f.definitions[0], _storage: { _provider: 'sqlite', _scope: 'app' } } }))._ok, false);

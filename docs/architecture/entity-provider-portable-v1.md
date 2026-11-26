@@ -1,5 +1,7 @@
 # EntityProvider Portable V1 Contract
 
+The additive [P2 bounded PostgreSQL/neutral contract](./postgresql-entity-local-unit-p2.md) extends the original SQLite-only local-unit description below. Legacy SQLite receipts/defaults remain unchanged. PostgreSQL requires explicit native negotiation; production ownership issuance/readiness remains a P3 dependency.
+
 EntityManager remains the public application boundary. It resolves logical identity, app/environment scope, provider selection, lifecycle, and `XResponseOK` / `XResponseError` envelopes. Entity providers return raw provider values behind that boundary.
 
 The default provider is `xdb`, and the default storage scope is `app`. An entity artifact with no `_storage` block therefore keeps the current XDB-backed app-scoped behavior. Provider changes never copy, merge, fall back, or dual-write records.
