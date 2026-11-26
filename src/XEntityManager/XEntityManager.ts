@@ -24,6 +24,9 @@ import type {
 import { aggregateEntityRecords } from "./EntityProvider.js";
 import { randomUUID } from "node:crypto";
 import { SQLiteEntityProvider } from "./SQLiteEntityProvider.js";
+import { PostgreSQLEntityProvider } from "./PostgreSQLEntityProvider.js";
+import { pgError } from "./PostgreSQLValues.js";
+import { getPostgreSQLRuntime } from "./PostgreSQLRuntime.js";
 import { aliasHistoricalOwner } from "./EntityHistoricalOwner.js";
 import { openEntityHistoricalImport, type EntityHistoricalImportBinding, type BoundEntityHistoricalImport } from "./EntityHistoricalImport.js";
 import { localUnitError, localUnitHash, resolveLocalUnitCapacity, resolveLocalUnitHashPolicy, validateLocalUnit, type EntityLocalUnitBinding, type BoundEntityLocalUnit, type EntityLocalUnitCapacity, type EntityLocalUnitHashAcknowledgement } from "./EntityLocalUnit.js";
@@ -333,11 +336,40 @@ export class XEntityManager extends XModule {
             process.cwd();
 
         this._provider_runtime_context = {
+            _postgresql: opts?._provider_runtime_context?._postgresql,
             _work_folder:
                 String(work_folder),
             _sqlite_require_full_durability:
                 opts?._provider_runtime_context?._sqlite_require_full_durability === true
         };
+    }
+
+    /** Native owner shutdown only; not a command and never closes another provider family. */
+    async closePostgreSQLResources() {
+        const closing = this._provider_runtime_context._postgresql?.close();
+        for (const entry of this._entities.values()) {
+            if (entry._provider instanceof PostgreSQLEntityProvider) await entry._provider.dispose();
+        }
+        await closing;
+    }
+
+    /** Native XNode/XVM startup guard; deliberately not an EntityManager command. */
+    assertPostgreSQLRegistration(app_id: unknown, env: unknown, entity: any, response: any) {
+        const handle = this._provider_runtime_context._postgresql;
+        if (handle && response?._ok !== true && getPostgreSQLRuntime(handle).requiresRegistration(app_id, env, entity)) throw pgError("REGISTRATION");
+    }
+
+    /** Every explicitly placed entity must be registered and freshly verified before Ready. */
+    async assertPostgreSQLReady() {
+        const handle = this._provider_runtime_context._postgresql;
+        if (!handle) return;
+        const providers = new Map([...this._entities.values()].filter(e => e._provider instanceof PostgreSQLEntityProvider)
+            .map(e => [e._provider.getPhysicalIdentity()._physical_identity, e._provider]));
+        for (const identity of getPostgreSQLRuntime(handle).requiredEntityIdentities()) {
+            const provider = providers.get(identity);
+            if (!provider) throw pgError("NOT_READY");
+            await provider.init();
+        }
     }
 
     /* -------------------------------------------------- */
@@ -428,8 +460,14 @@ export class XEntityManager extends XModule {
         entity_id: string,
         entity: any
     ): EntityPhysicalIdentity {
-        const provider =
+        let provider =
             this.resolveStorageProvider(entity);
+
+        const candidate = this.resolveEntityScopeIdentity({
+            _app_id: app_id, _env: env, _entity_id: entity_id, _provider: provider,
+            _storage_scope: this.resolveStorageScope(entity)
+        });
+        if (this._provider_runtime_context._postgresql) provider = getPostgreSQLRuntime(this._provider_runtime_context._postgresql).resolveProvider(entity, candidate, { _app_id: app_id, _env: env });
 
         return this.resolveEntityScopeIdentity({
             _app_id:
@@ -2148,6 +2186,7 @@ export class XEntityManager extends XModule {
                     existing_physical_identity._physical_entity_name === physical_identity._physical_entity_name;
 
                 if (!same_physical_identity) {
+                    if (existing._provider instanceof PostgreSQLEntityProvider || physical_identity._provider === "postgresql") throw pgError("REBIND");
                     await existing._provider.dispose();
 
                     const replacement_provider =

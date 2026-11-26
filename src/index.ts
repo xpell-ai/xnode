@@ -106,6 +106,12 @@ export {
   type XWebRouteContributor,
 } from "./XServer/XWebServer.js";
 export { XNode, type XNodeOptions } from "./XServer/XNode.js";
+export { createPostgreSQLRuntime } from "./XEntityManager/PostgreSQLRuntime.js";
+export type { PostgreSQLRuntimeOptions, PostgreSQLRuntimeHandle, PostgreSQLConnectionOptions, PostgreSQLPlacement } from "./XEntityManager/PostgreSQLRuntime.js";
+export { initializePostgreSQLStore, migratePostgreSQLStore, postgresqlInventory } from "./XEntityManager/PostgreSQLSchema.js";
+export type { PostgreSQLStoreEntity, PostgreSQLMaintenanceOptions } from "./XEntityManager/PostgreSQLSchema.js";
+export { resolve_entity_scope_identity } from "./XEntityManager/EntityScope.js";
+export type { EntityPhysicalIdentity, EntityStorageScope } from "./XEntityManager/EntityProvider.js";
 export { bindEntityLocalUnit } from "./XEntityManager/XEntityManager.js";
 export { bindEntityHistoricalImport } from "./XEntityManager/XEntityManager.js";
 export { ENTITY_HISTORICAL_IMPORT_CAPABILITIES, ENTITY_HISTORICAL_IMPORT_RUNTIME } from "./XEntityManager/EntityHistoricalImport.js";

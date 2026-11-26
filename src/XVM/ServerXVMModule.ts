@@ -551,9 +551,12 @@ export class ServerXVMModule extends XModule {
   private _active_app_by_env: Map<string, string> = new Map();
   private _system_xapps_path?: string;
   private _package_system_xapps_path: string;
+  /** Trusted native bootstrap guard; never taken from persisted app/command JSON. */
+  private _assert_entity_registration?: (app_id: string, env: string, entity: any, response: any) => void;
 
   constructor(opts: any = {}) {
     super({ _name: ServerXVMModule._name });
+    this._assert_entity_registration = typeof opts._assert_entity_registration === "function" ? opts._assert_entity_registration : undefined;
 
     const work_folder = opts._work_folder ?? DEFAULT_WORK_FOLDER;
     this._work_folder = work_folder;
@@ -3775,7 +3778,7 @@ export class ServerXVMModule extends XModule {
     this.validate_bundle_runtime_contract(loaded_bundle);
 
     for (const entity of Object.values(entities)) {
-      await _x.execute({
+      const response = await _x.execute({
         _module: "entity-manager",
         _op: "register",
         _params: {
@@ -3784,6 +3787,7 @@ export class ServerXVMModule extends XModule {
           _entity: entity
         }
       });
+      this._assert_entity_registration?.(app_file._app_id, app_file._env, entity, response);
     }
 
     const key = app_scope_key(app_file._app_id, app_file._env);

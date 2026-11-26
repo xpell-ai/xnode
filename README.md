@@ -6,6 +6,12 @@ Target publication date: **13 November 2026**; this candidate has not been publi
 Use the coordinated 2.0.8 runtime dependencies. See [CHANGELOG](./CHANGELOG.md)
 for package changes and qualification limits; [LICENSE](./LICENSE) contains the MIT terms.
 
+The source also includes an opt-in PostgreSQL EntityProvider P1 candidate. Its
+[native configuration, explicit initialization and capabilities](./docs/architecture/postgresql-entity-provider-v1.md)
+and [real PostgreSQL / SQLite qualification procedure](./docs/postgresql-provider-qualification.md)
+are documented separately. Existing provider defaults remain unchanged. PostgreSQL
+P1 does not provide application-controlled transactions or app-local atomic units.
+
 Xpell 2 Alpha --- Server Runtime (xnode)
 
 `@xpell/node` is the server-side execution layer of the Xpell 2

@@ -1,0 +1,141 @@
+{
+  "status": "P1 review candidate after independent-review corrections; owner acceptance/merge pending",
+  "postgresql": {
+    "version": "17.12",
+    "source_sha256": "9cf136a703d8ee2f83465c43be4e9e8e7930c82b0bfba13be7e2537be769ac55",
+    "docker_manifest_digest": "sha256:1eff563f6c868b9b433566e9f3cf6e5c79fbd3b95bf70ec7277d376cdbfc50d7",
+    "container_executed": false,
+    "native_platform": "Darwin-x86_64",
+    "encoding": "UTF8",
+    "locale": "C"
+  },
+  "pg": "8.23.1",
+  "types_pg": "8.23.1",
+  "node_reference": "22.23.1",
+  "node_additional": "24.22.3",
+  "typescript": "5.9.3",
+  "types_node": "22.20.7",
+  "sdk": "2.0.8",
+  "better_sqlite3": "12.11.1",
+  "sqlite": "3.53.2",
+  "xnet_regression_fixture_source": "93a7ec18194df7c79641f35b2a390247c6abca09",
+  "node24_failure": "Historical pre-exception result retained below; revised acceptance scope explicitly defers exceptional-string SQLite parity and independently verifies fixed PostgreSQL semantics on both Node versions.",
+  "historical_results_before_exception": {
+    "packed_node22": {
+      "pass": 40,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0
+    },
+    "packed_node24": {
+      "pass": 38,
+      "fail": 2,
+      "skip": 0,
+      "cancelled": 0
+    },
+    "sqlite_node22_final_source": {
+      "pass": 216,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0
+    },
+    "consumer_typescript": {
+      "node22": "PASS",
+      "node24": "PASS"
+    }
+  },
+  "historical_candidate_archive_sha256": "061ad55503394238adfbb1e1f6b8e2d6a3e02bc9d6ff347b7f0a13acef2e0e29",
+  "unicode_compatibility_exception": {
+    "approved_on": "2026-11-25",
+    "scope": "SQLite parity for unpaired UTF-16 surrogate keys only",
+    "postgresql_codec": "fixed WTF-8 on both qualified Node versions",
+    "deferred_named_tests": 1,
+    "sqlite_implementation_changed": false,
+    "node22_only_guard": false
+  },
+  "candidate_archive_sha256": "c15792f086fd2c3197c06817888d23e00dd7712f5d2ce96b045aa932243a791a",
+  "candidate_archive_integrity": "sha512-s29aIZL6C7MJQDjViWyQXQ6gA3jVs5DROop0A+ATN/pjyZsrVZFk4itP13awTGGB+4SCnd3gEi5KqtyRpo5uhw==",
+  "fixture_lock_sha256": "7aa0dc257e72569021611186a424fc6a39ba200522be1ae0c144d41c886fa6b6",
+  "qualified_dist_file_count": 278,
+  "historical_results_before_independent_review": {
+    "packed_node22": {
+      "pass": 42,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "db2ebece2125d61058d32e08e6ac0f230f968625222cd9c7491dfe8dcf13385c"
+    },
+    "packed_node24": {
+      "pass": 42,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "951ef7f3342c69c1e70b9070e249154b8d783b28ea7be0e6515d743f52ce3057"
+    },
+    "sqlite_node22": {
+      "pass": 216,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "log_sha256": "fc72eeea59b8490a661b76e63fc9971e17336fff8a4ac45b83082606092ed5c7",
+      "note": "Original SQLite regression run retained; subsequent changes affect Unicode test scope, documentation, packing helper and one codec comment only; SQLite and executable runtime logic unchanged."
+    },
+    "consumer_typescript": {
+      "node22": "PASS",
+      "node24": "PASS"
+    }
+  },
+  "historical_archive_before_independent_review": "f90f14efe76160a978a0a1e18087464befa4ebb1bc9f684473b10ed3fe4efe92",
+  "results": {
+    "packed_node22": {
+      "pass": 62,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "d22a44fb904e80ceca29d8b883de06088281a8dac1f01a6e320d5156d6c141f6"
+    },
+    "packed_node24": {
+      "pass": 62,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "log_sha256": "4c11f5bd02c7bee9cfbbebfafca79b123bcb47e9017af00e49efab5677ac32ea"
+    },
+    "sqlite_node22": {
+      "pass": 216,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "log_sha256": "fb68e6d4dc9d64cc199c2aa201d791a39a4a0cb8ca926b6992bade756fcc0569"
+    },
+    "consumer_typescript": {
+      "node22": "PASS",
+      "node24": "PASS"
+    }
+  },
+  "independent_review_2026_11_26": {
+    "reviewed_head": "1dc6c8a2e88bd80c59dde5e8be640067efaa08ac",
+    "baseline": {
+      "pass": 1,
+      "fail": 14,
+      "skip": 0,
+      "cancelled": 0,
+      "log_sha256": "d38f3be9309f49e01c97ff4023e190f5dbf5208fe383aaf826597550f055e975",
+      "note": "Reproduced before corrective source edits. Fourteen expected rejection assertions failed; healthy startup control passed. All278 reviewed dist hashes matched the original qualified candidate."
+    },
+    "physical_checks": [
+      "ordinary permanent entity and identity/ledger tables",
+      "normal user-trigger activation",
+      "valid/ready/live permanent indexes"
+    ],
+    "startup_checks": [
+      "required PG response errors abort XVM app loading",
+      "all explicit placements registered and freshly verified before Ready",
+      "no started event on failed startup; owned pool/core/listener cleanup",
+      "healthy SQLite-only and unrelated legacy-error behavior preserved"
+    ],
+    "direct_catalog_mutation": false,
+    "provider_or_registration_response_mocks": false,
+    "unicode_exception_unchanged": true
+  }
+}

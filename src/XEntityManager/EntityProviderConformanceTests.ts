@@ -22,7 +22,7 @@ import { XEntityManager } from "./XEntityManager.js";
 
 type ConformanceProviderType = Exclude<EntityProviderType, "mongo">;
 
-type EntityProviderConformanceCase = {
+export type EntityProviderConformanceCase = {
     _provider: ConformanceProviderType;
     _durable: boolean;
     _definition: any;
@@ -333,7 +333,7 @@ export async function runEntityProviderConformanceSuite(
     await recreated.dispose();
 }
 
-async function runEntityManagerEnvelopeSuite(
+export async function runEntityManagerEnvelopeSuite(
     provider: ConformanceProviderType,
     runtimeContext: EntityProviderRuntimeContext
 ) {

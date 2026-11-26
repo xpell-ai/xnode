@@ -1,0 +1,39 @@
+{
+  "name": "xnode-postgresql-p1-consumer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22.23.1"
+  },
+  "dependencies": {
+    "@xpell/core": "2.0.8",
+    "@xpell/node-core": "2.0.8",
+    "@xpell/mcp": "2.0.8",
+    "@xpell/vibe": "2.0.8",
+    "@xpell/file-service": "0.1.0",
+    "bcryptjs": "3.0.3",
+    "better-sqlite3": "12.11.1",
+    "cors": "2.8.6",
+    "express": "5.2.1",
+    "express-sslify": "1.2.0",
+    "fflate": "0.8.3",
+    "mongoose": "9.7.0",
+    "node-fetch": "3.3.2",
+    "ws": "8.21.0",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.7",
+    "@types/pg": "8.23.1",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/cors": "2.8.19",
+    "@types/express": "5.0.6",
+    "@types/express-sslify": "1.2.5",
+    "@types/ws": "8.18.1"
+  },
+  "overrides": {
+    "better-sqlite3": "12.11.1"
+  }
+}

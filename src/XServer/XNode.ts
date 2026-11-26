@@ -13,6 +13,7 @@ import { _xem, XEventManager } from "@xpell/node-core";
 import { XAI } from "../XAI/XAI.js";
 import FlowManagerModule from "../XFM/FlowManagerModule.js";
 import { XEntityManager } from "../XEntityManager/XEntityManager.js";
+import { createPostgreSQLRuntime, type PostgreSQLRuntimeOptions } from "../XEntityManager/PostgreSQLRuntime.js";
 import {
     XDB, XDBStorageFS, XDBStorageSqlite, type IXDBStorage
 } from "../XDB/index.js";
@@ -43,6 +44,8 @@ export type XNodeOptions = {
     _xdb?: XDBOptions;
     /** Server-owned EntityManager SQLite policy, separate from XDB storage. */
     _entity_sqlite?: { _require_full_durability?: boolean };
+    /** Native trusted PostgreSQL placement, separate from XDB whole-entity storage. */
+    _entity_postgresql?: PostgreSQLRuntimeOptions;
     _modules?: XModule[];
     _routes?: XWebRouteContributor[];
 };
@@ -97,6 +100,7 @@ export class XNode {
     private _shutdown?: Promise<void>;
     private _cleanup?: Promise<void>;
     private _xdb_storage?: IXDBStorage;
+    private _entity_manager?: XEntityManager;
 
     constructor() {
     }
@@ -339,18 +343,22 @@ export class XNode {
             }
 
             await this.loadOwnedModule(new FlowManagerModule());
-            await this.loadOwnedModule(new XEntityManager({
+            this._entity_manager = new XEntityManager({
                 _provider_runtime_context: {
+                    _postgresql: options._entity_postgresql ? createPostgreSQLRuntime(options._entity_postgresql) : undefined,
                     _work_folder:
                         this._work_folder,
                     _sqlite_require_full_durability: options._entity_sqlite?._require_full_durability === true
                 }
-            }));
+            });
+            await this.loadOwnedModule(this._entity_manager);
             await this.loadOwnedModule(new XPlanningModule());
             await this.loadOwnedModule(new XStudioModule());
-            const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path });
+            const server_xvm = new ServerXVMModule({ _work_folder: this._work_folder, _system_xapps_path: options._system_xapps_path,
+                _assert_entity_registration: (app_id: string, env: string, entity: any, response: any) =>
+                    this._entity_manager!.assertPostgreSQLRegistration(app_id, env, entity, response) });
             await this.loadOwnedModule(server_xvm);
-
+            await this._entity_manager.assertPostgreSQLReady();
 
             this._started = true;
             markXpellMCPRuntimeReady("xnode_module_graph_loaded");
@@ -404,6 +412,7 @@ export class XNode {
             const results = await Promise.allSettled([
                 this._bootstrap_started ? this._web_server.stop?.() : undefined,
                 this._xdb_storage?.close(),
+                this._entity_manager?.closePostgreSQLResources(),
             ]);
             if (this._owns_settings) { _xs.close(); this._owns_settings = false; }
             if (this._settings_events_bound) {
