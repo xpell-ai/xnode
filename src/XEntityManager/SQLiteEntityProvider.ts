@@ -6,7 +6,7 @@ import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { XError } from "@xpell/core";
 import { _xu } from "@xpell/node-core";
-import { assertEntityLocalUnitHashCreateInput, localUnitCanonical, localUnitError, localUnitHash, resolveLocalUnitHashPolicy, validateLocalUnit, ENTITY_LOCAL_UNIT_CAPABILITIES, type EntityLocalUnit, type EntityLocalUnitHashPolicy, type EntityLocalUnitCapacityLimits } from "./EntityLocalUnit.js";
+import { assertEntityLocalUnitHashCreateInput, assertLocalUnitPhysicalTargets, localUnitCanonical, localUnitError, localUnitHash, resolveLocalUnitHashPolicy, validateLocalUnit, ENTITY_LOCAL_UNIT_CAPABILITIES, type EntityLocalUnit, type EntityLocalUnitHashPolicy, type EntityLocalUnitCapacityLimits } from "./EntityLocalUnit.js";
 import { historicalImportContext, historicalImportTimestamp, isHistoricalImportProvider } from "./EntityHistoricalImport.js";
 import type {
     EntityAggregationRequest,
@@ -1847,20 +1847,30 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     /** Only EntityManager's pinned, app-local binding calls this. Handles never escape. */
+    /** Internal acknowledgement projection; reuse the provider's existing default serialization. */
+    static localUnitCreateDefaults(provider: SQLiteEntityProvider, input: Record<string, unknown>): Record<string, unknown> {
+        return Object.fromEntries(Object.entries(provider._schema).filter(([key, field]) => !Object.hasOwn(input, key) &&
+            !["_created_at", "_updated_at"].includes(key) && Object.hasOwn(field, "_default"))
+            .map(([key, field]) => [key, provider.serializeRecordValue(key, field._default)]));
+    }
+
     static async commitLocalUnit(
         providers: ReadonlyMap<string, SQLiteEntityProvider>, unit: EntityLocalUnit,
         clock: () => number, fault?: (point: string) => void,
         hashPolicy?: EntityLocalUnitHashPolicy,
         limits: EntityLocalUnitCapacityLimits = ENTITY_LOCAL_UNIT_CAPABILITIES._profiles["standard-v1"],
         revalidate?: () => void,
-        historicalToken?: object
+        historicalToken?: object,
+        strictFinalChecks = false
     ) {
         const historical = historicalToken === undefined ? undefined : historicalImportContext(historicalToken);
         if (historical && hashPolicy !== undefined) throw localUnitError("E_ENTITY_HISTORICAL_IMPORT_UNAUTHORIZED");
         const hash = resolveLocalUnitHashPolicy(hashPolicy);
         // Snapshot before any await. Never fingerprint a plaintext proposal for a receipt.
-        if (hash) unit = validateLocalUnit(unit, limits);
+        if (hash || strictFinalChecks) unit = validateLocalUnit(unit, limits);
         const list = [...providers.values()];
+        if (strictFinalChecks) assertLocalUnitPhysicalTargets(unit,
+            new Map([...providers].map(([name, p]) => [name, p._physical_identity._physical_identity])));
         const first = list[0];
         if (!first || list.some(p => !p._db?.open || p._db_path !== first._db_path ||
             p._physical_identity._storage_scope !== "app" || p.resolveDbPath(p._definition) !== p._db_path)) {
@@ -1913,7 +1923,7 @@ export class SQLiteEntityProvider implements EntityProvider {
             }
             prepared.set(op, values);
         }
-        if (hash) validateLocalUnit({ ...unit, _records: unit._records.map(op => {
+        if (hash || strictFinalChecks) validateLocalUnit({ ...unit, _records: unit._records.map(op => {
             const values = prepared.get(op);
             return values ? { ...op, ...(op._create ? { _create: values } : { _update: values }) } : op;
         }) }, limits);
@@ -1983,9 +1993,20 @@ export class SQLiteEntityProvider implements EntityProvider {
                     fault?.(`after_write_${++count}`);
                     return { _entity: op._entity, _record: record };
                 });
-                if ((hash || historical) && Buffer.byteLength(localUnitCanonical(records)) > limits._bytes) throw localUnitError();
+                if ((hash || historical || strictFinalChecks) && Buffer.byteLength(localUnitCanonical(records)) > limits._bytes) throw localUnitError();
                 historical?.after(db);
                 if (count > 0) fault?.("before_commit");
+                if (strictFinalChecks) {
+                    revalidate?.();
+                    if (list.some(p => !p._db?.open || localUnitHash(p._definition) !== schemaHashes[list.indexOf(p)])) throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+                    const finalNow = clock();
+                    if (!Number.isSafeInteger(finalNow) || finalNow < 0) throw localUnitError();
+                    if (unit._valid_until !== undefined && finalNow >= unit._valid_until) throw localUnitError("E_ENTITY_LOCAL_UNIT_EXPIRED");
+                    if (unit._lease) {
+                        const row = rows[unit._records.findIndex(op => op._entity === unit._lease!._entity && op._id === unit._lease!._id)];
+                        if (row._lease_expires_at <= finalNow) throw localUnitError("E_ENTITY_LOCAL_UNIT_FENCED");
+                    }
+                }
                 return { _records: records, _changed: changed, _durability: { _journal_mode: "wal", _synchronous: 2, _foreign_keys: 1 } };
             }).immediate();
             return result;

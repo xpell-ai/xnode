@@ -17,7 +17,7 @@ export const isPGError = suffix => e => e?._code === 'E_ENTITY_POSTGRESQL_' + su
 /** Refuses an unmarked/wrong cluster before creating or dropping any database. */
 export async function fixture(t, definitions = [simpleDefinition()], options = {}) {
   const cluster = process.env.XPELL_PG_TEST_CLUSTER, port = Number(process.env.XPELL_PG_TEST_PORT);
-  assert.ok(cluster?.includes('issue-73-') && Number.isInteger(port) && port > 1024, 'Explicit isolated Issue73 cluster/port required; PostgreSQL lane cannot silently skip');
+  assert.ok((cluster?.includes('issue-73-') || cluster?.includes('issue-74-')) && Number.isInteger(port) && port > 1024, 'Explicit isolated Issue73/74 cluster/port required; PostgreSQL lane cannot silently skip');
   const admin = new Client({ host: process.env.XPELL_PG_TEST_SOCKET ?? '/private/tmp', port, user: os.userInfo().username,
     password: 'unused-synthetic-unix-auth', database: 'postgres', ssl: false, connectionTimeoutMillis: 5000, query_timeout: 10000 });
   await admin.connect();

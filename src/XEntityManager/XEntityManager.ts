@@ -29,7 +29,9 @@ import { pgError } from "./PostgreSQLValues.js";
 import { getPostgreSQLRuntime } from "./PostgreSQLRuntime.js";
 import { aliasHistoricalOwner } from "./EntityHistoricalOwner.js";
 import { openEntityHistoricalImport, type EntityHistoricalImportBinding, type BoundEntityHistoricalImport } from "./EntityHistoricalImport.js";
-import { localUnitError, localUnitHash, resolveLocalUnitCapacity, resolveLocalUnitHashPolicy, validateLocalUnit, type EntityLocalUnitBinding, type BoundEntityLocalUnit, type EntityLocalUnitCapacity, type EntityLocalUnitHashAcknowledgement } from "./EntityLocalUnit.js";
+import { localUnitError, localUnitHash, localUnitCanonical, freezeLocalUnitData, resolveLocalUnitDurability, resolveLocalUnitCapacity, resolveLocalUnitHashPolicy, validateLocalUnit,
+    type EntityLocalUnitDurability, type EntityLocalUnitBinding, type BoundEntityLocalUnit, type EntityLocalUnitCapacity, type EntityLocalUnitHashAcknowledgement } from "./EntityLocalUnit.js";
+import { resolveNativeLocalUnitBackend, validateCommittedLocalUnitResult, type NativeLocalUnitBackend, type LocalUnitExecution } from "./EntityLocalUnitBackend.js";
 import {
     createEntityProvider,
     resolveEntityProviderType
@@ -252,6 +254,8 @@ export class XEntityManager extends XModule {
         _binding: EntityLocalUnitBinding;
         _capacity: EntityLocalUnitCapacity;
         _hash?: EntityLocalUnitHashAcknowledgement;
+        _backend: NativeLocalUnitBackend;
+        _durability?: EntityLocalUnitDurability;
         _acknowledge_capacity: boolean;
         _entries: Map<string, { _stored: EntityRegistryEntry; _schema_hash: string; _write: boolean }>;
     }>();
@@ -260,32 +264,60 @@ export class XEntityManager extends XModule {
     async bindLocalUnit(options: EntityLocalUnitBinding): Promise<BoundEntityLocalUnit> {
         const capacity = resolveLocalUnitCapacity(options._capacity_profile);
         const hash = resolveLocalUnitHashPolicy(options._hash_policy);
+        const durability = resolveLocalUnitDurability(options._durability_contract);
         const acknowledge_capacity = options._capacity_profile !== undefined;
         if (!options._app_id || !options._env || options._entities.length < 1 || options._entities.length > capacity._limits._entities) throw localUnitError();
         const binding = Object.freeze({ ...options, _capacity_profile: capacity._profile, _hash_policy: hash?._policy,
             _entities: Object.freeze(options._entities.map(e => Object.freeze({ ...e }))) });
         const entries = new Map<string, { _stored: EntityRegistryEntry; _schema_hash: string; _write: boolean }>();
+        const physical = new Set<string>();
         for (const entry of binding._entities) {
             if (entries.has(entry._entity) || typeof entry._write !== "boolean") throw localUnitError();
             const stored = this.getStoredEntity({ _env: binding._env, _app_id: binding._app_id, _entity: entry._entity });
-            if (!(stored._provider instanceof SQLiteEntityProvider) || stored._physical_identity._storage_scope !== "app" ||
+            if (stored._physical_identity._storage_scope !== "app" ||
                 stored._app_id !== binding._app_id || stored._env !== binding._env) throw localUnitError("E_ENTITY_LOCAL_UNIT_STORAGE");
+            const identity = stored._physical_identity._physical_identity;
+            if (physical.has(identity)) throw localUnitError();
+            physical.add(identity);
             entries.set(entry._entity, { _stored: stored, _schema_hash: localUnitHash(stored._definition), _write: entry._write });
         }
-        const providers = new Map([...entries].map(([name, entry]) => [name, entry._stored._provider as SQLiteEntityProvider]));
+        const providers = new Map([...entries].map(([name, entry]) => [name, entry._stored._provider]));
+        const backend = resolveNativeLocalUnitBackend(providers);
+        if (backend._backend === "postgresql" && !durability) throw localUnitError("E_ENTITY_LOCAL_UNIT_DURABILITY");
+        const revalidate = () => {
+            for (const [name, entry] of entries) {
+                const current = this.getStoredEntity({ _env: binding._env, _app_id: binding._app_id, _entity: name });
+                if (current !== entry._stored || localUnitHash(current._definition) !== entry._schema_hash) throw localUnitError("E_ENTITY_LOCAL_UNIT_SCHEMA");
+            }
+        };
+        const execution: LocalUnitExecution = { _clock: binding._clock ?? Date.now, _hash_policy: hash?._policy,
+            _limits: capacity._limits, _revalidate: revalidate, _strict_final_checks: !!durability, _owner_context: binding._owner_context };
         // Verify the real writer's storage profile at readiness, before allowing work.
-        await SQLiteEntityProvider.commitLocalUnit(providers, { _unit_id: randomUUID(),
-            _records: [{ _entity: binding._entities[0]._entity, _id: randomUUID() }] }, binding._clock ?? Date.now);
+        const store = await backend.verify(execution);
+        revalidate();
+        const descriptor: EntityLocalUnitDurability | undefined = durability ? freezeLocalUnitData({
+            _contract: durability, _version: 1, _backend: backend._backend, _store_identity: store,
+            _scope: { _app_id: binding._app_id, _env: binding._env },
+            _schema_sha256: localUnitHash([...entries].map(([name, e]) => ({ _entity: name,
+                _physical_identity: e._stored._physical_identity._physical_identity, _definition_sha256: e._schema_hash }))
+                .sort((a, b) => a._entity < b._entity ? -1 : a._entity > b._entity ? 1 : 0)),
+            _capacity: capacity, _hash_policy: hash?._policy ?? null, _semantics: "serializable-exact-record-v1",
+            _durability_profile: backend._backend === "sqlite" ? "sqlite-wal-full-v1" : "postgresql-local-durable-v1",
+            _ownership: { _mode: "unfenced" }
+        }) : undefined;
         const key = randomUUID();
-        this._local_units.set(key, { _binding: binding, _capacity: capacity, _hash: hash, _acknowledge_capacity: acknowledge_capacity, _entries: entries });
+        this._local_units.set(key, { _binding: binding, _capacity: capacity, _hash: hash, _backend: backend, _durability: descriptor,
+            _acknowledge_capacity: acknowledge_capacity, _entries: entries });
         return Object.freeze({ _app_id: binding._app_id, _env: binding._env,
             ...(acknowledge_capacity ? { _capacity: capacity } : {}),
             ...(hash ? { _hash: hash } : {}),
+            ...(descriptor ? { _durability_contract: descriptor } : {}),
             commit: async (unit) => _x.execute({ _module: this._name, _op: "commit-local-unit", _params: { _local_unit_key: key, _unit: unit } }) });
     }
 
     /** Private capability operation: deliberately absent from the general/model skill catalogue. */
     async _commit_local_unit(command: XCommand) {
+        let confirmedWithNewContract = false;
         try {
             const params = command._params ?? {};
             if ((command as any)._ctx || Object.keys(params).some(k => !["_local_unit_key", "_unit"].includes(k))) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
@@ -304,9 +336,19 @@ export class XEntityManager extends XModule {
                 const entry = entries.get(op._entity);
                 if (!entry || (!entry._write && (op._create || op._update))) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
             }
-            const result = await SQLiteEntityProvider.commitLocalUnit(
-                new Map([...entries].map(([name, e]) => [name, e._stored._provider as SQLiteEntityProvider])),
-                unit, binding._clock ?? Date.now, binding._fault, owned._hash?._policy, owned._capacity._limits, revalidate);
+            let result = await owned._backend.commit(unit, { _clock: binding._clock ?? Date.now, _fault: binding._fault,
+                _hash_policy: owned._hash?._policy, _limits: owned._capacity._limits, _revalidate: revalidate,
+                _strict_final_checks: !!owned._durability, _owner_context: binding._owner_context });
+            confirmedWithNewContract = !!owned._durability;
+            if (owned._durability) {
+                const expected = owned._backend._backend === "sqlite" ? { _journal_mode: "wal", _synchronous: 2, _foreign_keys: 1 }
+                    : { _backend: "postgresql", _profile: "postgresql-local-durable-v1" };
+                if (localUnitCanonical(result._durability) !== localUnitCanonical(expected) ||
+                    localUnitCanonical(result._ownership ?? { _mode: "unfenced" }) !== localUnitCanonical(owned._durability._ownership) ||
+                    result._records.length !== unit._records.length) throw localUnitError("E_ENTITY_LOCAL_UNIT_RESULT_UNCERTAIN");
+                result = await validateCommittedLocalUnitResult(unit, result, owned._backend,
+                    name => entries.get(name)!._stored._definition._schema ?? {}, owned._capacity._limits);
+            }
             for (const changed of result._changed) {
                 const stored = entries.get(changed._entity)!._stored;
                 const record = owned._hash ? { ...changed._record } : changed._record;
@@ -317,10 +359,12 @@ export class XEntityManager extends XModule {
             }
             if (result._changed.length) binding._fault?.("after_commit");
             return new XResponseOK({ _records: result._records, _durability: result._durability,
+                ...(owned._durability ? { _durability_attestation: { ...owned._durability, _unit_id: unit._unit_id, _commit: "confirmed" } } : {}),
                 ...(owned._acknowledge_capacity ? { _capacity: owned._capacity } : {}),
                 ...(owned._hash ? { _hash: owned._hash } : {}) }).toXData();
         } catch (error) {
-            return new XResponseError(error instanceof XError ? error : localUnitError("E_ENTITY_LOCAL_UNIT_FAILED")).toXData();
+            return new XResponseError(confirmedWithNewContract ? localUnitError("E_ENTITY_LOCAL_UNIT_RESULT_UNCERTAIN") :
+                error instanceof XError ? error : localUnitError("E_ENTITY_LOCAL_UNIT_FAILED")).toXData();
         }
     }
 

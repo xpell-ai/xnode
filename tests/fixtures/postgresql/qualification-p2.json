@@ -1,0 +1,281 @@
+{
+  "status": "P2 implementation candidate qualified for owner review; no implementation acceptance/merge/closure",
+  "generated_at": "2026-11-26T11:35:17.449531+00:00",
+  "base_integration_branch": "codex/postgresql-support",
+  "base_commit": "82d54ed5887b5d77637ae3418bc0f1a351f719bf",
+  "implementation_commit": "d78ac811edd373041eb7aef232ab989776a7c081",
+  "implementation_tree": "029ed15fb02ff7cd92a74780ed2599e6d07b9c4b",
+  "task_branch": "codex/issue-74-postgresql-local-unit",
+  "approved_contract_sha256": "939ff64d954cbb0ec079ad5c524640939f1f4957211ff09c57b6a51a8581d4f4",
+  "source_files_sha256": {
+    "docs/architecture/entity-provider-portable-v1.md": "4cecd017faaeca1170cfa743d634fb99b103e05f4323850ebed038d6a3285a84",
+    "docs/architecture/postgresql-entity-local-unit-p2-plan.md": "bf107fa01117e621a2d7a509ae32f7cb190cd7855060c880443e2256f996efed",
+    "docs/architecture/postgresql-entity-local-unit-p2-qualification.md": "62dc10fa8df45dfec3bbc673e29cf16774ac5bc1b71cb595efab166294de2e22",
+    "docs/architecture/postgresql-entity-local-unit-p2.md": "db18a48388dd8d7dabff0a695c13246b369a3d937301deca8c9a49b186607842",
+    "docs/architecture/postgresql-entity-provider-v1.md": "410730433e9a156fbfe7eed40f12dbf4d510fbe01842507684a54fe7df7603e4",
+    "src/XEntityManager/EntityLocalUnit.ts": "cfc187cf512aec1ce74e11d5c2421b359661378be742258df1f691a362127ca2",
+    "src/XEntityManager/EntityLocalUnitBackend.ts": "087928e8222c00deb2acc259ed461a26fad56905bcca6225e683654a61d7a066",
+    "src/XEntityManager/PostgreSQLEntityProvider.ts": "8d6927aceea39ee782a538bb986dae769cf357d0a9a657086a8b631499b07565",
+    "src/XEntityManager/PostgreSQLLocalUnit.ts": "fb46ff6913e4da4cc3a362ac8225fb9f795f87c5dca5a41b755cca695bf6b0fc",
+    "src/XEntityManager/PostgreSQLRuntime.ts": "d32ae66ccd7d37f93b2e99c1a89ae885e7a1b5de590985246f7b10345f549b10",
+    "src/XEntityManager/PostgreSQLSchema.ts": "94e0592f1c3535dc82a7090b08ce7f3a7bd3cb413b7a9ea1adcab820d32e195e",
+    "src/XEntityManager/SQLiteEntityProvider.ts": "40ac325e32497cf1c21321ad808b107c23ce02e231d1f9924183ce6b5ba233e4",
+    "src/XEntityManager/XEntityManager.ts": "40b349cde19dadae44f6ed91a649dcde7a76e7792025491361557d565b620303",
+    "src/index.ts": "4ebd4a601477ed081fd40e578041400bfef0107983a80ba2e84552fa1d19300d",
+    "tests/fixtures/postgresql/consumer/local-unit-types.ts": "f708218bc0908bb4c0b91b5476b6a894af8de30a514281c2e8fb661f57df4ea1",
+    "tests/local-unit-durability-contract.test.mjs": "38e26ae5fbaf098ffe35de2b5aa25ffba61654bb65ccf30b9432bbe34c06a957",
+    "tests/postgresql-fixture.mjs": "94462414b1ae1c8f34fcf03f116aeac5d212ec86d071fdadebe67540cb03beec",
+    "tests/postgresql-local-unit-concurrency.test.mjs": "66fe9f1330f5173b23d9ef3db14ff4f917fb1b17000230a9e8905f24b881d5ec",
+    "tests/postgresql-local-unit-durability.test.mjs": "61190fb038cba2d2b98d920e7456ac26cbed352a4a37d12238bcd991733c1bb5",
+    "tests/postgresql-local-unit-fence-fixture.mjs": "56e102fa81c2c02f30807054a26da7cda451e361b3af6c52180d7954743e4faa",
+    "tests/postgresql-local-unit-fence.test.mjs": "728bb02a113bcc57d87ede4784f404196692e42f12fac36f530800f11e2c223b",
+    "tests/postgresql-local-unit-fixture.mjs": "422613138959cc1096a1a56f303eb98566a0da01ba19b101795ae6519f390b6e",
+    "tests/postgresql-local-unit-process.mjs": "125ff9f8201ddba3375d3e77c043413f1355bb946acd17e3eed66d2287dd0fd4",
+    "tests/postgresql-local-unit-proxy.mjs": "d1524bf0356e502992cc2bd03cebcba3090ddcc4f1fe02e90e2b02148cebd441",
+    "tests/postgresql-local-unit-worker.mjs": "d57f995a0fcd7e36db097fa282de7b43bffc6aa2cbbbbf65dc74bccef55a0e8c",
+    "tests/postgresql-local-unit.test.mjs": "94024191955d3bf330ba5e815017722364c5965c62cc9c40c0cf20aa4fe59559",
+    "tests/postgresql-provider.test.mjs": "903eef3561957df76fac1b4d7fec35c52a70ff92144477ae5d81cf623f3a3ebe"
+  },
+  "environment": {
+    "platform": "Darwin",
+    "machine": "x86_64",
+    "os_release": "23.6.0",
+    "postgresql": "17.12",
+    "postgres_source_sha256": "9cf136a703d8ee2f83465c43be4e9e8e7930c82b0bfba13be7e2537be769ac55",
+    "native_server_binary_sha256": "4a0a8859d2548fe3887deaae3cc5cd9b140c207d52d1507fef100c84e95a2981",
+    "pg": "8.23.1",
+    "types_pg": "8.23.1",
+    "typescript": "5.9.3",
+    "types_node": "22.20.7",
+    "sdk": "2.0.8",
+    "better_sqlite3": "12.11.1",
+    "sqlite": "3.53.2",
+    "node22_archive_sha256": "efeec6641a2f15f5396d27cd0b32f5062d6689d1e9e5d89607d0b29bda890233",
+    "node24_archive_sha256": "4daeec962855c1a6e66cda398a25037319dc1bbd4a0939188b3547afbbfb6490",
+    "disposable_cluster": {
+      "settings": {
+        "server_version_num": "170012",
+        "encoding": "UTF8",
+        "fsync": "on",
+        "full_page_writes": "on",
+        "synchronous_commit": "on"
+      },
+      "remaining": {
+        "extra_databases": 0,
+        "fixture_roles": 0
+      },
+      "cluster_identity_verified": true
+    },
+    "test_cluster_shutdown": {
+      "status": "PASS",
+      "log": "stop-owned-cluster.log",
+      "sha256": "ca19178a35ab4153b75b494963b66ce8243e1b94c173107c87b44d09db23652d"
+    }
+  },
+  "artifact": {
+    "archive": "xpell-node-2.0.8.tgz",
+    "sha256": "85bce2c3000add84bcad39ece013ea8986e96671e108965ad5e66ce939f8ae81",
+    "npm_integrity": "sha512-V2tk8KWJaefTE+0elb29xsB4m9pjSy/YwtAD+5B2dpYHfRnGOarkf7m7HnBlvTYy+r/MR24+ZaeCKvJ+BLlcEg==",
+    "verified_dist_files": 283,
+    "dist_map_sha256": "61287267256a4e8dc60fdd562a151c069ae4354ab4da9044d26b11ee0955e26f",
+    "source_package_sha256": "07e68837bd909b59c6a6507a0b69671f18ff7a6fbcc153f7048644a63805d88f",
+    "staged_package_sha256": "7297aace77a144d47767a1c49dc9a225da2d315786d98f25346393e7fdb75f83",
+    "workspace_packaging_resolution": {
+      "@xpell/file-service": {
+        "from": "workspace:*",
+        "to": "0.1.0"
+      },
+      "@xpell/mcp": {
+        "from": "workspace:*",
+        "to": "2.0.8"
+      },
+      "@xpell/core": {
+        "from": "workspace:*",
+        "to": "2.0.8"
+      },
+      "@xpell/node-core": {
+        "from": "workspace:*",
+        "to": "2.0.8"
+      },
+      "@xpell/vibe": {
+        "from": "workspace:*",
+        "to": "2.0.8"
+      }
+    },
+    "fixture_lock_sha256": "7aa0dc257e72569021611186a424fc6a39ba200522be1ae0c144d41c886fa6b6",
+    "provenance_sha256": "9eb89be429a906dc9cd38d4ab7c86a29ed1a93f1a17c6a4ca2d05c6fdfc8860d",
+    "published": false
+  },
+  "consumers": {
+    "22": {
+      "node": "22.23.1",
+      "manifest_sha256": "08a4d76392aaa4db637fb7d08651d9551ddeff5a06b50c5c475ba68d198b8d80",
+      "lock_sha256": "c608723a051534d3aadf639b264058d26679ae8c066f86a38c731b432195f5fa",
+      "offline_npm_ci": "PASS",
+      "allowScripts": {},
+      "typescript": "PASS",
+      "typescript_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "24": {
+      "node": "24.22.3",
+      "manifest_sha256": "d2f8df54c8011245392b1e5426be661da846a757d4a9063c4867a7370325bbd2",
+      "lock_sha256": "1eb681b8143d42f598f8866b565e8f9e55c777f795766ffd5be1d12342a503da",
+      "offline_npm_ci": "PASS",
+      "allowScripts": {
+        "better-sqlite3@12.11.1": true
+      },
+      "typescript": "PASS",
+      "typescript_log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "results": {
+    "source_pg_node22": {
+      "log": "source-pg-node22.tap",
+      "format": "tap",
+      "sha256": "20cb6a992063b28c01e714c12973cb54989137791c3de482835af673ed66407e",
+      "tests": 116,
+      "pass": 115,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "duration_ms": 151438.173476
+    },
+    "sqlite_history_lifecycle_node22": {
+      "log": "sqlite-full-node22.tap",
+      "format": "tap",
+      "sha256": "952dcb674f9b66c4ca03d8ffa327b61d59ca318abbc25fb7e064daec91b3a0ad",
+      "tests": 216,
+      "pass": 216,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 237575.273718
+    },
+    "http_binding_node22": {
+      "log": "http-binding-node22.tap",
+      "format": "tap",
+      "sha256": "19ff9c1e8935c79889d9a86d5d423132bf8dffa3909b3bfec8693c4e91538258",
+      "tests": 6,
+      "pass": 6,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 1788.621839
+    },
+    "installed_node22": {
+      "log": "packed-node22.tap",
+      "format": "tap",
+      "sha256": "1bba1760d3d32188f280939454ced3c45d328c89269920119cee9b3f0aaa9062",
+      "tests": 121,
+      "pass": 120,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "duration_ms": 85963.752612
+    },
+    "installed_node24": {
+      "log": "packed-node24.log",
+      "format": "node-spec",
+      "sha256": "539c067c50e3a0e117267272619856433f023d51d5bc515acdb8c551783ee668",
+      "tests": 121,
+      "pass": 120,
+      "fail": 0,
+      "skip": 1,
+      "cancelled": 0,
+      "duration_ms": 83819.618161
+    }
+  },
+  "final_full_build": {
+    "status": "PASS",
+    "log_sha256": "c2a65298d2ff544e93cf67204123892392dc5ac7b8eeec3be95d44815e3f83de"
+  },
+  "scope_and_limits": {
+    "production_ownership_issuer": "DEFERRED_TO_P3_NOT_QUALIFIED",
+    "public_required_fence_binding": "FAILS_CLOSED_UNTIL_P3_ISSUER_WIRING",
+    "p2_fence_protocol": "REAL_POSTGRESQL_STORAGE_HALF_FIXTURES",
+    "router_business_backup_release": "P3_P4_NOT_RUN",
+    "container_linux": "NOT_RUN",
+    "ha_power_loss_production": "NOT_QUALIFIED",
+    "no_live_paid_provider_calls": true,
+    "no_active_service_or_production_data_changes": true,
+    "no_merge_issue_closure_or_p3_p4_execution": true,
+    "no_fallback_dual_writes_new_orm_or_public_raw_sql_clients": true
+  },
+  "unicode_exception": {
+    "approved_on": "2026-11-25",
+    "scope": "SQLite parity for unpaired UTF-16 surrogate keys only",
+    "postgresql_codec": "fixed WTF-8 on both qualified Node versions",
+    "deferred_named_tests": 1,
+    "sqlite_implementation_changed": false,
+    "node22_only_guard": false
+  },
+  "xnet_regression_fixture": {
+    "source_test_map_sha256": "142da3cb6bfb3b34b3ed7280e24bfde7c1f8fcb5f703b5718fc3f57f87636e32",
+    "copied_files": 26,
+    "provenance": "Read-only accepted P1 fixture copy; historical reference 93a7ec18194df7c79641f35b2a390247c6abca09, not a newly authenticated Git checkout"
+  },
+  "commands_normalized_for_isolated_paths": {
+    "build": "npm run build",
+    "source_pg": "node --import ./tests/postgresql-network-guard.mjs --test --test-concurrency=1 tests/postgresql-*.test.mjs tests/entity-provider-conformance.test.mjs",
+    "sqlite": "node --test --test-concurrency=1 tests/entity-provider-conformance.test.mjs tests/lifecycle.test.mjs tests/local-unit.test.mjs tests/local-unit-durability-contract.test.mjs tests/hash-local-unit.test.mjs tests/sqlite-durability.test.mjs tests/historical-import.test.mjs tests/historical-import-durability.test.mjs tests/historical-backup.test.mjs tests/historical-backup-durability.test.mjs",
+    "binding": "node --test tests/binding.test.mjs",
+    "pack": "python3 tests/fixtures/postgresql/pack-candidate.py <new-external-candidate-directory>",
+    "consumer_install": "npm install --cache <task-owned-cache> --no-audit --no-fund; npm ci --offline --cache <task-owned-cache> --no-audit --no-fund",
+    "node24_native_policy": "npm install-scripts approve better-sqlite3@12.11.1 (only inside new disposable consumer)",
+    "consumer_types": "node node_modules/typescript/bin/tsc --noEmit --strict --skipLibCheck --target ES2022 --module NodeNext --moduleResolution NodeNext local-unit-types.ts",
+    "installed_matrix": "node --import <installed-harness>/tests/postgresql-network-guard.mjs --test --test-concurrency=1 <installed-harness>/tests/postgresql-*.test.mjs <installed-harness>/tests/entity-provider-conformance.test.mjs <installed-harness>/tests/local-unit-durability-contract.test.mjs"
+  },
+  "iteration_history_not_added_to_final_totals": {
+    "pg_units_before_append_only_correction": {
+      "log": "pg-unit-initial.tap",
+      "format": "tap",
+      "sha256": "3e8f0a30156889de001d452c06ef8b3cafd7d079e6bb2369429de61b0d2dad36",
+      "tests": 21,
+      "pass": 15,
+      "fail": 6,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 12345.447016
+    },
+    "pg_units_after_correction": {
+      "log": "pg-unit-corrected.tap",
+      "format": "tap",
+      "sha256": "e9a7967aa032e029752c6213fb9dd9d053813bd2db828770a67c8b0d2622a987",
+      "tests": 21,
+      "pass": 21,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 13500.640715
+    },
+    "pg_concurrency_initial_fixture_and_ssi_expectations": {
+      "log": "pg-concurrency-initial.tap",
+      "format": "tap",
+      "sha256": "61fa9835db0c3191c8bf3e0d3e77ee6b4337b3657526193667df7ffe4f360e1b",
+      "tests": 6,
+      "pass": 2,
+      "fail": 4,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 18549.719394
+    },
+    "pg_concurrency_corrected": {
+      "log": "pg-concurrency-corrected.tap",
+      "format": "tap",
+      "sha256": "c8a66be978aba09ef626090d08479eb32bbaf8299b8e0c37d2e1f5567cfdb526",
+      "tests": 7,
+      "pass": 7,
+      "fail": 0,
+      "skip": 0,
+      "cancelled": 0,
+      "duration_ms": 12791.210735
+    }
+  },
+  "corrections": [
+    "Append-only roles preserve SELECT/INSERT privileges; mutable rows lock and immutable reads use SERIALIZABLE/SSI. Fault tests assert actual checkpoint reach.",
+    "Test harness uses actual supported find/count metadata, not an invented manager count command.",
+    "Independent SSI transactions may conservatively abort; explicit fresh caller guards only after confirmed abort, never hidden retry.",
+    "Legacy migration literal return type preserved through overloads; all tested JavaScript bytes unchanged after restoring the emitted documentation comment."
+  ],
+  "evidence_location": "Task-local runtime logs/provenance retained alongside isolated clone; hashes above. Node24 uses the actual Node spec reporter, not mislabeled TAP. No overlapping lane totals summed."
+}
