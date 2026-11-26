@@ -2,6 +2,8 @@
 
 Candidate evidence for owner review, not acceptance/deployment. Exact per-lane counts, source/package/lock/log hashes and iteration history are in `tests/fixtures/postgresql/qualification-p2.json`. P1 receipts remain unchanged historical evidence.
 
+Independent-review corrections based on reviewed head `ed06947dc4c6106b86db297a1fd14d828f460c96` are qualified separately in `tests/fixtures/postgresql/qualification-p2-review.json`; the earlier receipt remains historical. `tests/postgresql-local-unit-review.test.mjs` adds physical-alias negative tests and actual committed-response corruption tests. Corruption wraps only the native backend's returned data **after awaiting its real COMMIT**; persistence, SQL, transaction results and rollback are not mocked. Each negative acknowledgement proves committed rows by independent readback, no unvalidated events/confirmed attestation, a single native attempt and conflict on blind replay. Both opted-in and valid legacy SQLite paths remain covered by `tests/local-unit-durability-contract.test.mjs` and the existing regression suites.
+
 ## Reproduce safely
 
 Reuse PostgreSQL17.12 / pg8.23.1 / @types/pg8.23.1, Node22.23.1/24.22.3, SDK2.0.8 fixture locks and matching native SQLite ABI. Follow [P1 setup](../postgresql-provider-qualification.md) in a new owner-only `issue-74-` directory. Use an unused loopback port, short private Unix socket path (Darwin limit), new synthetic certificate/roles/databases and observed data_directory/version verification. Never use or stop an existing installation.

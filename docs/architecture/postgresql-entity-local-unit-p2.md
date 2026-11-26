@@ -19,6 +19,8 @@ PostgreSQL requires explicit new-contract selection. Bootstrap verifies the comp
 
 The unit DTO remains closed: GUID `_unit_id`, fixed entity/GUID records with full `_expect`, `_create` or `_update`, existing `_lease` and `_valid_until`. No SQL, query selectors, deletes, joins, arbitrary limits or transaction callbacks. IDs remain exact and case-sensitive. Standard limits are 8 records/4 writes/8 entities/65,536 bytes; expanded limits are 10/5/8/65,536.
 
+Registry lookup retains its existing NFKC/trim entity-name normalization. A binding may declare a single alias, but two entries resolving to the same physical entity are rejected before readiness/transaction admission, even with different write grants. Backend preparation also checks resolved physical identities and exact record IDs before effects. The DTO validator's logical duplicate check is not a substitute for this resolved check. Record GUID case remains exact; no new spelling normalization changes the legacy allowlist or returned entity names.
+
 ## Supplemental receipt
 
 The opted-in bound handle exposes frozen `_durability_contract` with `_contract: "provider-neutral-v1"`, `_version: 1`, `_backend`, tagged `_store_identity`, exact `_scope`, bound-manifest `_schema_sha256`, resolved `_capacity`, explicit `_hash_policy` or null, `_semantics: "serializable-exact-record-v1"`, `_durability_profile` and `_ownership`.
@@ -38,6 +40,10 @@ Full canonical expectations distinguish absent/null/Hash/timestamps. Record/proj
 Conflicts/deadlocks/constraints abort the entire unit. Independent requests may still have conservative SSI conflicts. There is no global unit mutex or automatic retry. Only a caller with a confirmed abort may build a fresh attempt after rereading/revalidating intent and guards.
 
 `E_ENTITY_POSTGRESQL_WRITE_UNCERTAIN` covers possible successful COMMIT with lost transport/timeout acknowledgement. `E_ENTITY_LOCAL_UNIT_RESULT_UNCERTAIN` covers new-contract response/notification failure or malformed acknowledgement after provider commit. Neither means rollback. Server-confirmed abort SQLSTATEs retain sanitized conflict/constraint classification; raw driver details are not exposed.
+
+For the new contract, committed response validation precedes every notification and confirmed attestation. It snapshots the result and validates record count/order/entity/ID, requires non-null create/update records, preserves exact expected guards and permits null only for legitimate guard observations/absence. Full create effects include provider-normalized defaults, explicit input, matching generated timestamps and bcrypt verification for created Hash fields. Updates must preserve the full expected record except the declared changes and update timestamp, including existing Hash values. Defaults overridden by explicit input are not evaluated again. Provider-owned default projection reuses existing serialization; it grants no SQL or transaction authority.
+
+The changed-record list must exactly match the write operations, events and returned full records in order, with no duplicate/omitted/guard notifications. Any malformed or inconsistent post-COMMIT response is uncertain, emits no unvalidated notification and supplies no confirmed attestation. This is response-integrity validation, not a durable replay log or independent database reconciliation proof. Real committed corruption tests establish persisted effects separately and reject blind replay. Legacy SQLite acknowledgement validation is unchanged unless the new contract is selected; duplicate physical bindings are invalid under either contract.
 
 `_unit_id` is correlation, not a durable idempotency receipt. Reconcile actual caller-owned immutable/business identities before retrying unknown work; do not re-dispatch external services. No generic unit-log/outbox is introduced. Notifications occur only after confirmed commit with best-effort delivery; lost acknowledgement cannot undo effects.
 

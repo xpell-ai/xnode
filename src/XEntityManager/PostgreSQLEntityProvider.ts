@@ -8,7 +8,7 @@ import { verifyEntitySchema, assertPostgreSQLIdentity, verifyPostgreSQLFence } f
 import { localUnitError, type EntityLocalUnit } from "./EntityLocalUnit.js";
 import type { LocalUnitExecution } from "./EntityLocalUnitBackend.js";
 import { preparePostgreSQLUnit, executePostgreSQLUnit, type PostgreSQLUnitEntity } from "./PostgreSQLLocalUnit.js";
-import { layoutFor, pgError, prepareRecord, projected, quote, sqliteStringKey, type PGLayout } from "./PostgreSQLValues.js";
+import { layoutFor, normalizeScalar, pgError, prepareRecord, projected, quote, sqliteStringKey, type PGLayout } from "./PostgreSQLValues.js";
 import { exactCount, orderSQL, pageOptions, PG_OPERATORS, whereSQL } from "./PostgreSQLQuery.js";
 
 export class PostgreSQLEntityProvider implements EntityProvider {
@@ -63,6 +63,12 @@ export class PostgreSQLEntityProvider implements EntityProvider {
         return { first, store, entities };
     }
     /** Internal native bounded adapter. No SQL/client handle is returned. */
+    static localUnitCreateDefaults(provider: PostgreSQLEntityProvider, input: Record<string, unknown>): Record<string, unknown> {
+        const layout = provider.#layout;
+        return Object.fromEntries(Object.entries(layout._schema).filter(([key, field]) => !Object.hasOwn(input, key) &&
+            !["_created_at", "_updated_at"].includes(key) && Object.hasOwn(field, "_default"))
+            .map(([key, field]) => [key, normalizeScalar(layout, key, field._default)]));
+    }
     static async verifyLocalUnit(providers: ReadonlyMap<string, PostgreSQLEntityProvider>, o: LocalUnitExecution) {
         const { store } = this.localUnitState(providers);
         await this.commitLocalUnit(providers, { _unit_id: randomUUID(),

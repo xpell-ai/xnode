@@ -184,6 +184,20 @@ export function localUnitCanonical(value: any, depth = 0): string {
 }
 export const localUnitHash = (value: any) => createHash("sha256").update(localUnitCanonical(value)).digest("hex");
 
+/** Registry-resolved identity, not caller spelling, owns physical uniqueness. */
+export function assertLocalUnitPhysicalTargets(unit: EntityLocalUnit, identities: ReadonlyMap<string, string>): void {
+    if (new Set(identities.values()).size !== identities.size) throw localUnitError();
+    const seen = new Set<string>();
+    for (const op of unit._records) {
+        const identity = identities.get(op._entity);
+        if (!identity) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
+        const key = JSON.stringify([identity, op._id]);
+        if (seen.has(key)) throw localUnitError();
+        seen.add(key);
+    }
+}
+
+/** Syntactic snapshot; resolved physical targets must also be checked before execution. */
 export function validateLocalUnit(raw: any, limits: EntityLocalUnitCapacityLimits = ENTITY_LOCAL_UNIT_CAPABILITIES._profiles["standard-v1"]): EntityLocalUnit {
     if (!Object.values(ENTITY_LOCAL_UNIT_CAPABILITIES._profiles).some(profile => profile === limits)) throw localUnitError("E_ENTITY_LOCAL_UNIT_CAPACITY");
     const data = localUnitCanonical(raw);

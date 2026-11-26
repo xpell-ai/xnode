@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import bcrypt from "bcryptjs";
 import type { PoolClient } from "pg";
-import { assertEntityLocalUnitHashCreateInput, localUnitCanonical, localUnitError, resolveLocalUnitHashPolicy,
+import { assertEntityLocalUnitHashCreateInput, assertLocalUnitPhysicalTargets, localUnitCanonical, localUnitError, resolveLocalUnitHashPolicy,
     validateLocalUnit, type EntityLocalUnit } from "./EntityLocalUnit.js";
 import type { LocalUnitExecution, LocalUnitResult } from "./EntityLocalUnitBackend.js";
 import { normalizeScalar, projected, quote, sqliteStringKey, type PGLayout } from "./PostgreSQLValues.js";
@@ -16,6 +16,7 @@ export type PreparedPostgreSQLUnit = { _unit: EntityLocalUnit; _values: (Record<
 
 export async function preparePostgreSQLUnit(entities: ReadonlyMap<string, PostgreSQLUnitEntity>, raw: EntityLocalUnit, o: LocalUnitExecution): Promise<PreparedPostgreSQLUnit> {
     const unit = validateLocalUnit(raw, o._limits), hash = resolveLocalUnitHashPolicy(o._hash_policy);
+    assertLocalUnitPhysicalTargets(unit, new Map([...entities].map(([name, e]) => [name, e._layout._identity])));
     const values: PreparedPostgreSQLUnit["_values"] = [];
     for (const op of unit._records) {
         const layout = entities.get(op._entity)?._layout;
@@ -69,6 +70,7 @@ export async function executePostgreSQLUnit(client: PoolClient, entities: Readon
     prepared: PreparedPostgreSQLUnit, store: { _id: string; _schema_version: number; _inventory_sha256: string }, o: LocalUnitExecution,
     fence?: PostgreSQLUnitFence): Promise<LocalUnitResult & { _finalize: () => void }> {
     const { _unit: unit, _values: values } = prepared;
+    assertLocalUnitPhysicalTargets(unit, new Map([...entities].map(([name, e]) => [name, e._layout._identity])));
     o._revalidate();
     const first = entities.values().next().value!;
     const actual = (await client.query(`SELECT store_id,schema_version,inventory_sha256 FROM ${first._namespace("ep_store")} WHERE singleton=TRUE`)).rows;

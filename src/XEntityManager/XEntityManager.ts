@@ -31,7 +31,7 @@ import { aliasHistoricalOwner } from "./EntityHistoricalOwner.js";
 import { openEntityHistoricalImport, type EntityHistoricalImportBinding, type BoundEntityHistoricalImport } from "./EntityHistoricalImport.js";
 import { localUnitError, localUnitHash, localUnitCanonical, freezeLocalUnitData, resolveLocalUnitDurability, resolveLocalUnitCapacity, resolveLocalUnitHashPolicy, validateLocalUnit,
     type EntityLocalUnitDurability, type EntityLocalUnitBinding, type BoundEntityLocalUnit, type EntityLocalUnitCapacity, type EntityLocalUnitHashAcknowledgement } from "./EntityLocalUnit.js";
-import { resolveNativeLocalUnitBackend, type NativeLocalUnitBackend, type LocalUnitExecution } from "./EntityLocalUnitBackend.js";
+import { resolveNativeLocalUnitBackend, validateCommittedLocalUnitResult, type NativeLocalUnitBackend, type LocalUnitExecution } from "./EntityLocalUnitBackend.js";
 import {
     createEntityProvider,
     resolveEntityProviderType
@@ -270,11 +270,15 @@ export class XEntityManager extends XModule {
         const binding = Object.freeze({ ...options, _capacity_profile: capacity._profile, _hash_policy: hash?._policy,
             _entities: Object.freeze(options._entities.map(e => Object.freeze({ ...e }))) });
         const entries = new Map<string, { _stored: EntityRegistryEntry; _schema_hash: string; _write: boolean }>();
+        const physical = new Set<string>();
         for (const entry of binding._entities) {
             if (entries.has(entry._entity) || typeof entry._write !== "boolean") throw localUnitError();
             const stored = this.getStoredEntity({ _env: binding._env, _app_id: binding._app_id, _entity: entry._entity });
             if (stored._physical_identity._storage_scope !== "app" ||
                 stored._app_id !== binding._app_id || stored._env !== binding._env) throw localUnitError("E_ENTITY_LOCAL_UNIT_STORAGE");
+            const identity = stored._physical_identity._physical_identity;
+            if (physical.has(identity)) throw localUnitError();
+            physical.add(identity);
             entries.set(entry._entity, { _stored: stored, _schema_hash: localUnitHash(stored._definition), _write: entry._write });
         }
         const providers = new Map([...entries].map(([name, entry]) => [name, entry._stored._provider]));
@@ -332,7 +336,7 @@ export class XEntityManager extends XModule {
                 const entry = entries.get(op._entity);
                 if (!entry || (!entry._write && (op._create || op._update))) throw localUnitError("E_ENTITY_LOCAL_UNIT_UNAUTHORIZED");
             }
-            const result = await owned._backend.commit(unit, { _clock: binding._clock ?? Date.now, _fault: binding._fault,
+            let result = await owned._backend.commit(unit, { _clock: binding._clock ?? Date.now, _fault: binding._fault,
                 _hash_policy: owned._hash?._policy, _limits: owned._capacity._limits, _revalidate: revalidate,
                 _strict_final_checks: !!owned._durability, _owner_context: binding._owner_context });
             confirmedWithNewContract = !!owned._durability;
@@ -341,8 +345,9 @@ export class XEntityManager extends XModule {
                     : { _backend: "postgresql", _profile: "postgresql-local-durable-v1" };
                 if (localUnitCanonical(result._durability) !== localUnitCanonical(expected) ||
                     localUnitCanonical(result._ownership ?? { _mode: "unfenced" }) !== localUnitCanonical(owned._durability._ownership) ||
-                    result._records.length !== unit._records.length || result._records.some((r, i) => r._entity !== unit._records[i]._entity ||
-                        r._record !== null && r._record._id !== unit._records[i]._id)) throw localUnitError("E_ENTITY_LOCAL_UNIT_RESULT_UNCERTAIN");
+                    result._records.length !== unit._records.length) throw localUnitError("E_ENTITY_LOCAL_UNIT_RESULT_UNCERTAIN");
+                result = await validateCommittedLocalUnitResult(unit, result, owned._backend,
+                    name => entries.get(name)!._stored._definition._schema ?? {}, owned._capacity._limits);
             }
             for (const changed of result._changed) {
                 const stored = entries.get(changed._entity)!._stored;

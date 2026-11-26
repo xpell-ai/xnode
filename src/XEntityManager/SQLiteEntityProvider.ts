@@ -6,7 +6,7 @@ import bcrypt from "bcryptjs";
 import Database from "better-sqlite3";
 import { XError } from "@xpell/core";
 import { _xu } from "@xpell/node-core";
-import { assertEntityLocalUnitHashCreateInput, localUnitCanonical, localUnitError, localUnitHash, resolveLocalUnitHashPolicy, validateLocalUnit, ENTITY_LOCAL_UNIT_CAPABILITIES, type EntityLocalUnit, type EntityLocalUnitHashPolicy, type EntityLocalUnitCapacityLimits } from "./EntityLocalUnit.js";
+import { assertEntityLocalUnitHashCreateInput, assertLocalUnitPhysicalTargets, localUnitCanonical, localUnitError, localUnitHash, resolveLocalUnitHashPolicy, validateLocalUnit, ENTITY_LOCAL_UNIT_CAPABILITIES, type EntityLocalUnit, type EntityLocalUnitHashPolicy, type EntityLocalUnitCapacityLimits } from "./EntityLocalUnit.js";
 import { historicalImportContext, historicalImportTimestamp, isHistoricalImportProvider } from "./EntityHistoricalImport.js";
 import type {
     EntityAggregationRequest,
@@ -1847,6 +1847,13 @@ export class SQLiteEntityProvider implements EntityProvider {
     }
 
     /** Only EntityManager's pinned, app-local binding calls this. Handles never escape. */
+    /** Internal acknowledgement projection; reuse the provider's existing default serialization. */
+    static localUnitCreateDefaults(provider: SQLiteEntityProvider, input: Record<string, unknown>): Record<string, unknown> {
+        return Object.fromEntries(Object.entries(provider._schema).filter(([key, field]) => !Object.hasOwn(input, key) &&
+            !["_created_at", "_updated_at"].includes(key) && Object.hasOwn(field, "_default"))
+            .map(([key, field]) => [key, provider.serializeRecordValue(key, field._default)]));
+    }
+
     static async commitLocalUnit(
         providers: ReadonlyMap<string, SQLiteEntityProvider>, unit: EntityLocalUnit,
         clock: () => number, fault?: (point: string) => void,
@@ -1862,6 +1869,8 @@ export class SQLiteEntityProvider implements EntityProvider {
         // Snapshot before any await. Never fingerprint a plaintext proposal for a receipt.
         if (hash || strictFinalChecks) unit = validateLocalUnit(unit, limits);
         const list = [...providers.values()];
+        if (strictFinalChecks) assertLocalUnitPhysicalTargets(unit,
+            new Map([...providers].map(([name, p]) => [name, p._physical_identity._physical_identity])));
         const first = list[0];
         if (!first || list.some(p => !p._db?.open || p._db_path !== first._db_path ||
             p._physical_identity._storage_scope !== "app" || p.resolveDbPath(p._definition) !== p._db_path)) {
